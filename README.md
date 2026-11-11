@@ -79,13 +79,27 @@ mcp-db deny <id>                      # 拒绝
 
 - 逻辑污染不处理；没有写前影响行数预览和回滚。
 - SQLite 驱动不支持语句超时；MSSQL 驱动不支持 `explain_query`。
-- 只做了 SQLite 的自动化集成测试；PostgreSQL / MySQL / SQL Server 需要各自的真实实例验证。
+- PostgreSQL 和 MySQL 已用临时实例验证；SQL Server 还需要真实实例验证。
 
 ## 开发
 
 ```bash
 bun run typecheck
-bun test
+bun test                                   # 临时 SQLite，无真实外部写入
 ```
+
+真实数据库集成（独立入口，需要真实实例和只读/读写账号）：
+
+```bash
+export MCPDB_TEST_PG_RW='postgres://rw:pw@127.0.0.1:5432/mcptest'
+export MCPDB_TEST_PG_RO='postgres://ro:pw@127.0.0.1:5432/mcptest'
+export MCPDB_TEST_MYSQL_RW='mysql://rw:pw@127.0.0.1:3306/mcptest'
+export MCPDB_TEST_MYSQL_RO='mysql://ro:pw@127.0.0.1:3306/mcptest'
+export MCPDB_TEST_MSSQL_RW='Server=127.0.0.1,1433;Database=mcptest;User Id=rw;Password=pw;TrustServerCertificate=true'
+export MCPDB_TEST_MSSQL_RO='Server=127.0.0.1,1433;Database=mcptest;User Id=ro;Password=pw;TrustServerCertificate=true'
+bun run scripts/real-integration.ts
+```
+
+脚本会创建并删除 `mcp_it_test` 表，验证 DDL、写入、参数绑定、元数据、只读账号拒绝写入和语句超时。
 
 基线见 [SPEC.md](SPEC.md)，操作流程见 [AGENTS.md](AGENTS.md)。

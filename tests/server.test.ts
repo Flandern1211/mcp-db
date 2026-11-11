@@ -143,6 +143,15 @@ afterAll(async () => {
 });
 
 describe("tool surface", () => {
+  test("rejects a source the agent cannot access", async () => {
+    const writer = await openClient("writer");
+    const result = await writer.callTool({
+      name: "execute_sql",
+      arguments: { source: "nope", sql: "SELECT 1" },
+    });
+    expect(result.isError).toBe(true);
+  });
+
   test("lists the sources visible to the agent", async () => {
     const reader = await openClient("reader");
     const result = await reader.callTool({ name: "list_sources", arguments: {} });
