@@ -1,0 +1,36 @@
+[server]
+host = "127.0.0.1"
+port = 8787
+admin_token_env = "MCPDB_ADMIN_TOKEN"
+state_path = "./.mcp-db/state.db"
+# 等待人工批准的上限；超时按拒绝处理
+approval_timeout_ms = 120000
+
+[[sources]]
+id = "production"
+driver = "postgres"
+dsn_readonly = "postgres://ro_user:CHANGE_ME@127.0.0.1:5432/app"
+dsn_readwrite = "postgres://rw_user:CHANGE_ME@127.0.0.1:5432/app"
+max_rows = 500
+statement_timeout_ms = 15000
+label = "生产库"
+
+[[sources]]
+id = "local"
+driver = "sqlite"
+dsn_readonly = "file:./dev.db?mode=ro"
+dsn_readwrite = "file:./dev.db"
+max_rows = 1000
+
+# 每个 agent 对每个 source 单独配模式：readonly | readwrite | approval
+[agents.gbrain]
+token_env = "MCPDB_TOKEN_GBRAIN"
+sources = { production = "approval", local = "readonly" }
+
+[agents.coder]
+token_env = "MCPDB_TOKEN_CODER"
+sources = { local = "readwrite" }
+
+[agents.reader]
+token_env = "MCPDB_TOKEN_READER"
+sources = { production = "readonly" }

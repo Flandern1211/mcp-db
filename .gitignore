@@ -12,6 +12,17 @@ build/
 out/
 target/
 
+# 依赖
+node_modules/
+
+# 本地配置与运行状态
+mcp-db.toml
+.mcp-db/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # 系统文件
 .DS_Store
 Thumbs.db
