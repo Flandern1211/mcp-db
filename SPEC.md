@@ -7,221 +7,230 @@
 
 ## 1. 范围与非目标
 
-mcp-db 是一个常驻数据库服务器的 HTTP MCP 服务：统一接入多个 SQL 数据源，通过 **token 的 MCP tool 白名单 × token 的 source 权限 × source 自身策略** 控制 agent 能做什么、能在哪些库上做。产品边界是**保证不了数据写对，只保证写不出灾难**；数据库账号权限是最终安全边界，应用层分类、审批和配额提供纵深防御。
+mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问目标数据库的受信位置按需启动或常驻运行。核心模型是：**token 在每个 source 上获得哪些 MCP tools；tool 使用哪个连接 profile 执行；执行前适用什么审批策略**。三者分别回答“能不能”“用什么数据库身份”“要不要批准”，不重复表达授权。
 
 ### 1.1 范围
 
-- 单实例、多数据源的 Streamable HTTP MCP 服务；服务只监听 `127.0.0.1`，本机客户端通过 SSH 隧道接入。
-- 驱动：PostgreSQL、MySQL/MariaDB、SQLite、SQL Server。各驱动的建库能力可分阶段实现，未支持时必须明确拒绝，不能退回通用 SQL。
-- 每个 source 两套普通业务 DSN（只读、读写）与两个连接池；权限模式决定普通 SQL 使用哪个池。
-- agent 身份来自 `Authorization: Bearer <token>`；token 由管理面签发，只保存哈希和识别信息，明文只在签发时返回一次。
-- token 创建时同时分配：
-  - 允许调用的 MCP tools；
-  - 可访问的 source，以及每个 source 的 `readonly`、`readwrite` 或 `approval` 模式。
-- 有效授权取三者交集：token 必须允许当前 tool、必须被分配目标 source、source 模式和 source 自身策略必须允许当前操作。服务端不能把工具不可见当作授权，调用时仍须再次校验。
-- source 可标记环境（`dev`、`test`、`prod`）并由 admin 显式开启“允许 agent 申请建库”；默认关闭。生产 source 的普通 SQL 对 agent 始终只读，不能配置成有效写权限；专用建库是独立控制面动作，仍须经过开关、配额与逐次审批。
-- agent 建库只能调用专用 `create_database` tool。每次申请均须人工审批，并受 source 开关、配额和频率限制；通用 SQL 不提供建库、删库或权限管理通道。
-- source 模式继续固定三档：
-  - `readonly`：查询走只读池；写入和 DDL 不执行；
-  - `readwrite`：普通查询和普通写入可直接执行，高危操作仍须逐次审批；
-  - `approval`：查询走只读池；每条普通写入和 DDL 执行前逐次审批，批准后该条语句走读写池。
-- 普通 `approval` 写入的确认通道：优先 MCP elicitation；客户端未声明该能力时，进入待批队列。高危 SQL 和建库必须由 admin 身份在管理页或 CLI 做一次性决定；elicitation 可用于展示或通知，但客户端返回不能单独构成这两类操作的人工批准。
-- 执行保护：参数绑定、返回行数截断、语句超时、连接池上限、建库配额与频率限制、审计。
-- 管理面负责 token、source、审批、审计及 source 归档/恢复；agent token 不具备控制面生命周期权限。
-- 单用户使用，不区分多个管理员、审批人角色或组织归属；不同 agent 可持有不同 token。
+- 单实例、多数据源的 Streamable HTTP MCP 服务；不要求与数据库同机，不要求全年常驻。
+- 默认监听 `127.0.0.1`；SSH 隧道是可选接入方式。集中部署可以通过受信反向代理或显式配置的监听地址接入，但对非本机访问必须提供 TLS、认证和网络访问控制，不能裸露管理接口。
+- 驱动：PostgreSQL、MySQL/MariaDB、SQLite、SQL Server。建库可分阶段支持，未支持驱动必须明确拒绝，不能退回通用 SQL。
+- source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
+- agent 使用管理面签发的 Bearer token；明文只在签发时返回一次，服务端只保存哈希和识别信息。
+- token 创建时按 **source → tool 集合** 授权。不再维护独立的全局 tool 白名单与 source 模式，也不再使用 `readonly/readwrite/approval` 作为运行时权限枚举。
+- 管理页可提供“只读”“数据读写”“结构管理”等快捷模板；模板只是勾选 tools 的便捷方式，保存结果是明确的 grants，不具有隐含继承关系。“逐次审批”是执行策略，不是权限模板。
+- 普通 SQL 拆为 `query_sql`、`mutate_sql`、`execute_ddl`；通用 `execute_sql` 不属于目标 tool 集合，旧客户端必须迁移，不能保留可绕过新授权的兼容入口。
+- 生产 source 的普通 SQL 对 agent 只读，不能授予 `mutate_sql` 或 `execute_ddl`。专用建库独立受控：目标 source 有 provision 能力、token 在该 source 有 `create_database` grant，并且每次由 admin 人工审批。
+- 不设独立“允许 agent 建库”布尔开关；配置 provision profile 提供技术能力，tool grant 提供申请资格，admin 决定提供本次授权。
+- 管理面负责 token、profiles、tool 路由、审批策略、审批决定、审计和 source 归档/恢复；agent 不具备这些控制面管理权限。
+- 参数绑定、结果截断、执行超时、连接池限制、请求速率和建库配额负责限制影响面；数据库原生权限仍是执行身份的最终能力边界。
+- 单用户管理，可供多个 agent/token 使用；不引入多个管理员角色或组织归属。
 
 ### 1.2 非目标
 
-- 不解决逻辑污染；事务成功、权限合法的 SQL 仍可能写入错误业务数据。
-- 当前不允许 agent 写生产 source；生产写入流程在真实需求出现后单独设计。
-- 不允许 agent 通过通用 SQL 执行数据库级管理；`CREATE DATABASE` 只走专用 tool，`DROP DATABASE`、`GRANT`、`REVOKE` 不向 agent 开放。
-- 不做完整工作区或共享工作区模型，不做 workspace 成员、角色、所有权、TTL、快照、一键恢复或自动删库；数据模型保留后续扩展空间。
-- 不做团队/多租户、数据脱敏、列级授权或 RLS 管理；保密边界仍由数据库及部署环境负责。
-- 不做跨驱动统一的存储空间和表数量硬限额；第一版只提供能够一致执行的连接、超时、返回行数、建库数量和建库频率限制。
-- 不做限时写授权或常驻提权状态；token 的人工授权创建后不可修改。成功的 `create_database` 可按该次已审批请求自动给创建 token 增加新 source，这是建库结果的一部分，不允许借此修改其他 source 权限。
-- 不支持 NoSQL；Oracle 只在驱动接口上留位置。
-- 不做 stdio transport、IM 审批。
-- 不替代数据库自身的备份、恢复、账号权限、审计和资源治理体系。
+- 不承诺“所有错误都可拦截”或“写不出灾难”；审批和权限不保证业务语义正确，合法 SQL 仍可能写坏业务数据。
+- 当前不开放 agent 写生产数据；生产写入在真实需求出现后单独设计。
+- 不提供 agent 删库、账号/角色管理或权限管理。建库所需的账号配置仅由受控 provisioner 内部完成，不向 agent 暴露任意管理 SQL。
+- 不做完整工作区/共享工作区、成员体系、TTL、快照、一键恢复或自动删库；保留创建者、父 source 和生命周期扩展空间。
+- 不做团队/多租户、数据脱敏、列级授权或 RLS 管理；实际数据库授权仍由管理员负责。
+- 不做跨驱动统一的存储空间和表数量硬限额；第一版限制连接、执行时间、返回行数、请求速率、建库数量和频率。
+- token 人工分配创建后不可修改，变更须撤销重签；受审批的新库创建结果可以增加该 token 对新 source 的 tools，不允许借此修改其他 grants。
+- 不做 NoSQL、stdio transport、IM 审批或分布式多实例部署；按需启动不等于无状态或 serverless。
+- 不替代数据库备份、恢复、原生资源治理和审计。
 
-## 2. 授权与风险策略
+## 2. 部署与运行生命周期
 
-### 2.1 判定顺序
+- 服务可以位于个人电脑、开发机、内网管理机、容器或数据库所在主机，只需能访问数据库，并被 MCP 客户端和管理者访问。
+- 使用期间 HTTP 服务须保持运行。单人可按需启动，多客户端可常驻；部署位置不改变授权与审批语义。
+- source、profile 元数据、token/grants、审计、审批状态和建库预留须持久化；数据库连接池与 MCP 会话是进程内状态。
+- 停机/重启不能自动执行旧批准或盲目重放写入。尚未执行的待批/已批请求终止，客户端需重新发起并重新审批；已经发出的写入若结果未知，保留未知状态并人工核对，不标记为未执行或重试。
+- 非本机接入必须明确公开访问地址、受信代理及 Origin 校验配置；admin 登录会话须有 HttpOnly、SameSite、CSRF 防护，并在 HTTPS 下使用 Secure cookie。仅监听本机且经 SSH 隧道接入仍是默认部署。
 
-每次调用按以下顺序判定；前置检查失败时不得继续执行、申请审批或触发数据库连接：
+## 3. 授权、连接与审批
 
-1. 认证 token，并确认未撤销；
-2. 校验 token 的 tool 白名单；
-3. 解析 source 并校验 token 的 source 分配；
-4. 执行 source 自身策略，包括归档状态、生产只读和建库开关；
-5. 对 SQL tool 使用对应方言的 fail-closed 解析识别查询、普通写入、高危、禁止和未知操作；多语句或未知语句直接拒绝；
-6. 对普通 SQL 应用 source 的 `readonly`、`readwrite`、`approval` 模式；
-7. 高危 SQL 无论 source 是 `readwrite` 还是 `approval` 都逐次审批；
-8. 建库额外检查活动库配额与创建频率，再逐次审批。
+### 3.1 Per-source tool grants
 
-`readwrite` 不能绕过高危审批，admin 开启建库也不能绕过 token tool 权限、source 分配、配额或逐次审批。
+每条 grant 是 `(token, source, tool)`，默认拒绝，并可为普通写入携带 `direct/approval` 执行策略；策略只决定已有 grant 如何执行，不赋予 tool 能力。source 不因另一个 source 上已有相同 tool 而开放；拥有查询不隐含写入，拥有 DDL 不隐含查询或建库。
 
-审批记录必须绑定不可变的请求摘要（请求类型、token、tool、source、规范化 SQL 与参数或建库参数的摘要），批准只能消费一次。等待审批期间不保留授权快照；批准后、执行外部写之前必须重新校验 token 未撤销、tool/source 授权、source 状态与策略、生产限制和配额。摘要不匹配、状态变化或重复消费都必须拒绝并审计。
+- 会话工具列表是该 token 在所有有效 source 上 grants 的并集；调用时必须再次校验当前 source 上的精确 grant，不能因 tool 已在别处可见而放行。
+- `list_sources` 是认证后的基础发现工具，只返回至少存在一个 grant 且未归档的 source；不额外维护全局白名单，返回结果不能扩大任何 tool 权限。
+- source 选择参数只包含该 token 对当前 tool 有 grant 的有效 source；外部直接构造未授权参数同样拒绝。
+- 新建 source 自动授权是明确例外，须更新当前会话的 source 授权视图；tool 集合变化时通过协议通知或要求重建会话后发现，不能让静态参数枚举永久阻止访问新 source。
 
-### 2.2 SQL 风险分级
+### 3.2 Connection profiles
 
-| 类别 | 语句 | 行为 |
+每个 source 可配置任意数量的命名 profiles；每个 profile 有用途类别、凭证引用、连接限制和启用状态。数量不限于两个，同类别可有多个 profile。每个 tool 绑定一个明确 profile；找不到可用映射时拒绝，不能自动升级到权限更大的身份。
+
+| 用途类别 | 用途 | 典型 tool |
 | --- | --- | --- |
-| 通用 SQL 禁止 | `CREATE DATABASE`、`DROP DATABASE`、`GRANT`、`REVOKE` | `query_sql`/`execute_sql` 在连接数据库前直接拒绝；建库只能走 `create_database`，其余不向 agent 开放 |
-| 高危 | 库内对象的 `DROP`、`TRUNCATE`、`ALTER`、无 `WHERE` 的 `UPDATE`/`DELETE`、`CALL`/`EXECUTE` | 无论 source 是 `readwrite` 还是 `approval` 都逐次审批 |
-| 普通写入与库内 DDL | `INSERT`、带 `WHERE` 的 `UPDATE`/`DELETE`、`CREATE TABLE/INDEX/VIEW` 等 | 按 source 模式处理 |
-| 查询 | `SELECT`、只读元数据查询和不会执行被解释语句的执行计划 | 只允许 `query_sql`，走只读池 |
+| `query` | 元数据和受限查询 | `list_tables`、`describe_table`、`explain_query`、`query_sql` |
+| `mutate` | 数据写入 | `mutate_sql` |
+| `schema` | 库内结构操作 | `execute_ddl` |
+| `provision` | 同一数据库服务上的受控建库及必要账号配置 | `create_database` |
 
-SQL 解析用于执行策略，是高危审批边界的一部分：必须按对应方言解析单条语句，多语句、解析失败或无法证明类别的语句一律拒绝，不能退回关键词猜测。数据库原生权限承担粗粒度的最终越权保护：普通只读/读写账号不得拥有建库、角色或授权管理权限。`query_sql` 只走只读池，避免通过副作用函数写入；存储过程和动态 SQL 入口一律归为高危；普通账号还必须无权通过 definer 函数、角色切换或其他间接入口取得数据库级管理能力。无法确认间接执行效果的调用直接拒绝，人工批准不能解除此限制。`EXPLAIN ANALYZE` 等会实际执行被解释语句的变体不属于 `explain_query`，必须通过对应的查询或写入 tool 并重新执行完整授权和风险判定。
+普通 profiles 不能拥有数据库级建库、角色/授权管理权限，也不能通过 definer 函数、角色切换等间接入口取得这些能力；provision profile 必须与普通执行路径隔离，不进入普通 SQL 可选连接集合。
 
-### 2.3 Agent 建库
+同一 DSN 可以供多个普通 profiles 引用，但这不产生数据库级隔离。管理页须提示复用凭证的风险；`query` 的实际只读性必须由数据库权限、受支持的只读会话/事务或 SQLite 只读打开方式实现，不能仅靠 profile 名称保证。每个驱动都必须通过 query profile 直接尝试数据写入和 schema DDL（绕过 SQL tool 分类），由数据库/文件边界拒绝且夹具状态不变，才能启用该 profile；无法完成负向集成验证的 profile 不得用于查询路径。
 
-- `create_database` 的目标是一个已分配给 token、且由 admin 开启建库能力的 source；source 代表同一数据库服务上的建库入口，不额外引入 server 实体。
-- source 的普通读写凭证不得拥有服务器级建库能力。建库使用独立 provisioner 凭证；该凭证不得进入普通连接池、不得由通用 SQL 使用、不得通过 API 或审计回显。
-- agent 提供用途等受限参数，服务端负责生成或校验安全的数据库标识；不能接受任意 DSN、主机、环境或 provisioner 参数。新 source 的环境由 parent source 的 admin 预设策略决定，agent 不能自行把新库标为生产。
-- 每个 token 在每个建库 source 下最多保有 5 个活动的 agent 创建库；每个 token 在每个建库 source 下每分钟最多成功创建 1 个库。归档后的新 source 不计活动库数量。admin 可配置更低上限，但不能取消逐次审批。
-- 配额和频率先在进入审批前做快速检查；批准后、外部创建前必须在本地状态库事务内重新检查并原子预留活动库槽位和频率窗口。并发请求只有取得预留者可执行；执行前拒绝、取消、审批超时，或已证明物理创建未发生的失败须释放预留；执行结果未知或部分成功时保留隔离的预留，停止后续创建并由 admin 核对实际状态后结算，不能自动释放。恢复已归档的新 source 也必须重新满足活动库配额。
-- 新库成功登记后，创建 token 按新 source 的环境获得权限：非生产 source 为 `readwrite`，生产 source 为 `readonly`；这是已审批建库请求的结果，不代表 token 可以修改其他 source 授权。其他 token 默认不可见，须由 admin 另行签发或授权。
-- `DROP DATABASE` 不提供 agent tool。物理数据库删除由人通过数据库运维流程执行，不由 source 归档代替。
+agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永不回显。profile 只能由 admin 配置和停用，token/grant 不赋予管理 profile 的权限。
 
-### 2.4 Source 生命周期
+### 3.3 调用判定与审批
 
-- source 归档和恢复只属于 admin 管理面，不作为 MCP agent tool 暴露。
-- 归档会阻止新请求、关闭对应连接池并从 agent 可见列表中移除，但保留 source 配置、审批和审计记录，不删除物理数据库。
-- 恢复由 admin 显式执行，恢复前重新校验配置、凭证和活动库配额；agent 不能归档、恢复或删除 source。
+1. 认证 token，确认未撤销；
+2. 解析目标 source，确认有效且该 token 在此 source 上有当前 tool grant；
+3. 检查生产限制，解析当前 tool 的服务端 profile 映射并确认启用；
+4. SQL 按方言 fail-closed 解析，拒绝不属于该 tool 的语句、多语句、禁止或未知操作；
+5. 检查请求速率及适用配额；
+6. 应用 source/tool 审批策略，高危 SQL 和建库不能降低为直接执行；
+7. 外部执行前复核授权、source/profile 状态与版本、环境和策略；需要配额预留的操作须原子完成预留。
 
-## 3. 需求与验收
+普通写入的 grant 可由 admin 配置 `direct` 或 `approval`，新增 grant 默认 `approval`；source/tool 路由还能设置不可下调的最低策略，实际策略取 grant、路由最低策略和内置强制规则中的更严格者。`direct` 不跳过高危审批。普通审批可通过受信客户端的 MCP elicitation 交互确认，不支持时转 admin 待批队列；它只是交互确认，不是独立的人类身份凭证。高危 SQL 与建库必须由 admin 在管理页或 CLI 决定，不能仅凭 agent 客户端的 accept。
 
-本节使用 `AC2-*` 作为 2026-11-13 目标基线的独立验收编号。T-01 引用的 `AC-01`～`AC-11` 仅属于 2026-11-11 基线，其证据不自动证明本节要求；旧编号及证据保留在 T-01 任务与变更记录中，不在当前验收编号上复用。实现进度和证据位置以 `TASK.md` 为准。
+批准必须绑定精确不可变请求摘要（token、source、tool、完整操作参数以及解析后的执行目标/profile 版本），只能消费一次。等待期间撤销 token、归档 source、停用 profile、变更路由/策略或请求内容，都使旧批准失效。未知结果禁止自动重试。
+
+### 3.4 SQL 工具与风险
+
+| 类别 | 行为 |
+| --- | --- |
+| 查询 | `query_sql` 只允许只读语句并走有效只读 profile；副作用调用、写 CTE 等不能混入 |
+| 数据变更 | `mutate_sql` 只接受数据变更，不接受结构或数据库级管理；普通写按审批策略 |
+| 库内 DDL | `execute_ddl` 处理表、索引、视图等库内对象；不能管理数据库、账号或权限 |
+| 高危 | 库内 `DROP`、`ALTER`、`TRUNCATE`、无 `WHERE` 的 `UPDATE/DELETE` 总是 admin 审批；`TRUNCATE` 归 `mutate_sql` |
+| 间接执行 | `CALL/EXECUTE` 仅在能确认操作范围属于数据变更时归 `mutate_sql`，且总是 admin 审批；不能确认效果或可能绕过数据库管理禁令时直接拒绝 |
+| 禁止 | 所有通用 SQL tools 禁止 `CREATE/DROP DATABASE`、账号/角色管理和 `GRANT/REVOKE`；包含方言等价形式，MySQL 的 `CREATE/DROP SCHEMA` 按数据库级操作处理 |
+
+单条 SQL 按方言解析，未知、多语句、解析失败或不能确认间接效果一律拒绝，不能退回关键词猜测。SQL 解析承担 tool 范围与审批策略边界，数据库最小权限承担执行身份的最终能力边界。
+
+`explain_query` 仅允许只读查询的非执行型计划，不接受 `ANALYZE` 等实际执行变体或写语句。不能用执行计划入口绕过 `query_sql`/`mutate_sql` grants。`WHERE` 存在不代表影响小，例如 `WHERE 1=1` 仍可改全表，普通写入不能因此宣称安全。
+
+### 3.5 Agent 建库
+
+- 不额外引入 server 实体。source 兼任同一数据库服务的建库入口，必须存在启用的 provision profile 映射，且 token 在该 source 上获授 `create_database`。
+- 不再有独立建库开关。缺少 provision 映射/凭证或 tool grant 时，在审批前拒绝；有资格也必须每次经过 admin 审批。
+- agent 只提供用途等受限参数；实际名称、主机、凭证、环境和新 source 配置由服务端生成或 admin 预设，不能由 agent 注入任意 DSN 或服务器参数。
+- 审批展示创建目标、数据库名称、环境、所用 profile 身份摘要，以及将授予创建 token 的新 source tools，全部绑定批准摘要。
+- 新库需配置适用的 query/mutate/schema profiles，登记父 source、创建 token/agent、环境和审计。非生产新库按 admin 预设模板授予显式 tool 集合；生产新库只授予查询/元数据 tools。新库不继承 provision 能力或 `create_database` grant，不能递归建库绕过配额。
+- 新 source grants 与本地登记事务一致；尚未就绪的 source 不可见。物理建库和本地登记不能跨边界原子提交时，部分成功必须隔离并由 admin 核对，不能谎报成功或自动清理未知结果。
+- 每 token × 父建库 source 默认最多 5 个活动创建库，每 60 秒最多成功创建 1 个；admin 可收紧。只统计该父 source 创建结果，别名 source 和重签 token 不构成服务器全局存储限额。
+- 审批前检查，执行前原子复核并预留数量和频率窗口；并发竞争失败不执行。归档不计活动配额，恢复须重新占用；归档不会释放物理存储，不能据此承诺磁盘安全。
+- 执行前取消/拒绝/审批超时，或已证明未创建时释放预留；创建结果未知/部分成功保留隔离预留，阻止该 token × 父 source 后续创建，待 admin 核对结算。
+- `DROP DATABASE` 不向 agent 开放。物理删除由人经数据库运维流程执行，source 归档不能替代删库。
+
+### 3.6 Source 生命周期
+
+归档和恢复仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。
+
+## 4. 需求与验收
+
+使用 `AC2-*` 表示本轮目标基线，条目会随尚未实现的设计修订。T-01 的 `AC-01～AC-11` 属于 2026-11-11 基线，其证据不自动证明本节；后续实现任务须固定引用对应基线提交。
 
 | 编号 | 需求 | 验收标准 |
 | --- | --- | --- |
-| `AC2-01` | agent 身份与 source 可见性 | 缺少、未知或已撤销 token 时 `/mcp` 返回 401；`list_sources` 只返回该 token 配置且未归档的 source；工具的 `source` 参数只接受该 token 可访问的 source。 |
-| `AC2-02` | `readonly` 无法写入 | `readonly` 的 token 不能通过普通 SQL 修改数据或 schema；写语句不执行，库内数据与 schema 不变。 |
-| `AC2-03` | `readwrite` 普通读写 | 非生产 source 的 `readwrite` token 可直接执行普通写入；高危 SQL 仍按 `AC2-16` 审批。 |
-| `AC2-04` | `approval` + elicitation 逐条确认 | 客户端声明 elicitation 能力时，每条普通写语句触发一次确认；accept 后执行，decline/cancel 后不执行；查询不触发确认。 |
-| `AC2-05` | `approval` + 管理面兜底 | 客户端未声明 elicitation 能力时，写语句进入待批队列；admin 批准后执行，拒绝或超时后返回错误且不执行。 |
-| `AC2-06` | 参数绑定 | SQL 只通过 `params` 传参；参数中的引号、分号不改变语句结构。 |
-| `AC2-07` | 结果集截断 | 结果行数超过 source 的 `max_rows` 时最多返回 `max_rows` 行，并显式标记结果被截断。 |
-| `AC2-08` | 语句超时 | 超过 `statement_timeout_ms` 的语句返回超时错误，连接池不被挂死，后续请求可正常执行。 |
-| `AC2-09` | 审计 | SQL 调用、审批及拒绝写入可定位审计，包含 token/agent、tool、source、决定、渠道、原因、耗时和行数等适用字段。 |
-| `AC2-10` | 管理面隔离 | 管理接口只接受 admin 身份；agent token 访问返回 401/403；服务只监听 `127.0.0.1`。 |
-| `AC2-11` | 配置校验 | 非法 DSN、未知 source、非法模式、非法环境、生产写权限、非正数限制或建库开关缺少 provisioner 凭证时启动/保存失败，并指出字段路径。 |
-| `AC2-12` | tool 白名单 | token 只能发现和调用创建时分配的 MCP tools；直接调用未授权 tool 也被服务端拒绝并审计。 |
-| `AC2-13` | tool × source 双重授权 | 拥有 tool 但未分配 source，或拥有 source 但未分配 tool 时都不能执行；任一维度不能隐式扩大另一维度。 |
-| `AC2-14` | 生产 source 只读 | 标为 `prod` 的 source 对普通 SQL 只提供查询和元数据能力；任何写入或库内 DDL 均在数据库执行前拒绝。专用建库按 `AC2-17～AC2-20` 独立判定，不能写入现有生产库。 |
-| `AC2-15` | 通用 SQL 策略 | `query_sql`/`execute_sql` 收到数据库管理语句、多语句、解析失败或未知语句时在数据库执行前拒绝并审计；普通只读/读写账号不具备建库、角色或授权管理权限。 |
-| `AC2-16` | 高危 SQL 强制审批 | 库内对象的 `DROP`、`TRUNCATE`、`ALTER`、无 `WHERE` 的 `UPDATE`/`DELETE`、`CALL`/`EXECUTE` 在 `readwrite` 与 `approval` 下均进入 admin 认证的逐次审批；批准绑定精确请求摘要且只能消费一次，拒绝、取消、超时、摘要不符或执行前复核失败均不执行。 |
-| `AC2-17` | source 建库开关 | token 即使拥有 `create_database`，目标 source 未显式开启建库时也在审批前拒绝；开关默认关闭。 |
-| `AC2-18` | 建库逐次审批与专用凭证 | 每次符合条件的 `create_database` 都进入 admin 认证的人工审批；批准绑定精确请求摘要且只能消费一次，执行前重新校验全部授权与策略；通过后只由隔离 provisioner 执行，agent 和普通 SQL 不能获取或使用该凭证。 |
-| `AC2-19` | 建库配额 | 每 token × 建库 source 最多 5 个活动库且每分钟最多成功创建 1 个；批准后、创建前必须原子复核并预留，超限或并发竞争失败不执行；确认未创建才释放预留，未知/部分成功保留隔离预留待人工核对，恢复归档 source 也受活动库配额约束。 |
-| `AC2-20` | 建库登记与授权 | 建库成功后登记新 source、创建 token/agent、父 source、环境和审计；创建 token 对非生产新 source 自动获得 `readwrite`，对生产新 source 只获得 `readonly`。跨边界部分成功必须停止并进入人工处置，不得暴露未就绪 source 或谎报成功。 |
-| `AC2-21` | admin-only 归档与恢复 | 只有 admin 可归档和恢复 source；agent 无对应 tool，直接访问管理接口被拒绝；归档不删除物理库且保留审计。 |
+| `AC2-01` | 身份与发现 | 缺失、未知或撤销 token 返回 401；`list_sources` 只返回 token 至少持有一个 grant 且有效的 source，不返回凭证 |
+| `AC2-02` | 只读查询 | 仅获查询 tools 的 token 不能写入数据/schema；每个驱动须通过 query profile 直连负向集成测试，证明数据写入与 schema DDL 被数据库/文件边界拒绝且夹具不变，不能靠名称或 SQL 分类通过 |
+| `AC2-03` | 普通写入 | 获相应 source/tool grant 且有适用 profile 时，非生产普通写按 grant、路由最低策略和内置规则中的最严格策略执行，无 profile 不回退 |
+| `AC2-04` | 普通交互审批 | 普通写的 elicitation accept 才执行，decline/cancel 不执行；不是高危/建库的 admin 批准替代品 |
+| `AC2-05` | admin 审批 | 不支持 elicitation 的普通审批及所有高危/建库进入 admin 队列；拒绝、取消、超时不执行 |
+| `AC2-06` | 参数绑定 | 值参数通过绑定传递，不改变 SQL 结构；建库标识符由服务端生成/校验，不按值参数拼接任意管理 SQL |
+| `AC2-07` | 结果限制 | 超过 source 行数上限显式截断；不把结果截断等同于限制数据库扫描成本 |
+| `AC2-08` | 资源限制 | 每 profile 连接上限、语句超时、token 请求速率按配置执行；未支持的硬限制明确拒绝配置，不假装生效 |
+| `AC2-09` | 审计 | 记录 token/agent、source、tool、profile 标识、决定、渠道、原因与适用耗时/行数，绝不记录凭证 |
+| `AC2-10` | 部署与管理隔离 | 可在非数据库主机按需启动；默认本机监听，非本机接入具备 TLS/认证/网络控制；agent 不能操作 admin API |
+| `AC2-11` | 配置校验 | 未知 tool/profile、错误用途映射、生产写 grant、非法凭证引用或限制保存失败；连接数不固定为两个，query 实际只读性有验证依据 |
+| `AC2-12` | 工具发现 | 展示 token 在有效 source 上 grants 的 tool 并集，加基础 `list_sources`；不可见不替代调用鉴权 |
+| `AC2-13` | 精确 grant | A 库获某 tool 不允许对 B 库调用该 tool；直接构造参数也拒绝；source/profile/环境限制始终生效 |
+| `AC2-14` | 生产只读 | prod source 拒绝 `mutate_sql/execute_ddl` grants 及调用；专用建库独立审批，不修改既有生产数据 |
+| `AC2-15` | SQL 范围 | query/mutate/DDL 严格分离；数据库级管理、未知、多语句或解析失败在外部执行前拒绝；explain 不能执行 SQL |
+| `AC2-16` | 高危策略 | 高危 SQL 必须 admin 审批，direct 不豁免；摘要不符、撤销、路由/策略变化和重复消费都不执行 |
+| `AC2-17` | 建库能力 | create_database 必须同时有目标 source 的精确 grant 和启用 provision 映射；无重复布尔开关，缺任一条件审批前拒绝 |
+| `AC2-18` | 建库审批 | 每次建库由 admin 批准并绑定创建目标、profile 版本和结果 grants；一次性消费，执行前复核；provision 凭证不能进入通用 SQL |
+| `AC2-19` | 并发配额 | 默认每 token × 父 source 5 个活动库、60 秒成功 1 个；执行前原子预留，恢复受限；未知结果保留隔离预留待核对 |
+| `AC2-20` | 新库登记 | 就绪后才暴露新 source 与结果 grants；prod 仅查询，非 prod 按审批模板；不继承建库能力；现有会话可重新发现新 source |
+| `AC2-21` | 归档恢复 | 仅 admin 操作，阻止新请求、使待批失效、保留记录且不删物理库；恢复复核 profiles、grants 和配额 |
+| `AC2-22` | 按需停启 | 重启保留配置/grants/审计/预留；不重放旧批准或外部写；未发出请求终止，已发出未知请求保留待核对状态 |
+| `AC2-23` | 旧模型迁移 | 停服后按固定矩阵导入 TOML 与状态库，用 journal 完成可恢复 cutover，不生成建库能力；未分类 source 禁用。提交后活动 TOML 不含旧凭证/权限，旧 binary 用活动配置无法获得 source；新服务只启用分类 tools 并拒绝旧 `execute_sql`，失败/崩溃只能回滚提交点前状态或进入 recovery |
 
-需要端到端验证的新增 AC 及检查点：
+端到端证据检查点（不是本次文档变更的运行结果）：
 
-- `AC2-12/AC2-13`：签发不同 tool/source 组合的 token → 建立 MCP 会话 → 检查工具发现结果 → 直接调用未授权组合 → 确认拒绝且数据库无请求、审计有记录。
-- `AC2-16`：使用 `readwrite` token 提交高危 SQL → 进入 admin 待批队列 → 分别批准和拒绝 → 批准后篡改请求或撤销 token 再执行 → 确认只有请求摘要一致且执行前复核通过的批准分支执行一次。
-- `AC2-18～AC2-20`：并发调用 `create_database` → 校验 source 开关与初次配额 → admin 分别批准、拒绝 → 执行前原子复核和预留 → provisioner 实际创建 → 新 source 按环境登记并只对创建 token 可见；另跑超限、执行失败和恢复超额路径，确认配额不被穿透、确定未创建时释放预留、未知或部分成功保留隔离预留并进入人工处置。
-- `AC2-21`：admin 归档 source → 新请求被阻止且连接池关闭 → 在配额允许时由 admin 恢复；agent 调用管理接口始终失败，物理数据库未删除。
+- `AC2-02`：每个驱动用 query profile 绕过 MCP SQL 分类直接尝试 `INSERT/UPDATE/DELETE` 与 schema DDL → 数据库或 SQLite 文件只读边界全部拒绝 → 夹具数据和 schema 不变；随后正常查询仍成功。
+- `AC2-12/AC2-13`：签发 A/B source 不同 tool grants → 建立 MCP 会话看工具并集 → 在未授权 source 调用可见 tool → 确认拒绝且目标数据库无请求。
+- `AC2-15/AC2-16`：提交跨 tool SQL、执行型 explain、禁止/未知语句和高危 SQL → 前者拒绝、后者进入 admin 队列 → 批准后变更策略/撤销 token → 确认复核失败且不执行；有效批准只执行一次。
+- `AC2-17～AC2-20`：检查 provision 与 grants → 并发申请 → admin 分别批准/拒绝 → 原子预留 → 实际创建 → 登记新 source 与结果 grants → 验证创建者访问及其他 token 不可见；失败、未知、恢复超额和递归建库路径分别有数据库/状态库证据。
+- `AC2-10/AC2-22`：服务从非数据库主机启动并访问多个库 → 提交待批及已发出请求 → 停启服务 → 验证持久化、旧请求不重放、未知状态保留；远程入口验证 TLS、认证和 admin 隔离。
+- `AC2-23`：复制旧 TOML 与状态库 → 停服并取得维护锁 → staging 导入与校验 → 在各 cutover 点注入崩溃 → 验证 journal 只能完成、提交点前回滚或进入 recovery，绝不启动混合授权；成功后检查活动 TOML 无旧凭证/权限、无建库 grant、未分类 source 禁用、新服务拒绝 `execute_sql`，并用旧 binary + 活动配置确认得不到 source/agent 权限。
 
-## 4. 架构边界与关键决策
+## 5. 架构边界与数据模型
 
-- 系统边界：内部组件是配置、HTTP transport、身份鉴权、tool 授权、工具层、SQL 策略、连接池注册表、方言驱动、建库 provisioner、审批、配额、审计/状态存储、管理接口和 CLI；外部依赖是 MCP 客户端、数据库、人工审批者和凭证存储。
-- 部署与运行形态：单进程常驻数据库服务器，Bun 直接运行 TypeScript；MCP 端点 `/mcp`，管理端点 `/admin/*`；只绑 `127.0.0.1:8787`，本机通过 SSH 隧道接入。状态库默认 `./.mcp-db/state.db`。
-- 工程基线：Bun、TypeScript、ESM；单机部署。具体版本以锁文件和工程配置为准。
+### 5.1 组件与工具
 
-组件与职责（目标边界；实现进度以代码和 `TASK.md` 为准）：
+单进程 Bun/TypeScript/ESM；HTTP 端点 `/mcp`、管理页 `/admin` 与管理接口 `/admin/*`。默认状态库 `./.mcp-db/state.db`。具体工程版本以配置与锁文件为准。
 
-| 组件 | 职责 |
+| 组件 | 目标职责 |
 | --- | --- |
-| `src/config.ts` | 解析服务、source 策略、配额及凭证引用并校验跨字段约束 |
-| `src/auth.ts` | Bearer token 解析、token/tool/source 授权与 admin 身份区分 |
-| `src/transport/http.ts` | Streamable HTTP 接入、MCP 会话、能力协商、管理路由挂载 |
-| `src/tools/*.ts` | MCP tool 定义、zod schema、调用时再次鉴权 |
-| `src/core/pools.ts` | 按 source × role 建普通池；provisioner 不进入普通池注册表 |
-| `src/core/sql.ts` | 按方言 fail-closed 解析及风险识别，承担高危审批策略边界；数据库权限仍承担最终越权保护 |
-| `src/core/provisioning.ts` | 建库参数约束、配额、审批后执行、source 原子登记和创建者授权 |
-| `src/drivers/*.ts` | 各方言元数据、查询、执行和可选建库适配 |
-| `src/core/approval.ts` | 普通写确认与 admin 高危/建库审批；不可变请求摘要、一次性决定和执行前复核 |
-| `src/core/store.ts` | source、token、tool/source 授权、审批、配额计数与审计持久化 |
-| `src/core/audit.ts` | 审计记录写入；安全关键拒绝和建库结果必须可定位 |
-| `src/admin/*` | token、source、建库开关、审批、审计、归档和恢复 |
-| `src/cli/*` | 本机 CLI：serve、approvals、approve、deny 等管理操作 |
+| `src/config.ts` | 部署、profiles、路由、审批策略、限制及跨字段校验 |
+| `src/auth.ts` | token 身份、精确 source/tool grant、admin 区分 |
+| `src/transport/http.ts` | MCP 会话/发现、远程接入边界、生命周期 |
+| `src/tools/` | 工具 schema、调用鉴权与操作类别约束 |
+| `src/core/pools.ts` | 按 source/profile 建池，禁止未配置回退与 provision 越界 |
+| `src/core/sql.ts` | 方言解析、工具范围、禁止及高危操作策略 |
+| `src/core/provisioning.ts` | 建库审批、预留、方言执行、结果登记与异常核对 |
+| `src/core/approval.ts` | 请求绑定、一次性决定、执行前复核 |
+| `src/core/store.ts` | source/profile/grants、审批、配额、审计持久化 |
+| `src/admin/`、`src/cli/` | 管理配置、审批、归档恢复和审计查询 |
 
-关键取舍：
+机器可读契约以 `src/tools/` 的 schemas 为准；新增/迁移接口随实现同步更新，本文不把目标工具表冒充已实现接口。
 
-1. **HTTP 而非 stdio**：服务在数据库服务器，本机客户端通过隧道接入。
-2. **工具能力与数据范围正交**：token 的 tool 白名单回答“能做什么”，source 分配和模式回答“能在哪里做”；必须同时通过。
-3. **数据库权限是最终边界**：只读、读写和 provisioner 凭证隔离；应用分类、工具隐藏和审批不能替代数据库原生授权。
-4. **建库是专用能力**：source 兼任同一服务的建库入口，不提前引入 server 实体；通用 SQL 不能获得数据库级管理能力。
-5. **审批不等于授权**：高危 SQL 和建库必须审批，但审批不能绕过 tool、source、生产只读、开关和配额检查。
-6. **token 通常不可变**：调整人工分配须撤销重签；建库成功后的创建者授权是已审批结果的原子组成部分。
-7. **归档可逆、删除外置**：管理面只管理 source 生命周期，不代替数据库物理删除和恢复流程。
-8. **工作区后置**：当前用 `created_by`、父 source、环境和生命周期字段保留演进空间，不提前实现 workspace 权限体系。
-
-## 5. 对外契约与数据模型
-
-### 5.1 MCP tools
-
-机器可读形状以 `src/tools/` 中的 zod schema 为准；实现新增工具时同步更新 schema。以下只规定非机器可读语义：
-
-| tool | 典型授权 | 说明 |
-| --- | --- | --- |
-| `list_sources` | 基础 | 仅返回 token 被分配且未归档的 source，不返回任何 DSN |
-| `list_tables` | 元数据 | 表/视图清单；source 必须可访问 |
-| `describe_table` | 元数据 | 列、类型、可空、默认值、主键、索引、外键 |
-| `explain_query` | 查询 | 只提供不会执行被解释语句的执行计划；`ANALYZE` 等执行型变体必须改走对应查询/写入 tool |
-| `query_sql` | 查询 | 只接受只读 SQL，始终走只读池 |
-| `execute_sql` | 写入/库内 DDL | 不接受数据库级管理；普通写按 source 模式，高危写强制审批 |
-| `create_database` | 建库 | source 开关、配额、频率与逐次审批全部通过后，由隔离 provisioner 建库并登记新 source |
-
-工具只对被 token 白名单允许的会话注册/展示；无论是否展示，服务端都必须在调用时重复鉴权。管理面的归档、恢复、token 和 source 管理不是 MCP agent tools。
-
-### 5.2 管理接口
-
-管理接口仅监听 `127.0.0.1`，只接受 admin Bearer 或由 admin 登录建立的安全会话。管理面至少承担：token tool/source 分配、source 策略与建库开关、待批决定、审计查询、source 归档与恢复。具体机器契约随实现提供，不在本文件复制。
-
-### 5.3 配置语义
-
-- source 至少包含 `id`、驱动、环境、普通只读/读写 DSN、限制参数、是否允许 agent 建库及可选 provisioner 凭证引用。
-- 开启 agent 建库时必须配置对应驱动支持的 provisioner 凭证；该凭证与普通 DSN 隔离且 API 永不回显。
-- token 至少包含 agent 标识、tool 白名单和 source→模式映射；生产 source 不能分配有效写模式。
-- 密钥、DSN 和 token 明文不得写入仓库、审计或普通日志。具体配置字段名由后续实现任务的机器契约确定。
-
-### 5.4 数据模型
-
-| 表/概念 | 关键字段或语义 |
+| tool | source profile 与约束 |
 | --- | --- |
-| `sources` | source 身份、driver、environment、状态（active/archived）、普通 DSN、provisioner 凭证引用、建库开关、父 source、`created_by_token/agent`、创建来源、限制参数、时间戳 |
-| `tokens` | agent、token hash、tool 白名单、状态、创建/撤销时间；明文只在签发响应出现一次 |
-| `token_sources` | token、source、模式；唯一约束保证每个组合只有一条有效授权 |
-| `approvals` | 请求类型（普通写/高危 SQL/建库）、token/agent、source、tool、不可变请求摘要、状态、渠道、admin 决策者、一次性消费状态、过期与决定时间 |
-| `audit` | 时间、token/agent、tool、source、请求摘要、决定、渠道、admin 决策者、原因、耗时、行数及适用的生命周期信息 |
+| `list_sources` | 无数据库连接；基础发现，返回已有 grant 的 source |
+| `list_tables` | query profile；须有当前 source/tool grant |
+| `describe_table` | query profile；结构与关系 |
+| `explain_query` | query profile；只读非执行型计划 |
+| `query_sql` | query profile；仅只读 SQL |
+| `mutate_sql` | mutate profile；DML 与受控间接数据操作，高危不能绕过审批 |
+| `execute_ddl` | schema profile；仅库内对象 DDL |
+| `create_database` | provision profile；始终 admin 审批 |
 
-建库成功时，物理创建、新 source 登记和创建 token 授权应尽可能形成可恢复的单一业务操作；数据库不支持跨边界原子事务时，失败必须停止后续步骤、记录实际状态并进入人工处置，不能盲目重试或谎报成功。
+### 5.2 数据模型与凭证
 
-### 5.5 错误与审计语义
+| 表/概念 | 语义 |
+| --- | --- |
+| `sources` | driver、environment、active/archived 状态、父 source、创建 token/agent、创建来源、限制、时间戳 |
+| `connection_profiles` | source、命名 profile、用途、凭证引用、连接限制、启用状态与版本；无固定两个的数量约束 |
+| `source_tool_routes` | source、tool、profile、最低审批策略、版本；高危/建库强制规则不可下调 |
+| `tokens` | agent、hash、状态、创建与撤销时间；不再有全局 tool 白名单 |
+| `tool_grants` | token、source、tool 三元唯一及普通写入的 direct/approval 策略；不存 readonly/readwrite source 模式，策略不赋予 tool |
+| `approvals` | token/agent、source、tool、精确请求摘要、profile/路由版本、状态、渠道、admin 决策身份、一次性消费和过期时间 |
+| `quota_reservations` | token、父 source、请求、计数/频率预留、执行状态、未知/隔离标记 |
+| `audit` | 时间、身份、source/tool/profile、摘要、决定、渠道、原因、耗时/行数及适用生命周期信息 |
 
-- 缺失、未知或已撤销 token：HTTP 401。
-- tool 未授权、source 未分配、生产写入、source 已归档、source 未开启建库、禁止 SQL、quota/rate limit 超限、admin-only 操作：在外部写前拒绝，返回可区分但不泄露凭证的错误并写审计。
-- 审批拒绝、取消或超时：工具返回拒绝错误，不执行外部写。
-- provisioner 或数据库返回未知/部分成功：停止自动重试与后续写入，保留脱敏证据并报告人工处置需求。
-- 审计至少区分 `allowed`、`rejected`、`error`，并能通过 reason 区分 tool、source、production、forbidden_sql、approval、quota、archive 等原因。
+凭证用系统密钥环或等价安全存储；持久状态记录引用，不保存真实密码/token 明文。profile 凭证不回显、不进入仓库、日志或审计。provision 必须与普通连接隔离。SQL/参数摘要也可能含业务数据，按敏感本地材料保护。
 
-## 6. 未决问题
+### 5.3 兼容与错误
 
-| 问题 | 影响 | 处理时点 |
+- 旧实现的 sources、两套 DSN 与 agent source 模式位于 TOML，审批/审计位于状态库。后续完整档实现必须使用停机维护锁和持久 migration journal 做跨工件 cutover，不能把它描述成单个 SQLite 事务：先阻止 MCP/admin 业务请求，快照活动 TOML 与状态库，再导入 staging 状态并完整校验。
+- 旧 source 的 `dsn_readonly` 转为 query profile，`dsn_readwrite` 转为 mutate 与 schema profiles；两者可以引用同一凭证但必须显示隔离告警。旧 source 没有 provision profile，也不会获得建库能力。
+- 每个旧 token × source 按固定矩阵转换：`readonly` → 元数据、非执行 explain、`query_sql` grants；`readwrite` → 前述 grants + `mutate_sql` + `execute_ddl`，这两个写 grants 的普通策略为 direct；`approval` → 与 readwrite 相同 grants，但两个写 grants 的普通策略为 approval。source/tool 路由的最低策略按最保守值初始化为 direct，由各 grant 保留原有差异，高危内置规则仍不可下调。所有转换都不生成 `create_database` grant，旧固定 tool 集不存在可额外放宽的新权限。
+- 旧 source 没有环境字段，迁移后保持 disabled，不接受业务调用；admin 必须先标记环境、验证 query profile 的真实只读边界并复核生成 grants/策略，才能逐个启用。管理员可删减迁移生成的 grants，但不能在迁移过程中隐式增加建库或生产写权限。
+- 校验 staging 状态后，以 journal 记录提交点：激活新状态，并用同目录临时文件 + fsync + rename 替换当前生效 TOML，新的活动 TOML 不再包含旧 sources、agents、DSN 或旧 token 配置。原敏感配置移到非默认路径按凭证材料保护，不能由服务自动回退读取。跨文件切换中断时，新版本只能进入 migration recovery，不能启动 MCP；恢复根据 journal 完成或在提交点前回滚，不能猜测当前 source of truth。
+- 切换成功后只注册分类 tools，旧 `execute_sql` 直接调用也拒绝。使用活动配置启动旧二进制时不得获得 source 或 agent 权限；切换后不支持自动降级。管理员故意恢复旧敏感备份并运行旧二进制属于显式回滚/凭证风险，必须停服、人工执行并重新评估数据库凭证，不能由新服务承诺阻止。
+- 缺失/未知/撤销 token 返回 401；grant 不足、profile 缺失/停用、归档、生产限制、错误 SQL 类别、限流/配额或审批拒绝返回可区分的拒绝原因并审计，不泄露凭证。
+- 审批和外部执行结果未知时停止自动重试、保留实际状态；外部副作用与本地登记不宣称跨库原子性。恢复步骤须在实现任务中明确验证。
+
+## 6. 后续实现设计事项
+
+| 事项 | 必须确定的内容 | 时点 |
 | --- | --- | --- |
-| 各驱动建库、建账号和 source 登记的补偿策略 | 物理建库与本地状态库不能跨边界原子提交，需定义失败后的人工处置与安全重试 | 建库实现任务设计阶段 |
-| 各驱动首批支持范围 | 未支持驱动必须明确拒绝，不能借通用 SQL 绕过 | 建库实现任务拆分前 |
-| 长 SQL 和建库请求在审批界面的摘要与详情 | 影响审批者能否识别目标、风险与参数 | 审批 UI 实现前 |
-| agent 创建库的长期存储监控和回收 | 当前只限制活动库数量与创建频率，不限制跨驱动存储大小 | 工作区/资源治理迭代 |
+| 驱动与 SQL 解析 | 首批建库/解析支持范围、query 只读验证、profiles 的最低原生权限 | 对应实现任务拆分前 |
+| 迁移与会话刷新 | TOML + 状态库的 journal/cutover/恢复、旧敏感配置隔离、固定 grants/策略转换、旧 binary 与 tool 退役、新 source 发现机制 | 权限实现前 |
+| 配额和限流配置 | profile 池大小/超时、token 普通请求速率的默认值、重启恢复和未知状态核对 | 限制实现前 |
+| 建库失败与凭证 | 驱动建库/账号配置补偿、凭证安全存储、admin 人工处置入口 | 建库实现前 |
+| 远程部署验收 | TLS 终止、受信代理、Origin/CSRF、停启及未知请求取证 | 远程接入实现前 |
+
+工作区、长期存储监控和自动回收另行迭代；不为预留空间提前添加无行为的 workspace/quota 占位字段。
 
 ## 7. 维护规则
 
-1. 只在用户可见行为、对外契约、数据模型、架构边界变化时更新本文件，并在 `CHANGELOG.md` 记一条。
-2. 任务级验收微调写任务或提交，不上升为基线。
-3. 超过约 300 行时按领域拆分到 `spec/<domain>.md`，保留一个索引。
-4. 同一主题只保留一个权威正文；历史材料不进入本文件。
-5. 产品意图、目标用户、场景和范围变化时更新可选的 `docs/PRD.md`；SPEC 不重复产品叙事。
-6. 对外 API 的机器可读契约以链接的 OpenAPI/schema 为准；本文件只保留链接、适用范围和非机器可读约定。
+1. 用户行为、契约、模型或架构边界变化时更新本文件与 CHANGELOG。
+2. TASK 记录实际实现和证据，目标设计不等于已交付；任务须引用基线提交。
+3. 同主题只保留一个权威正文；机器可读 API/schema 不在此复制。
+4. 超过约 300 行时按领域拆分至 `spec/` 并保留索引；历史不冒充当前要求。

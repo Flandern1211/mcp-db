@@ -2,13 +2,14 @@
 
 ## 2026-11-13
 
-- 授权模型由“仅按 source 三档模式”扩展为 **token MCP tool 白名单 × token source 模式 × source 自身策略**；工具不可见不替代服务端调用时鉴权。
-- 生产 source 的普通 SQL 对 agent 始终只读；普通写入继续按 `readonly`、`readwrite`、`approval` 处理，高危 SQL 即使在 `readwrite` 下也须由 admin 逐次审批。SQL 策略按方言 fail-closed 解析，拒绝多语句、解析失败和未知语句。
-- 新增专用 `create_database` tool：source 必须由 admin 显式开启、token 必须同时具备 tool 和 source 权限、通过原子配额预留且每次由 admin 人工批准；建库凭证与普通连接池隔离。
-- 通用 SQL 禁止 `CREATE DATABASE`、`DROP DATABASE`、`GRANT`、`REVOKE`；`DROP DATABASE` 不向 agent 开放。
-- 第一版限制每个 token 在每个建库 source 下最多 5 个活动库、每分钟最多成功创建 1 个；source 归档/恢复仅限 admin，归档不删除物理数据库。
-- 完整工作区/共享工作区、TTL、快照恢复、自动删库、跨驱动存储硬限额和生产写入暂缓；保留创建者、父 source、环境和生命周期扩展空间。
-- 本节更新目标基线，不表示代码已经实现；实现状态和证据以 `TASK.md` 为准，2026-11-11 的条目保留为历史决策。
+- 服务不再假定部署在数据库服务器或全年常驻：可在任何能访问目标数据库的受信位置按需或常驻运行；默认本机监听，远程部署必须有 TLS、认证和网络访问控制。
+- 授权模型收敛为 `(token, source, MCP tool)` 精确 grants；原 `readonly/readwrite` 仅可映射为管理页能力快捷模板，`approval` 单独迁移为执行策略，不再存在运行时 source 模式。
+- 固定双 DSN 改为不定数量的命名 connection profiles，按 `query`、`mutate`、`schema`、`provision` 用途路由；同一凭证可复用但会降低隔离，provision 必须与普通 SQL 隔离。
+- 普通 SQL 拆为 `query_sql`、`mutate_sql`、`execute_ddl`，弃用通用 `execute_sql`；工具范围按方言 fail-closed 解析，拒绝跨类、多语句、解析失败和未知语句。
+- 新增专用 `create_database` tool；不再另设“允许 agent 建库”开关。建库必须同时有目标 source 的 tool grant、启用的 provision 映射、配额预留和每次 admin 批准。
+- 生产 source 的普通 SQL 只读；高危 SQL 即使普通策略为 direct 也必须 admin 审批。通用 SQL 禁止数据库、账号、角色与授权管理，`DROP DATABASE` 不向 agent 开放。
+- 默认每 token × 父建库 source 最多 5 个活动库、每 60 秒最多成功创建 1 个；source 归档/恢复仅限 admin，归档不删除物理数据库或释放物理存储。
+- 完整工作区/共享工作区、TTL、快照恢复、自动删库、跨驱动存储硬限额和生产写入暂缓；本节是目标基线，实际实现和证据以 `TASK.md` 为准。
 
 ## 2026-11-11
 
