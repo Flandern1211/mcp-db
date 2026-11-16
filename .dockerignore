@@ -1,0 +1,11 @@
+.git
+.zcode
+.plan
+node_modules
+target
+.mcp-db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+mcp-db.toml

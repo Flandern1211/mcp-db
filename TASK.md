@@ -2,20 +2,23 @@
 
 任务状态、档位和证据位置的唯一入口。轻档只在本表登记；完整档在 `tasks/` 下建立任务文件，并在此链接。
 
+当前产品基线见 [docs/PRD.md](docs/PRD.md)，系统基线见 [SPEC.md](SPEC.md)。T-02～T-11 按 Rust AC2 基线重规划；T-01 保留为 legacy Bun/TypeScript v1 历史任务。
+
 ## 任务表
 
 | 编号 | 任务 | 档位 | 状态 | 依赖 | AC | 提交 | 未关闭项 | 证据/任务文件 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | T-01 | 实现 mcp-db v1 服务端 | 完整 | 🟡 待验收 | 无 | AC-01～AC-11 | `eb4a950`、`ec56fa4` | 2 非阻塞 | [tasks/2026-11-11-t-01-mcp-db-v1.md](tasks/2026-11-11-t-01-mcp-db-v1.md) |
-| T-02 | 建立 AC2 状态模型与身份基础 | 完整 | 进行中 | 无 | AC2-01、AC2-09、AC2-11、AC2-22（基础） | — | 0 | [tasks/2026-11-13-t-02-state-identity.md](tasks/2026-11-13-t-02-state-identity.md) |
-| T-03 | 迁移旧配置与状态库 | 完整 | 未开始 | T-02 | AC2-23 | — | 0 | [tasks/2026-11-13-t-03-legacy-migration.md](tasks/2026-11-13-t-03-legacy-migration.md) |
-| T-04 | 实现精确 grants、profile 路由与发现 | 完整 | 未开始 | T-02 | AC2-03、AC2-12～AC2-14 | — | 0 | [tasks/2026-11-13-t-04-grants-routing-discovery.md](tasks/2026-11-13-t-04-grants-routing-discovery.md) |
-| T-05 | 实现方言 SQL 策略与分类 tools | 完整 | 未开始 | T-04 | AC2-06、AC2-07、AC2-15 | — | 0 | [tasks/2026-11-13-t-05-sql-tools.md](tasks/2026-11-13-t-05-sql-tools.md) |
-| T-06 | 实现审批状态机与审计绑定 | 完整 | 未开始 | T-02、T-04、T-05 | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 | — | 0 | [tasks/2026-11-13-t-06-approval-audit.md](tasks/2026-11-13-t-06-approval-audit.md) |
-| T-07 | 实现 profile 限制与只读边界验证 | 完整 | 未开始 | T-04、T-05 | AC2-02、AC2-08、AC2-11 | — | 0 | [tasks/2026-11-13-t-07-profile-limits.md](tasks/2026-11-13-t-07-profile-limits.md) |
-| T-08 | 实现建库、配额与 source 生命周期 | 完整 | 未开始 | T-04～T-07 | AC2-17～AC2-21 | — | 0 | [tasks/2026-11-13-t-08-provisioning-lifecycle.md](tasks/2026-11-13-t-08-provisioning-lifecycle.md) |
-| T-09 | 实现远程部署与管理面安全 | 完整 | 未开始 | T-02、T-06、T-08 | AC2-10、AC2-21、AC2-22 | — | 0 | [tasks/2026-11-13-t-09-remote-admin-security.md](tasks/2026-11-13-t-09-remote-admin-security.md) |
-| T-10 | 完成 AC2 跨边界验收与发布收口 | 完整 | 未开始 | T-03～T-09 | AC2-01～AC2-23 | — | 0 | [tasks/2026-11-13-t-10-ac2-acceptance.md](tasks/2026-11-13-t-10-ac2-acceptance.md) |
+| T-02 | 建立 Rust 工程与 AC2 状态/身份基础 | 完整 | 未开始 | 无 | AC2-01、AC2-09、AC2-11、AC2-22（基础） | — | — | [tasks/2026-11-13-t-02-state-identity.md](tasks/2026-11-13-t-02-state-identity.md) |
+| T-03 | 迁移旧配置与状态库 | 完整 | 未开始 | T-02 | AC2-23 | — | — | [tasks/2026-11-13-t-03-legacy-migration.md](tasks/2026-11-13-t-03-legacy-migration.md) |
+| T-04 | 实现精确 grants、profile 路由与发现 | 完整 | 未开始 | T-02 | AC2-03、AC2-12～AC2-14 | — | — | [tasks/2026-11-13-t-04-grants-routing-discovery.md](tasks/2026-11-13-t-04-grants-routing-discovery.md) |
+| T-05 | 实现 PostgreSQL SQL 策略与分类 tools | 完整 | 未开始 | T-04 | AC2-06、AC2-07、AC2-15 | — | — | [tasks/2026-11-13-t-05-sql-tools.md](tasks/2026-11-13-t-05-sql-tools.md) |
+| T-06 | 实现审批状态机与审计绑定 | 完整 | 未开始 | T-02、T-04、T-05 | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 | — | — | [tasks/2026-11-13-t-06-approval-audit.md](tasks/2026-11-13-t-06-approval-audit.md) |
+| T-07 | 实现 PostgreSQL profile 限制与只读边界 | 完整 | 未开始 | T-04、T-05 | AC2-02、AC2-08、AC2-11 | — | — | [tasks/2026-11-13-t-07-profile-limits.md](tasks/2026-11-13-t-07-profile-limits.md) |
+| T-08 | 实现 PostgreSQL 建库、配额与 source 生命周期 | 完整 | 未开始 | T-04～T-07 | AC2-17～AC2-21 | — | — | [tasks/2026-11-13-t-08-provisioning-lifecycle.md](tasks/2026-11-13-t-08-provisioning-lifecycle.md) |
+| T-09 | 实现首版本机 CLI 与 Web 管理面 | 完整 | 未开始 | T-02、T-06、T-08 | AC2-10（首版本机）、AC2-21、AC2-22 | — | — | [tasks/2026-11-13-t-09-local-admin.md](tasks/2026-11-13-t-09-local-admin.md) |
+| T-10 | 完成首版 AC2 跨边界验收与发布收口 | 完整 | 未开始 | T-03～T-09 | AC2-01～AC2-23（首版 PostgreSQL 范围） | — | — | [tasks/2026-11-13-t-10-ac2-acceptance.md](tasks/2026-11-13-t-10-ac2-acceptance.md) |
+| T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 未开始 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | — | — | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
 
 ## 状态定义
 
