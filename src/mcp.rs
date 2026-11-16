@@ -12,15 +12,18 @@ use rmcp::service::RequestContext;
 use rmcp::{tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use serde_json::Value;
 
+use crate::executor::SqlExecutor;
 use crate::metadata::MetadataProvider;
+use crate::sql_policy::validate_for_tool;
 use crate::{AuthorizedCall, Authorizer, Error, Store, TokenIdentity, Tool};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub metadata: Arc<dyn MetadataProvider>,
+    pub executor: Arc<dyn SqlExecutor>,
+    pub max_rows: usize,
     /// MCP session id -> token id. Prevents a session from switching identity.
     pub sessions: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -47,8 +50,6 @@ struct ExplainArgs {
     #[schemars(description = "Source id; may be omitted when the token has one source")]
     source: Option<String>,
     sql: String,
-    #[serde(default)]
-    params: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -170,7 +171,105 @@ impl McpDbServer {
         })))
     }
 
-    #[tool(description = "Return the database query plan for a statement.")]
+    #[tool(description = "Execute one read-only SQL statement with bound parameters.")]
+    async fn query_sql(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ExplainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::QuerySql) {
+            Ok(call) => call,
+            Err(result) => return Ok(result),
+        };
+        let validated = match validate_for_tool(&args.sql, Tool::QuerySql) {
+            Ok(validated) => validated,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        let outcome = match self
+            .state
+            .executor
+            .query(&call.profile, &validated.sql, &[], self.state.max_rows)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        Ok(CallToolResult::structured(json!({
+            "source": call.source.id,
+            "columns": outcome.columns,
+            "rows": outcome.rows,
+            "rowCount": outcome.row_count,
+            "returnedRows": outcome.returned_rows,
+            "truncated": outcome.truncated,
+        })))
+    }
+
+    #[tool(description = "Execute one data-modifying SQL statement.")]
+    async fn mutate_sql(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ExplainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::MutateSql) {
+            Ok(call) => call,
+            Err(result) => return Ok(result),
+        };
+        let validated = match validate_for_tool(&args.sql, Tool::MutateSql) {
+            Ok(validated) => validated,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        // shortcut: approval policy handoff (direct vs admin queue) is owned by T-06.
+        let outcome = match self
+            .state
+            .executor
+            .mutate(&call.profile, &validated.sql, &[])
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        Ok(CallToolResult::structured(json!({
+            "source": call.source.id,
+            "rowCount": outcome.row_count,
+            "highRisk": validated.high_risk,
+        })))
+    }
+
+    #[tool(description = "Execute one database-local DDL statement.")]
+    async fn execute_ddl(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ExplainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::ExecuteDdl) {
+            Ok(call) => call,
+            Err(result) => return Ok(result),
+        };
+        let validated = match validate_for_tool(&args.sql, Tool::ExecuteDdl) {
+            Ok(validated) => validated,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        // shortcut: approval policy handoff (direct vs admin queue) is owned by T-06.
+        let outcome = match self
+            .state
+            .executor
+            .mutate(&call.profile, &validated.sql, &[])
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        Ok(CallToolResult::structured(json!({
+            "source": call.source.id,
+            "rowCount": outcome.row_count,
+            "highRisk": validated.high_risk,
+        })))
+    }
+
+    #[tool(description = "Return the database query plan for one read-only statement.")]
     async fn explain_query(
         &self,
         context: RequestContext<RoleServer>,
@@ -182,11 +281,14 @@ impl McpDbServer {
             Ok(call) => call,
             Err(result) => return Ok(result),
         };
-        // shortcut: SQL class and non-executing plan policy are owned by T-05.
+        let validated = match validate_for_tool(&args.sql, Tool::ExplainQuery) {
+            Ok(validated) => validated,
+            Err(error) => return Ok(tool_error(error)),
+        };
         let plan = match self
             .state
-            .metadata
-            .explain(&call.profile, &args.sql, &args.params)
+            .executor
+            .explain(&call.profile, &validated.explain_sql())
             .await
         {
             Ok(plan) => plan,

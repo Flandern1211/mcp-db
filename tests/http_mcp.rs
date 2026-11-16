@@ -11,8 +11,8 @@ use http_body_util::BodyExt;
 use mcp_db::transport::http::app;
 use mcp_db::{
     AppState, ApprovalPolicy, Driver, EncryptedFileResolver, Environment, MetadataProvider,
-    NewGrant, NewProfile, NewRoute, NewSource, PostgresMetadata, Profile, ProfilePurpose, Store,
-    Tool,
+    NewGrant, NewProfile, NewRoute, NewSource, PostgresExecutor, PostgresMetadata, Profile,
+    ProfilePurpose, Store, Tool, UnavailableExecutor, DEFAULT_MAX_ROWS,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -72,6 +72,8 @@ fn setup() -> (TempDir, AppState, String, Arc<MockMetadata>) {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         metadata: metadata.clone(),
+        executor: Arc::new(UnavailableExecutor),
+        max_rows: DEFAULT_MAX_ROWS,
         sessions: Default::default(),
     };
     (dir, state, token.token, metadata)
@@ -136,6 +138,8 @@ const LIST_SOURCES: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","par
 const LIST_TABLES: &str = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_tables","arguments":{"source":"a"}}}"#;
 const DESCRIBE_TABLE: &str = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"describe_table","arguments":{"source":"a","table":"users"}}}"#;
 const EXPLAIN_QUERY: &str = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"explain_query","arguments":{"source":"a","sql":"SELECT 1"}}}"#;
+const QUERY_SQL: &str = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT 1"}}}"#;
+const QUERY_SQL_CROSS: &str = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"CREATE TABLE t (id bigint)"}}}"#;
 const LIST_TABLES_B: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_tables","arguments":{"source":"b"}}}"#;
 
 async fn init_session(router: axum::Router, token: &str) -> String {
@@ -190,7 +194,12 @@ fn add_metadata_access(state: &AppState, token: &str) {
         })
         .expect("create profile");
     let token_id = store.authenticate(token).expect("auth").token_id;
-    for tool in [Tool::ListTables, Tool::DescribeTable, Tool::ExplainQuery] {
+    for tool in [
+        Tool::ListTables,
+        Tool::DescribeTable,
+        Tool::ExplainQuery,
+        Tool::QuerySql,
+    ] {
         store
             .create_route(&NewRoute {
                 source_id: source.id.clone(),
@@ -377,6 +386,7 @@ async fn metadata_tools_authorize_before_provider_and_expose_structured_results(
     assert!(names.contains(&"list_tables"));
     assert!(names.contains(&"describe_table"));
     assert!(names.contains(&"explain_query"));
+    assert!(names.contains(&"query_sql"));
 
     let (status, _, body) = send(
         router.clone(),
@@ -426,11 +436,12 @@ async fn metadata_tools_authorize_before_provider_and_expose_structured_results(
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], true);
     assert_eq!(
-        body["result"]["structuredContent"]["plan"][0]["Plan"]["Node Type"],
-        "Seq Scan"
+        body["result"]["structuredContent"]["code"],
+        "METADATA_UNAVAILABLE"
     );
-    assert_eq!(metadata.explain_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(metadata.explain_calls.load(Ordering::SeqCst), 0);
 
     {
         let store = state.store.lock().expect("store lock");
@@ -447,7 +458,7 @@ async fn metadata_tools_authorize_before_provider_and_expose_structured_results(
             .expect("create second source");
     }
     let (status, _, body) = send(
-        router,
+        router.clone(),
         request(
             Method::POST,
             "/mcp",
@@ -464,6 +475,40 @@ async fn metadata_tools_authorize_before_provider_and_expose_structured_results(
         "TOOL_NOT_GRANTED"
     );
     assert_eq!(metadata.list_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(metadata.explain_calls.load(Ordering::SeqCst), 0);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            QUERY_SQL,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "METADATA_UNAVAILABLE"
+    );
+
+    let (status, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            QUERY_SQL_CROSS,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(body["result"]["structuredContent"]["code"], "SQL_REJECTED");
 }
 
 #[tokio::test]
@@ -527,9 +572,12 @@ async fn encrypted_credentials_flow_through_mcp_to_postgres() {
             .expect("create grant");
     }
 
+    let resolver = Arc::new(resolver);
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
-        metadata: Arc::new(PostgresMetadata::new(Arc::new(resolver))),
+        metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
+        executor: Arc::new(PostgresExecutor::new(resolver)),
+        max_rows: DEFAULT_MAX_ROWS,
         sessions: Default::default(),
     };
     let router = app(state);

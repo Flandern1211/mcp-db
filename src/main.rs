@@ -3,8 +3,9 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use mcp_db::{
-    check_health, Config, EncryptedFileResolver, MetadataProvider, PostgresMetadata, Store,
-    UnavailableMetadata, DEFAULT_ADDR, HEALTHCHECK_ADDR,
+    check_health, Config, EncryptedFileResolver, MetadataProvider, PostgresExecutor,
+    PostgresMetadata, SqlExecutor, Store, UnavailableExecutor, UnavailableMetadata, DEFAULT_ADDR,
+    HEALTHCHECK_ADDR,
 };
 
 fn main() -> ExitCode {
@@ -38,21 +39,29 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let store = Store::open(&config.state_path)
                 .map_err(|error| format!("state init failed: {error}"))?;
             let store = Arc::new(Mutex::new(store));
-            let metadata: Arc<dyn MetadataProvider> =
-                match (&config.credential_store, &config.master_key_file) {
-                    (Some(store_path), Some(key_path)) => {
-                        let resolver = EncryptedFileResolver::open(store_path, key_path)
-                            .map_err(|error| format!("credential init failed: {error}"))?;
-                        Arc::new(PostgresMetadata::new(Arc::new(resolver)))
-                    }
-                    _ => Arc::new(UnavailableMetadata),
-                };
+            let metadata: Arc<dyn MetadataProvider>;
+            let executor: Arc<dyn SqlExecutor>;
+            match (&config.credential_store, &config.master_key_file) {
+                (Some(store_path), Some(key_path)) => {
+                    let resolver = EncryptedFileResolver::open(store_path, key_path)
+                        .map_err(|error| format!("credential init failed: {error}"))?;
+                    let resolver = Arc::new(resolver);
+                    metadata = Arc::new(PostgresMetadata::new(resolver.clone()));
+                    executor = Arc::new(PostgresExecutor::new(resolver));
+                }
+                _ => {
+                    metadata = Arc::new(UnavailableMetadata);
+                    executor = Arc::new(UnavailableExecutor);
+                }
+            }
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| format!("runtime init failed: {error}"))?;
             runtime
-                .block_on(mcp_db::transport::http::run(config, store, metadata))
+                .block_on(mcp_db::transport::http::run(
+                    config, store, metadata, executor,
+                ))
                 .map_err(|error| format!("server error: {error}"))
         }
     }
