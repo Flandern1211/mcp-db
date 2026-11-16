@@ -1,5 +1,7 @@
 # mcp-db
 
+> **当前实现状态**：本 README 描述的是 legacy Bun/TypeScript v1。目标 AC2 基线与首版范围见 [docs/PRD.md](docs/PRD.md)、[SPEC.md](SPEC.md) 和 [TASK.md](TASK.md)。Rust 服务尚未实现，不能按本文宣称目标能力已可用。
+
 一个常驻数据库服务器的 MCP 服务：统一接入多个 SQL 数据源，按 **agent × source** 发放写权限，`approval` 模式下每条写语句执行前都要你确认。
 
 **产品边界：保证不了数据写对，只保证写不出灾难。** 只读由数据库只读账号兜底，结构破坏和批量误伤会被拦住；逻辑污染（`UPDATE users SET vip = 1` 这种语法正确、业务错误的写入）不处理。

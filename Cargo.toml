@@ -1,0 +1,13 @@
+[package]
+name = "mcp-db"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Authorized multi-database MCP service"
+publish = false
+
+[dependencies]
+
+[profile.release]
+lto = true
+strip = true

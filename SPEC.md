@@ -1,7 +1,8 @@
 # mcp-db 规格
 
 - 状态：当前基线
-- 更新时间：2026-11-13
+- 更新时间：2026-11-16
+- 产品意图、目标用户、场景与成功指标：[docs/PRD.md](docs/PRD.md)
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 - 实现状态：以 [TASK.md](TASK.md) 为准；本文件中的目标能力不等于已经实现
 
@@ -12,8 +13,9 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 ### 1.1 范围
 
 - 单实例、多数据源的 Streamable HTTP MCP 服务；不要求与数据库同机，不要求全年常驻。
-- 默认监听 `127.0.0.1`；SSH 隧道是可选接入方式。集中部署可以通过受信反向代理或显式配置的监听地址接入，但对非本机访问必须提供 TLS、认证和网络访问控制，不能裸露管理接口。
-- 驱动：PostgreSQL、MySQL/MariaDB、SQLite、SQL Server。建库可分阶段支持，未支持驱动必须明确拒绝，不能退回通用 SQL。
+- 首版正式交付形态为 OCI 容器镜像（Docker 服务）。MCP 端口默认只发布到宿主回环地址或受控网络。
+- 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的一次性登录令牌；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
+- 首版普通数据库能力仅支持 PostgreSQL；MySQL/MariaDB、SQLite、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
 - source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
 - agent 使用管理面签发的 Bearer token；明文只在签发时返回一次，服务端只保存哈希和识别信息。
 - token 创建时按 **source → tool 集合** 授权。不再维护独立的全局 tool 白名单与 source 模式，也不再使用 `readonly/readwrite/approval` 作为运行时权限枚举。
@@ -39,11 +41,11 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 
 ## 2. 部署与运行生命周期
 
-- 服务可以位于个人电脑、开发机、内网管理机、容器或数据库所在主机，只需能访问数据库，并被 MCP 客户端和管理者访问。
+- 首版以 OCI 容器运行在个人电脑、开发机、内网管理机或数据库所在主机，只需能访问 PostgreSQL 并被 MCP 客户端和管理者访问。
 - 使用期间 HTTP 服务须保持运行。单人可按需启动，多客户端可常驻；部署位置不改变授权与审批语义。
 - source、profile 元数据、token/grants、审计、审批状态和建库预留须持久化；数据库连接池与 MCP 会话是进程内状态。
 - 停机/重启不能自动执行旧批准或盲目重放写入。尚未执行的待批/已批请求终止，客户端需重新发起并重新审批；已经发出的写入若结果未知，保留未知状态并人工核对，不标记为未执行或重试。
-- 非本机接入必须明确公开访问地址、受信代理及 Origin 校验配置；admin 登录会话须有 HttpOnly、SameSite、CSRF 防护，并在 HTTPS 下使用 Secure cookie。仅监听本机且经 SSH 隧道接入仍是默认部署。
+- 首版管理面仅本机：MCP 与管理监听分离，管理端口只发布到宿主回环地址，登录使用 CLI 生成的一次性令牌；admin 会话须有 HttpOnly、SameSite 和 CSRF 防护。跨主机接入属于后续阶段，启用前必须明确公开访问地址、受信代理及 Origin 校验配置，并在 HTTPS 下使用 Secure cookie。
 
 ## 3. 授权、连接与审批
 
@@ -58,7 +60,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 
 ### 3.2 Connection profiles
 
-每个 source 可配置任意数量的命名 profiles；每个 profile 有用途类别、凭证引用、连接限制和启用状态。数量不限于两个，同类别可有多个 profile。每个 tool 绑定一个明确 profile；找不到可用映射时拒绝，不能自动升级到权限更大的身份。
+每个 source 可配置任意数量的命名 profiles；每个 profile 有用途类别、凭证引用、连接限制和启用状态。数量不限于两个，同类别可有多个 profile。每个 tool 绑定一个明确 profile；找不到可用映射时拒绝，不能自动升级到权限更大的身份。首版只要求 PostgreSQL 的 profile 路由和只读边界验收；其他驱动在对应扩展任务完成前不得启用。
 
 | 用途类别 | 用途 | 典型 tool |
 | --- | --- | --- |
@@ -69,7 +71,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 
 普通 profiles 不能拥有数据库级建库、角色/授权管理权限，也不能通过 definer 函数、角色切换等间接入口取得这些能力；provision profile 必须与普通执行路径隔离，不进入普通 SQL 可选连接集合。
 
-同一 DSN 可以供多个普通 profiles 引用，但这不产生数据库级隔离。管理页须提示复用凭证的风险；`query` 的实际只读性必须由数据库权限、受支持的只读会话/事务或 SQLite 只读打开方式实现，不能仅靠 profile 名称保证。每个驱动都必须通过 query profile 直接尝试数据写入和 schema DDL（绕过 SQL tool 分类），由数据库/文件边界拒绝且夹具状态不变，才能启用该 profile；无法完成负向集成验证的 profile 不得用于查询路径。
+同一 DSN 可以供多个普通 profiles 引用，但这不产生数据库级隔离。管理页须提示复用凭证的风险；`query` 的实际只读性必须由数据库权限、受支持的只读会话/事务或对应驱动的只读打开方式实现，不能仅靠 profile 名称保证。每个已发布驱动都必须通过 query profile 直接尝试数据写入和 schema DDL（绕过 SQL tool 分类），由数据库/文件边界拒绝且夹具状态不变，才能启用该 profile；无法完成负向集成验证的 profile 不得用于查询路径。
 
 agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永不回显。profile 只能由 admin 配置和停用，token/grant 不赋予管理 profile 的权限。
 
@@ -123,10 +125,12 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 使用 `AC2-*` 表示本轮目标基线，条目会随尚未实现的设计修订。T-01 的 `AC-01～AC-11` 属于 2026-11-11 基线，其证据不自动证明本节；后续实现任务须固定引用对应基线提交。
 
+首版发布范围只覆盖 PostgreSQL 普通能力、本机 CLI/Web 管理面和 Docker 交付。其他驱动与跨主机远程管理属于后续阶段；未被首版覆盖的 AC2 检查点必须保持未验证，不能算通过。
+
 | 编号 | 需求 | 验收标准 |
 | --- | --- | --- |
 | `AC2-01` | 身份与发现 | 缺失、未知或撤销 token 返回 401；`list_sources` 只返回 token 至少持有一个 grant 且有效的 source，不返回凭证 |
-| `AC2-02` | 只读查询 | 仅获查询 tools 的 token 不能写入数据/schema；每个驱动须通过 query profile 直连负向集成测试，证明数据写入与 schema DDL 被数据库/文件边界拒绝且夹具不变，不能靠名称或 SQL 分类通过 |
+| `AC2-02` | 只读查询 | 仅获查询 tools 的 token 不能写入数据/schema；每个已发布驱动（首版 PostgreSQL）须通过 query profile 直连负向集成测试，证明数据写入与 schema DDL 被数据库/文件边界拒绝且夹具不变，不能靠名称或 SQL 分类通过 |
 | `AC2-03` | 普通写入 | 获相应 source/tool grant 且有适用 profile 时，非生产普通写按 grant、路由最低策略和内置规则中的最严格策略执行，无 profile 不回退 |
 | `AC2-04` | 普通交互审批 | 普通写的 elicitation accept 才执行，decline/cancel 不执行；不是高危/建库的 admin 批准替代品 |
 | `AC2-05` | admin 审批 | 不支持 elicitation 的普通审批及所有高危/建库进入 admin 队列；拒绝、取消、超时不执行 |
@@ -134,7 +138,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 | `AC2-07` | 结果限制 | 超过 source 行数上限显式截断；不把结果截断等同于限制数据库扫描成本 |
 | `AC2-08` | 资源限制 | 每 profile 连接上限、语句超时、token 请求速率按配置执行；未支持的硬限制明确拒绝配置，不假装生效 |
 | `AC2-09` | 审计 | 记录 token/agent、source、tool、profile 标识、决定、渠道、原因与适用耗时/行数，绝不记录凭证 |
-| `AC2-10` | 部署与管理隔离 | 可在非数据库主机按需启动；默认本机监听，非本机接入具备 TLS/认证/网络控制；agent 不能操作 admin API |
+| `AC2-10` | 部署与管理隔离 | 首版以 Docker 服务在非数据库主机按需启动；管理页仅通过宿主回环端口和一次性登录令牌访问；agent 不能操作 admin API；跨主机接入在后续阶段具备 TLS/认证/网络控制后才可启用 |
 | `AC2-11` | 配置校验 | 未知 tool/profile、错误用途映射、生产写 grant、非法凭证引用或限制保存失败；连接数不固定为两个，query 实际只读性有验证依据 |
 | `AC2-12` | 工具发现 | 展示 token 在有效 source 上 grants 的 tool 并集，加基础 `list_sources`；不可见不替代调用鉴权 |
 | `AC2-13` | 精确 grant | A 库获某 tool 不允许对 B 库调用该 tool；直接构造参数也拒绝；source/profile/环境限制始终生效 |
@@ -151,7 +155,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 端到端证据检查点（不是本次文档变更的运行结果）：
 
-- `AC2-02`：每个驱动用 query profile 绕过 MCP SQL 分类直接尝试 `INSERT/UPDATE/DELETE` 与 schema DDL → 数据库或 SQLite 文件只读边界全部拒绝 → 夹具数据和 schema 不变；随后正常查询仍成功。
+- `AC2-02`：每个已发布驱动（首版 PostgreSQL）用 query profile 绕过 MCP SQL 分类直接尝试 `INSERT/UPDATE/DELETE` 与 schema DDL → 数据库或文件只读边界全部拒绝 → 夹具数据和 schema 不变；随后正常查询仍成功。
 - `AC2-12/AC2-13`：签发 A/B source 不同 tool grants → 建立 MCP 会话看工具并集 → 在未授权 source 调用可见 tool → 确认拒绝且目标数据库无请求。
 - `AC2-15/AC2-16`：提交跨 tool SQL、执行型 explain、禁止/未知语句和高危 SQL → 前者拒绝、后者进入 admin 队列 → 批准后变更策略/撤销 token → 确认复核失败且不执行；有效批准只执行一次。
 - `AC2-17～AC2-20`：检查 provision 与 grants → 并发申请 → admin 分别批准/拒绝 → 原子预留 → 实际创建 → 登记新 source 与结果 grants → 验证创建者访问及其他 token 不可见；失败、未知、恢复超额和递归建库路径分别有数据库/状态库证据。
@@ -162,22 +166,24 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 ### 5.1 组件与工具
 
-单进程 Bun/TypeScript/ESM；HTTP 端点 `/mcp`、管理页 `/admin` 与管理接口 `/admin/*`。默认状态库 `./.mcp-db/state.db`。具体工程版本以配置与锁文件为准。
+单进程 Rust 服务；HTTP 端点 `/mcp`、管理页 `/admin` 与管理接口 `/admin/*`。MCP 监听与管理监听分离，首版管理监听只绑定或发布到宿主回环地址。默认状态库 `./.mcp-db/state.db`。首版正式交付形态为 OCI 容器镜像；具体 crate、Rust 版本和镜像版本以配置与锁文件为准。
+
+下表是 Rust 模块职责边界，路径为职责示意，不提前锁定具体 crate 或文件布局。
 
 | 组件 | 目标职责 |
 | --- | --- |
-| `src/config.ts` | 部署、profiles、路由、审批策略、限制及跨字段校验 |
-| `src/auth.ts` | token 身份、精确 source/tool grant、admin 区分 |
-| `src/transport/http.ts` | MCP 会话/发现、远程接入边界、生命周期 |
-| `src/tools/` | 工具 schema、调用鉴权与操作类别约束 |
-| `src/core/pools.ts` | 按 source/profile 建池，禁止未配置回退与 provision 越界 |
-| `src/core/sql.ts` | 方言解析、工具范围、禁止及高危操作策略 |
-| `src/core/provisioning.ts` | 建库审批、预留、方言执行、结果登记与异常核对 |
-| `src/core/approval.ts` | 请求绑定、一次性决定、执行前复核 |
-| `src/core/store.ts` | source/profile/grants、审批、配额、审计持久化 |
-| `src/admin/`、`src/cli/` | 管理配置、审批、归档恢复和审计查询 |
+| 配置与校验 | 部署、profiles、路由、审批策略、限制及跨字段校验 |
+| 身份与授权 | token 身份、精确 source/tool grant、admin 区分 |
+| HTTP/MCP transport | MCP 会话/发现、本机管理边界、生命周期 |
+| tools | 工具 schema、调用鉴权与操作类别约束 |
+| 连接管理 | 按 source/profile 建池，禁止未配置回退与 provision 越界 |
+| SQL 策略 | 按已发布驱动方言解析，约束工具范围、禁止及高危操作 |
+| provisioning | 建库审批、预留、方言执行、结果登记与异常核对 |
+| approval | 请求绑定、一次性决定、执行前复核 |
+| 持久化 | source/profile/grants、审批、配额、审计和迁移状态 |
+| admin/CLI | 管理配置、审批、归档恢复和审计查询 |
 
-机器可读契约以 `src/tools/` 的 schemas 为准；新增/迁移接口随实现同步更新，本文不把目标工具表冒充已实现接口。
+机器可读契约以 Rust 源码中的 tool schema 定义为权威；服务实际 `tools/list` 输出必须与实现一致。本文不把目标工具表冒充已实现接口。
 
 | tool | source profile 与约束 |
 | --- | --- |
@@ -207,12 +213,13 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 ### 5.3 兼容与错误
 
-- 旧实现的 sources、两套 DSN 与 agent source 模式位于 TOML，审批/审计位于状态库。后续完整档实现必须使用停机维护锁和持久 migration journal 做跨工件 cutover，不能把它描述成单个 SQLite 事务：先阻止 MCP/admin 业务请求，快照活动 TOML 与状态库，再导入 staging 状态并完整校验。
+- 旧实现指 Bun/TypeScript v1。其 sources、两套 DSN 与 agent source 模式位于 TOML，审批/审计位于状态库；迁移目标是 Rust AC2 状态模型。后续完整档实现必须使用停机维护锁和持久 migration journal 做跨工件 cutover，不能把它描述成单个 SQLite 事务：先阻止 MCP/admin 业务请求，快照活动 TOML 与状态库，再导入 staging 状态并完整校验。
 - 旧 source 的 `dsn_readonly` 转为 query profile，`dsn_readwrite` 转为 mutate 与 schema profiles；两者可以引用同一凭证但必须显示隔离告警。旧 source 没有 provision profile，也不会获得建库能力。
 - 每个旧 token × source 按固定矩阵转换：`readonly` → 元数据、非执行 explain、`query_sql` grants；`readwrite` → 前述 grants + `mutate_sql` + `execute_ddl`，这两个写 grants 的普通策略为 direct；`approval` → 与 readwrite 相同 grants，但两个写 grants 的普通策略为 approval。source/tool 路由的最低策略按最保守值初始化为 direct，由各 grant 保留原有差异，高危内置规则仍不可下调。所有转换都不生成 `create_database` grant，旧固定 tool 集不存在可额外放宽的新权限。
 - 旧 source 没有环境字段，迁移后保持 disabled，不接受业务调用；admin 必须先标记环境、验证 query profile 的真实只读边界并复核生成 grants/策略，才能逐个启用。管理员可删减迁移生成的 grants，但不能在迁移过程中隐式增加建库或生产写权限。
 - 校验 staging 状态后，以 journal 记录提交点：激活新状态，并用同目录临时文件 + fsync + rename 替换当前生效 TOML，新的活动 TOML 不再包含旧 sources、agents、DSN 或旧 token 配置。原敏感配置移到非默认路径按凭证材料保护，不能由服务自动回退读取。跨文件切换中断时，新版本只能进入 migration recovery，不能启动 MCP；恢复根据 journal 完成或在提交点前回滚，不能猜测当前 source of truth。
-- 切换成功后只注册分类 tools，旧 `execute_sql` 直接调用也拒绝。使用活动配置启动旧二进制时不得获得 source 或 agent 权限；切换后不支持自动降级。管理员故意恢复旧敏感备份并运行旧二进制属于显式回滚/凭证风险，必须停服、人工执行并重新评估数据库凭证，不能由新服务承诺阻止。
+- 切换成功后只注册分类 tools，旧 `execute_sql` 直接调用也拒绝。使用活动配置启动旧 Bun/TypeScript binary 时不得获得 source 或 agent 权限；切换后不支持自动降级。管理员故意恢复旧敏感备份并运行旧二进制属于显式回滚/凭证风险，必须停服、人工执行并重新评估数据库凭证，不能由新服务承诺阻止。
+- 旧 Bun/TypeScript v1 源码和二进制在迁移验收完成前保留为迁移夹具和兼容测试对象，不作为正式开发入口；完成后是否移除由发布策略决定。
 - 缺失/未知/撤销 token 返回 401；grant 不足、profile 缺失/停用、归档、生产限制、错误 SQL 类别、限流/配额或审批拒绝返回可区分的拒绝原因并审计，不泄露凭证。
 - 审批和外部执行结果未知时停止自动重试、保留实际状态；外部副作用与本地登记不宣称跨库原子性。恢复步骤须在实现任务中明确验证。
 
@@ -220,11 +227,12 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 | 事项 | 必须确定的内容 | 时点 |
 | --- | --- | --- |
-| 驱动与 SQL 解析 | 首批建库/解析支持范围、query 只读验证、profiles 的最低原生权限 | 对应实现任务拆分前 |
-| 迁移与会话刷新 | TOML + 状态库的 journal/cutover/恢复、旧敏感配置隔离、固定 grants/策略转换、旧 binary 与 tool 退役、新 source 发现机制 | 权限实现前 |
+| 驱动与 SQL 解析 | 首版 PostgreSQL 的最低支持版本、建库/解析支持范围、query 只读验证、profiles 的最低原生权限；其他驱动在扩展任务前不得启用 | 对应实现任务拆分前 |
+| 迁移与会话刷新 | Bun/TypeScript v1 TOML + 状态库的 journal/cutover/恢复、旧敏感配置隔离、固定 grants/策略转换、旧 binary 与 tool 退役、新 source 发现机制 | 权限实现前 |
 | 配额和限流配置 | profile 池大小/超时、token 普通请求速率的默认值、重启恢复和未知状态核对 | 限制实现前 |
-| 建库失败与凭证 | 驱动建库/账号配置补偿、凭证安全存储、admin 人工处置入口 | 建库实现前 |
-| 远程部署验收 | TLS 终止、受信代理、Origin/CSRF、停启及未知请求取证 | 远程接入实现前 |
+| 建库失败与凭证 | PostgreSQL 建库/账号配置补偿、凭证安全存储、admin 人工处置入口 | 建库实现前 |
+| 本机管理面 | 一次性登录令牌、admin 会话 cookie、CSRF、一次性令牌有效期和 Web 信息架构 | 管理页实现前 |
+| 远程部署验收 | TLS 终止、受信代理、Origin/CSRF、停启及未知请求取证；首版不启用 | 远程接入实现前 |
 
 工作区、长期存储监控和自动回收另行迭代；不为预留空间提前添加无行为的 workspace/quota 占位字段。
 
