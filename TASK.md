@@ -13,7 +13,7 @@
 | T-03 | 迁移旧配置与状态库 | 完整 | 未开始 | T-02 | AC2-23 | — | — | [tasks/2026-11-13-t-03-legacy-migration.md](tasks/2026-11-13-t-03-legacy-migration.md) |
 | T-04 | 实现精确 grants、profile 路由与发现 | 完整 | 🟢 已完成 | T-02、T-12 | AC2-12～AC2-14 | `7c8374c`、`2c7fddf`、`c995885`、`eb9b87c`、`57bae34` | 无 | [tasks/2026-11-13-t-04-grants-routing-discovery.md](tasks/2026-11-13-t-04-grants-routing-discovery.md) |
 | T-05 | 实现 PostgreSQL SQL 策略与分类 tools（含 explain） | 完整 | 🟢 已完成 | T-04 | AC2-03、AC2-06、AC2-07、AC2-15 | `72f0e2c`、`3ff90fa`、`57e89ef`、`c2e6f5d`、`bd98c76`、`6a0f097` | 无 | [tasks/2026-11-13-t-05-sql-tools.md](tasks/2026-11-13-t-05-sql-tools.md) |
-| T-06 | 实现审批状态机与审计绑定 | 完整 | 进行中 | T-02、T-04、T-05 | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 | — | — | [tasks/2026-11-13-t-06-approval-audit.md](tasks/2026-11-13-t-06-approval-audit.md) |
+| T-06 | 实现审批状态机与审计绑定 | 完整 | 🟡 待验收 | T-02、T-04、T-05 | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 | `47a531a` | 1 非阻塞 | [tasks/2026-11-13-t-06-approval-audit.md](tasks/2026-11-13-t-06-approval-audit.md) |
 | T-07 | 实现 PostgreSQL profile 限制与只读边界 | 完整 | 未开始 | T-04、T-05 | AC2-02、AC2-08、AC2-11 | — | — | [tasks/2026-11-13-t-07-profile-limits.md](tasks/2026-11-13-t-07-profile-limits.md) |
 | T-08 | 实现 PostgreSQL 建库、配额与 source 生命周期 | 完整 | 未开始 | T-04～T-07 | AC2-17～AC2-21 | — | — | [tasks/2026-11-13-t-08-provisioning-lifecycle.md](tasks/2026-11-13-t-08-provisioning-lifecycle.md) |
 | T-09 | 实现首版本机 CLI 与 Web 管理面 | 完整 | 未开始 | T-02、T-06、T-08 | AC2-10（首版本机）、AC2-21、AC2-22 | — | — | [tasks/2026-11-13-t-09-local-admin.md](tasks/2026-11-13-t-09-local-admin.md) |
