@@ -4,6 +4,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::approval::{
+    ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalRecord, ApprovalStatus, AuditEvent,
+    ClaimOutcome, DecisionOutcome, NewApprovalRequest, RecoverySummary,
+};
 use crate::auth;
 use crate::error::{Error, Result};
 use crate::state::model::{
@@ -12,7 +16,7 @@ use crate::state::model::{
     NewSource, Profile, ProfilePurpose, Route, Source, SourceStatus, TokenIdentity, Tool,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -116,6 +120,75 @@ CREATE TABLE IF NOT EXISTS audit (
 );
 "#;
 
+const MIGRATION_2: &str = r#"
+CREATE TABLE IF NOT EXISTS approval_requests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  source_environment TEXT NOT NULL,
+  tool TEXT NOT NULL CHECK (tool IN ('mutate_sql', 'execute_ddl', 'create_database')),
+  sql TEXT,
+  params_json TEXT NOT NULL,
+  request_digest TEXT NOT NULL,
+  profile_id INTEGER NOT NULL,
+  profile_version INTEGER NOT NULL,
+  route_id INTEGER NOT NULL,
+  route_version INTEGER NOT NULL,
+  grant_policy TEXT NOT NULL CHECK (grant_policy IN ('direct', 'approval')),
+  route_min_policy TEXT NOT NULL CHECK (route_min_policy IN ('direct', 'approval')),
+  high_risk INTEGER NOT NULL CHECK (high_risk IN (0, 1)),
+  channel TEXT NOT NULL CHECK (channel IN ('elicitation', 'admin')),
+  status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'consumed')),
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  decided_at INTEGER,
+  decided_by TEXT,
+  consumed_at INTEGER,
+  outcome TEXT CHECK (outcome IS NULL OR outcome IN ('succeeded', 'failed', 'unknown')),
+  finished_at INTEGER,
+  row_count INTEGER,
+  error_code TEXT,
+  reason_code TEXT,
+  reason TEXT
+);
+CREATE INDEX IF NOT EXISTS approval_requests_queue
+  ON approval_requests(status, created_at);
+CREATE INDEX IF NOT EXISTS approval_requests_expiry
+  ON approval_requests(status, expires_at);
+CREATE INDEX IF NOT EXISTS approval_requests_token
+  ON approval_requests(token_id, status);
+CREATE INDEX IF NOT EXISTS approval_requests_source
+  ON approval_requests(source_id, status);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts INTEGER NOT NULL,
+  event TEXT NOT NULL,
+  approval_id INTEGER,
+  token_id TEXT,
+  agent TEXT,
+  source_id TEXT,
+  tool TEXT NOT NULL,
+  profile_id INTEGER,
+  profile_version INTEGER,
+  route_id INTEGER,
+  route_version INTEGER,
+  request_digest TEXT,
+  channel TEXT,
+  decision TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  high_risk INTEGER NOT NULL CHECK (high_risk IN (0, 1)),
+  reason_code TEXT,
+  reason TEXT,
+  duration_ms INTEGER,
+  row_count INTEGER,
+  error_code TEXT
+);
+CREATE INDEX IF NOT EXISTS audit_events_approval ON audit_events(approval_id, id);
+CREATE INDEX IF NOT EXISTS audit_events_ts ON audit_events(ts);
+"#;
+
 pub struct Store {
     conn: Connection,
 }
@@ -142,7 +215,7 @@ impl Store {
                applied_at INTEGER NOT NULL
              );",
         )?;
-        let version: i64 = transaction.query_row(
+        let mut version: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_migrations",
             [],
             |row| row.get(0),
@@ -158,10 +231,20 @@ impl Store {
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (1, ?)",
                 [now_ms()],
             )?;
+            version = 1;
+        }
+        if version < 2 {
+            transaction.execute_batch(MIGRATION_2)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
+                [now_ms()],
+            )?;
         }
         transaction.commit()?;
 
-        Ok(Self { conn })
+        let store = Self { conn };
+        store.recover_after_restart(now_ms())?;
+        Ok(store)
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -219,11 +302,13 @@ impl Store {
     }
 
     pub fn revoke_token(&self, token_id: &str) -> Result<()> {
+        let now = now_ms();
         let changed = self.conn.execute(
             "UPDATE tokens SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'",
-            params![now_ms(), token_id],
+            params![now, token_id],
         )?;
         if changed > 0 {
+            self.invalidate_approvals_for_token(token_id, "TOKEN_REVOKED", now)?;
             return Ok(());
         }
         let exists: bool = self
@@ -617,6 +702,431 @@ impl Store {
         rows.into_iter().map(|tool| Tool::parse(&tool)).collect()
     }
 
+    pub fn insert_approval_request(&self, request: &NewApprovalRequest) -> Result<ApprovalRecord> {
+        if request.channel == ApprovalChannel::Elicitation
+            && (request.draft.high_risk || request.draft.tool == Tool::CreateDatabase)
+        {
+            return Err(Error::InvalidInput(
+                "high-risk and create_database approvals require admin".to_string(),
+            ));
+        }
+        if request.channel == ApprovalChannel::Elicitation
+            && request.status == ApprovalStatus::Pending
+        {
+            return Err(Error::InvalidInput(
+                "elicitation cannot leave a pending admin request".to_string(),
+            ));
+        }
+        if !matches!(
+            request.draft.tool,
+            Tool::MutateSql | Tool::ExecuteDdl | Tool::CreateDatabase
+        ) {
+            return Err(Error::InvalidInput(
+                "tool does not support approvals".to_string(),
+            ));
+        }
+        let draft = &request.draft;
+        let digest = draft.digest();
+        let transaction = self.conn.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO approval_requests
+               (token_id, agent, source_id, source_environment, tool, sql, params_json,
+                request_digest, profile_id, profile_version, route_id, route_version,
+                grant_policy, route_min_policy, high_risk, channel, status, created_at,
+                expires_at, decided_at, decided_by, reason_code, reason)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                draft.token_id,
+                draft.agent,
+                draft.source_id,
+                draft.source_environment.as_str(),
+                draft.tool.as_str(),
+                draft.sql,
+                draft.params_json,
+                digest,
+                draft.profile_id,
+                draft.profile_version,
+                draft.route_id,
+                draft.route_version,
+                draft.grant_policy.as_str(),
+                draft.route_min_policy.as_str(),
+                i64::from(draft.high_risk),
+                request.channel.as_str(),
+                request.status.as_str(),
+                request.created_at,
+                request.expires_at,
+                request.decided_at,
+                request.decided_by,
+                request.reason_code,
+                request.reason,
+            ],
+        )?;
+        let id = transaction.last_insert_rowid();
+        let record = approval_from_conn(&transaction, id)?;
+        insert_audit(
+            &transaction,
+            &AuditEvent::for_approval(
+                &record,
+                "requested",
+                "pending",
+                "system",
+                request.created_at,
+            ),
+        )?;
+        if record.status != ApprovalStatus::Pending {
+            let decision = if record.status == ApprovalStatus::Approved {
+                "allowed"
+            } else {
+                "rejected"
+            };
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(
+                    &record,
+                    record.status.as_str(),
+                    decision,
+                    request.decided_by.as_deref().unwrap_or("mcp-client"),
+                    request.decided_at.unwrap_or(request.created_at),
+                ),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn get_approval(&self, id: i64) -> Result<ApprovalRecord> {
+        approval_from_conn(&self.conn, id)
+    }
+
+    pub fn list_pending_approvals(&self, limit: usize) -> Result<Vec<ApprovalRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id FROM approval_requests WHERE status = 'pending' ORDER BY created_at LIMIT ?",
+        )?;
+        let ids = statement
+            .query_map([limit as i64], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter()
+            .map(|id| approval_from_conn(&self.conn, id))
+            .collect()
+    }
+
+    pub fn decide_approval(
+        &self,
+        id: i64,
+        approve: bool,
+        actor: &str,
+        now: i64,
+        execution_ttl_ms: i64,
+    ) -> Result<DecisionOutcome> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let Some(record) = approval_optional(&transaction, id)? else {
+            transaction.commit()?;
+            return Ok(DecisionOutcome::NotFound);
+        };
+        if record.status != ApprovalStatus::Pending {
+            transaction.commit()?;
+            return Ok(DecisionOutcome::AlreadyDecided);
+        }
+        if record.expires_at <= now {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', decided_at = ?, reason_code = 'APPROVAL_EXPIRED'
+                  WHERE id = ? AND status = 'pending'",
+                params![now, id],
+            )?;
+            let record = approval_from_conn(&transaction, id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "expired", "expired", "system", now),
+            )?;
+            transaction.commit()?;
+            return Ok(DecisionOutcome::Expired);
+        }
+        let status = if approve {
+            ApprovalStatus::Approved
+        } else {
+            ApprovalStatus::Denied
+        };
+        let changed = transaction.execute(
+            "UPDATE approval_requests
+                SET status = ?, decided_at = ?, decided_by = ?,
+                    expires_at = CASE WHEN ? THEN ? ELSE expires_at END
+              WHERE id = ? AND status = 'pending'",
+            params![
+                status.as_str(),
+                now,
+                actor,
+                i64::from(approve),
+                now + execution_ttl_ms,
+                id
+            ],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(DecisionOutcome::AlreadyDecided);
+        }
+        let record = approval_from_conn(&transaction, id)?;
+        insert_audit(
+            &transaction,
+            &AuditEvent::for_approval(
+                &record,
+                status.as_str(),
+                if approve { "allowed" } else { "rejected" },
+                actor,
+                now,
+            ),
+        )?;
+        transaction.commit()?;
+        Ok(if approve {
+            DecisionOutcome::Approved
+        } else {
+            DecisionOutcome::Denied
+        })
+    }
+
+    pub fn claim_approval(
+        &self,
+        id: i64,
+        token_id: &str,
+        expected_digest: &str,
+        now: i64,
+    ) -> Result<ClaimOutcome> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let Some(record) = approval_optional(&transaction, id)? else {
+            transaction.commit()?;
+            return Ok(ClaimOutcome::NotFound);
+        };
+        if record.draft.token_id != token_id {
+            transaction.commit()?;
+            return Ok(ClaimOutcome::TokenMismatch);
+        }
+        if record.request_digest != expected_digest || record.draft.digest() != expected_digest {
+            transaction.commit()?;
+            return Ok(ClaimOutcome::DigestMismatch);
+        }
+        if record.status != ApprovalStatus::Approved {
+            transaction.commit()?;
+            return Ok(ClaimOutcome::NotApproved);
+        }
+        if record.expires_at <= now {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = 'APPROVAL_EXPIRED'
+                  WHERE id = ? AND status = 'approved'",
+                [id],
+            )?;
+            let record = approval_from_conn(&transaction, id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "expired", "expired", "system", now),
+            )?;
+            transaction.commit()?;
+            return Ok(ClaimOutcome::Expired);
+        }
+
+        if let Some(reason) = claim_stale_reason(&transaction, &record)? {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = ?
+                  WHERE id = ? AND status = 'approved'",
+                params![reason, id],
+            )?;
+            let record = approval_from_conn(&transaction, id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "invalidated", "rejected", "system", now),
+            )?;
+            transaction.commit()?;
+            return Ok(ClaimOutcome::Stale(reason.to_string()));
+        }
+
+        let changed = transaction.execute(
+            "UPDATE approval_requests SET status = 'consumed', consumed_at = ?
+              WHERE id = ? AND status = 'approved' AND consumed_at IS NULL",
+            params![now, id],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(ClaimOutcome::NotApproved);
+        }
+        let record = approval_from_conn(&transaction, id)?;
+        insert_audit(
+            &transaction,
+            &AuditEvent::for_approval(&record, "claimed", "allowed", "system", now),
+        )?;
+        transaction.commit()?;
+        Ok(ClaimOutcome::Claimed(Box::new(record)))
+    }
+
+    pub fn finish_approval(
+        &self,
+        id: i64,
+        outcome: ApprovalOutcome,
+        row_count: Option<u64>,
+        error_code: Option<&str>,
+        now: i64,
+    ) -> Result<bool> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE approval_requests
+                SET outcome = ?, finished_at = ?, row_count = ?, error_code = ?
+              WHERE id = ? AND status = 'consumed' AND outcome IS NULL",
+            params![
+                outcome.as_str(),
+                now,
+                row_count.map(|value| value as i64),
+                error_code,
+                id
+            ],
+        )?;
+        if changed == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let record = approval_from_conn(&transaction, id)?;
+        let event = match outcome {
+            ApprovalOutcome::Succeeded => "succeeded",
+            ApprovalOutcome::Failed => "failed",
+            ApprovalOutcome::Unknown => "unknown",
+        };
+        let mut audit = AuditEvent::for_approval(
+            &record,
+            event,
+            match outcome {
+                ApprovalOutcome::Succeeded => "allowed",
+                ApprovalOutcome::Failed => "error",
+                ApprovalOutcome::Unknown => "unknown",
+            },
+            "system",
+            now,
+        );
+        audit.row_count = row_count.map(|value| value as i64);
+        audit.error_code = error_code.map(str::to_string);
+        insert_audit(&transaction, &audit)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    pub fn expire_due_approvals(&self, now: i64) -> Result<usize> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let rows = approval_rows(
+            &transaction,
+            "WHERE status IN ('pending', 'approved') AND expires_at <= ?",
+            params![now],
+        )?;
+        let mut count = 0;
+        for record in rows {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = 'APPROVAL_EXPIRED'
+                  WHERE id = ? AND status IN ('pending', 'approved')",
+                [record.id],
+            )?;
+            let record = approval_from_conn(&transaction, record.id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "expired", "expired", "system", now),
+            )?;
+            count += 1;
+        }
+        transaction.commit()?;
+        Ok(count)
+    }
+
+    pub fn recover_after_restart(&self, now: i64) -> Result<RecoverySummary> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let pending = approval_rows(&transaction, "WHERE status = 'pending'", [])?;
+        let approved = approval_rows(&transaction, "WHERE status = 'approved'", [])?;
+        let inflight = approval_rows(
+            &transaction,
+            "WHERE status = 'consumed' AND outcome IS NULL",
+            [],
+        )?;
+
+        for record in &pending {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = 'RESTART_PENDING'
+                  WHERE id = ? AND status = 'pending'",
+                [record.id],
+            )?;
+        }
+        for record in &approved {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = 'RESTART_APPROVED'
+                  WHERE id = ? AND status = 'approved'",
+                [record.id],
+            )?;
+        }
+        for record in &inflight {
+            transaction.execute(
+                "UPDATE approval_requests
+                    SET outcome = 'unknown', finished_at = ?, error_code = 'RESTART_UNKNOWN',
+                        reason_code = 'RESTART_UNKNOWN'
+                  WHERE id = ? AND status = 'consumed' AND outcome IS NULL",
+                params![now, record.id],
+            )?;
+        }
+
+        for record in pending.iter().chain(approved.iter()) {
+            let record = approval_from_conn(&transaction, record.id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "expired", "expired", "system", now),
+            )?;
+        }
+        for record in &inflight {
+            let record = approval_from_conn(&transaction, record.id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "unknown", "unknown", "system", now),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(RecoverySummary {
+            pending_expired: pending.len(),
+            approved_expired: approved.len(),
+            unknown_marked: inflight.len(),
+        })
+    }
+
+    pub fn invalidate_approvals_for_token(
+        &self,
+        token_id: &str,
+        reason_code: &str,
+        now: i64,
+    ) -> Result<usize> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let rows = approval_rows(
+            &transaction,
+            "WHERE token_id = ? AND status IN ('pending', 'approved')",
+            [token_id],
+        )?;
+        let mut count = 0;
+        for record in rows {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = ?
+                  WHERE id = ? AND status IN ('pending', 'approved')",
+                params![reason_code, record.id],
+            )?;
+            let record = approval_from_conn(&transaction, record.id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "invalidated", "rejected", "system", now),
+            )?;
+            count += 1;
+        }
+        transaction.commit()?;
+        Ok(count)
+    }
+
+    pub fn record_audit_event(&self, event: &AuditEvent) -> Result<()> {
+        insert_audit(&self.conn, event)
+    }
+
+    pub fn count_audit_events(&self, approval_id: i64) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM audit_events WHERE approval_id = ?",
+            [approval_id],
+            |row| row.get(0),
+        )?)
+    }
+
     pub fn get_token_identity(&self, token_id: &str) -> Result<TokenIdentity> {
         let row = self
             .conn
@@ -696,4 +1206,260 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or(0)
+}
+
+const APPROVAL_SELECT: &str =
+    "SELECT id, token_id, agent, source_id, source_environment, tool, sql, params_json,
+       request_digest, profile_id, profile_version, route_id, route_version,
+       grant_policy, route_min_policy, high_risk, channel, status, created_at,
+       expires_at, decided_at, decided_by, consumed_at, outcome, finished_at,
+       row_count, error_code, reason_code, reason
+  FROM approval_requests";
+
+struct ApprovalRow {
+    id: i64,
+    token_id: String,
+    agent: String,
+    source_id: String,
+    source_environment: String,
+    tool: String,
+    sql: Option<String>,
+    params_json: String,
+    request_digest: String,
+    profile_id: i64,
+    profile_version: i64,
+    route_id: i64,
+    route_version: i64,
+    grant_policy: String,
+    route_min_policy: String,
+    high_risk: i64,
+    channel: String,
+    status: String,
+    created_at: i64,
+    expires_at: i64,
+    decided_at: Option<i64>,
+    decided_by: Option<String>,
+    consumed_at: Option<i64>,
+    outcome: Option<String>,
+    finished_at: Option<i64>,
+    row_count: Option<i64>,
+    error_code: Option<String>,
+    reason_code: Option<String>,
+    reason: Option<String>,
+}
+
+impl ApprovalRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            token_id: row.get(1)?,
+            agent: row.get(2)?,
+            source_id: row.get(3)?,
+            source_environment: row.get(4)?,
+            tool: row.get(5)?,
+            sql: row.get(6)?,
+            params_json: row.get(7)?,
+            request_digest: row.get(8)?,
+            profile_id: row.get(9)?,
+            profile_version: row.get(10)?,
+            route_id: row.get(11)?,
+            route_version: row.get(12)?,
+            grant_policy: row.get(13)?,
+            route_min_policy: row.get(14)?,
+            high_risk: row.get(15)?,
+            channel: row.get(16)?,
+            status: row.get(17)?,
+            created_at: row.get(18)?,
+            expires_at: row.get(19)?,
+            decided_at: row.get(20)?,
+            decided_by: row.get(21)?,
+            consumed_at: row.get(22)?,
+            outcome: row.get(23)?,
+            finished_at: row.get(24)?,
+            row_count: row.get(25)?,
+            error_code: row.get(26)?,
+            reason_code: row.get(27)?,
+            reason: row.get(28)?,
+        })
+    }
+
+    fn into_record(self) -> Result<ApprovalRecord> {
+        let draft = ApprovalDraft {
+            token_id: self.token_id,
+            agent: self.agent,
+            source_id: self.source_id,
+            source_environment: Environment::parse(&self.source_environment)?,
+            tool: Tool::parse(&self.tool)?,
+            sql: self.sql,
+            params_json: self.params_json,
+            profile_id: self.profile_id,
+            profile_version: self.profile_version,
+            route_id: self.route_id,
+            route_version: self.route_version,
+            grant_policy: ApprovalPolicy::parse(&self.grant_policy)?,
+            route_min_policy: ApprovalPolicy::parse(&self.route_min_policy)?,
+            high_risk: self.high_risk != 0,
+        };
+        let status = ApprovalStatus::parse(&self.status).ok_or_else(|| {
+            Error::InvalidInput(format!("unknown approval status {}", self.status))
+        })?;
+        let channel = ApprovalChannel::parse(&self.channel).ok_or_else(|| {
+            Error::InvalidInput(format!("unknown approval channel {}", self.channel))
+        })?;
+        let outcome =
+            match self.outcome {
+                Some(value) => Some(ApprovalOutcome::parse(&value).ok_or_else(|| {
+                    Error::InvalidInput(format!("unknown approval outcome {value}"))
+                })?),
+                None => None,
+            };
+        Ok(ApprovalRecord {
+            id: self.id,
+            draft,
+            request_digest: self.request_digest,
+            channel,
+            status,
+            created_at: self.created_at,
+            expires_at: self.expires_at,
+            decided_at: self.decided_at,
+            decided_by: self.decided_by,
+            consumed_at: self.consumed_at,
+            outcome,
+            finished_at: self.finished_at,
+            row_count: self.row_count.map(|value| value as u64),
+            error_code: self.error_code,
+            reason_code: self.reason_code,
+            reason: self.reason,
+        })
+    }
+}
+
+fn approval_from_conn(conn: &Connection, id: i64) -> Result<ApprovalRecord> {
+    approval_optional(conn, id)?.ok_or_else(|| Error::NotFound(format!("approval {id}")))
+}
+
+fn approval_optional(conn: &Connection, id: i64) -> Result<Option<ApprovalRecord>> {
+    let sql = format!("{APPROVAL_SELECT} WHERE id = ?");
+    let row = conn
+        .query_row(&sql, [id], ApprovalRow::from_row)
+        .optional()?;
+    row.map(ApprovalRow::into_record).transpose()
+}
+
+fn approval_rows<P: rusqlite::Params>(
+    conn: &Connection,
+    where_clause: &str,
+    params: P,
+) -> Result<Vec<ApprovalRecord>> {
+    let sql = format!("{APPROVAL_SELECT} {where_clause}");
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement
+        .query_map(params, ApprovalRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter().map(ApprovalRow::into_record).collect()
+}
+
+fn insert_audit(conn: &Connection, event: &AuditEvent) -> Result<()> {
+    conn.execute(
+        "INSERT INTO audit_events
+           (ts, event, approval_id, token_id, agent, source_id, tool, profile_id,
+            profile_version, route_id, route_version, request_digest, channel, decision,
+            actor, high_risk, reason_code, reason, duration_ms, row_count, error_code)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        params![
+            event.ts,
+            event.event,
+            event.approval_id,
+            event.token_id,
+            event.agent,
+            event.source_id,
+            event.tool,
+            event.profile_id,
+            event.profile_version,
+            event.route_id,
+            event.route_version,
+            event.request_digest,
+            event.channel,
+            event.decision,
+            event.actor,
+            i64::from(event.high_risk),
+            event.reason_code,
+            event.reason,
+            event.duration_ms,
+            event.row_count,
+            event.error_code,
+        ],
+    )?;
+    Ok(())
+}
+
+fn claim_stale_reason(conn: &Connection, record: &ApprovalRecord) -> Result<Option<&'static str>> {
+    let draft = &record.draft;
+    if !exists(
+        conn,
+        "SELECT 1 FROM tokens WHERE id = ? AND status = 'active'",
+        [&draft.token_id],
+    )? {
+        return Ok(Some("TOKEN_REVOKED"));
+    }
+    if !exists(
+        conn,
+        "SELECT 1 FROM sources WHERE id = ? AND status = 'active' AND environment = ?",
+        params![draft.source_id, draft.source_environment.as_str()],
+    )? {
+        return Ok(Some("SOURCE_ARCHIVED"));
+    }
+    if !exists(
+        conn,
+        "SELECT 1 FROM tool_grants
+          WHERE token_id = ? AND source_id = ? AND tool = ? AND policy = ?",
+        params![
+            draft.token_id,
+            draft.source_id,
+            draft.tool.as_str(),
+            draft.grant_policy.as_str()
+        ],
+    )? {
+        return Ok(Some("GRANT_POLICY_CHANGED"));
+    }
+    if !exists(
+        conn,
+        "SELECT 1 FROM source_tool_routes
+          WHERE id = ? AND source_id = ? AND tool = ? AND version = ?
+            AND profile_id = ? AND min_approval_policy = ?",
+        params![
+            draft.route_id,
+            draft.source_id,
+            draft.tool.as_str(),
+            draft.route_version,
+            draft.profile_id,
+            draft.route_min_policy.as_str()
+        ],
+    )? {
+        return Ok(Some("ROUTE_CHANGED"));
+    }
+    let Some(purpose) = draft.tool.purpose() else {
+        return Ok(Some("TOOL_CHANGED"));
+    };
+    if !exists(
+        conn,
+        "SELECT 1 FROM connection_profiles
+          WHERE id = ? AND source_id = ? AND version = ? AND enabled = 1 AND purpose = ?",
+        params![
+            draft.profile_id,
+            draft.source_id,
+            draft.profile_version,
+            purpose.as_str()
+        ],
+    )? {
+        return Ok(Some("PROFILE_CHANGED"));
+    }
+    Ok(None)
+}
+
+fn exists<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Result<bool> {
+    Ok(conn
+        .query_row(sql, params, |_| Ok(true))
+        .optional()?
+        .unwrap_or(false))
 }

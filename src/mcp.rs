@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
@@ -8,15 +9,19 @@ use rmcp::model::{
     ServerCapabilities, ServerInfo,
 };
 use rmcp::serde_json::json;
-use rmcp::service::RequestContext;
+use rmcp::service::{ElicitationError, ElicitationMode, RequestContext};
 use rmcp::{tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::approval::{
+    ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalRecord, ApprovalStatus, ClaimOutcome,
+    NewApprovalRequest,
+};
 use crate::executor::SqlExecutor;
 use crate::metadata::MetadataProvider;
-use crate::sql_policy::validate_for_tool;
+use crate::sql_policy::{validate_for_tool, ValidatedSql};
 use crate::{ApprovalPolicy, AuthorizedCall, Authorizer, Error, Store, TokenIdentity, Tool};
 
 #[derive(Clone)]
@@ -24,7 +29,10 @@ pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub metadata: Arc<dyn MetadataProvider>,
     pub executor: Arc<dyn SqlExecutor>,
+    pub elicitation: Arc<dyn ElicitationGate>,
     pub max_rows: usize,
+    pub approval_timeout_ms: i64,
+    pub approval_execution_ttl_ms: i64,
     /// MCP session id -> token id. Prevents a session from switching identity.
     pub sessions: Arc<Mutex<HashMap<String, String>>>,
 }
@@ -53,6 +61,54 @@ struct SqlArgs {
     sql: String,
     #[serde(default)]
     params: Vec<Value>,
+    #[schemars(description = "Approval id returned by a previous APPROVAL_REQUIRED response")]
+    approval_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ApprovalResponse {
+    #[schemars(description = "Approve this exact operation?")]
+    approved: bool,
+}
+
+rmcp::elicit_safe!(ApprovalResponse);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElicitationOutcome {
+    Accepted,
+    Declined,
+    Cancelled,
+    Unsupported,
+    Failed,
+}
+
+#[async_trait::async_trait]
+pub trait ElicitationGate: Send + Sync {
+    async fn ask(&self, context: &RequestContext<RoleServer>, prompt: &str) -> ElicitationOutcome;
+}
+
+pub struct PeerElicitation;
+
+#[async_trait::async_trait]
+impl ElicitationGate for PeerElicitation {
+    async fn ask(&self, context: &RequestContext<RoleServer>, prompt: &str) -> ElicitationOutcome {
+        if !context
+            .peer
+            .supported_elicitation_modes()
+            .contains(&ElicitationMode::Form)
+        {
+            return ElicitationOutcome::Unsupported;
+        }
+        match context.peer.elicit::<ApprovalResponse>(prompt).await {
+            Ok(Some(response)) if response.approved => ElicitationOutcome::Accepted,
+            Ok(Some(_)) | Ok(None) | Err(ElicitationError::UserDeclined) => {
+                ElicitationOutcome::Declined
+            }
+            Err(ElicitationError::UserCancelled) => ElicitationOutcome::Cancelled,
+            Err(ElicitationError::CapabilityNotSupported) => ElicitationOutcome::Unsupported,
+            Err(_) => ElicitationOutcome::Failed,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -97,6 +153,271 @@ impl McpDbServer {
         Authorizer::new(&store)
             .authorize(&identity.token_id, source, tool)
             .map_err(tool_error)
+    }
+
+    fn build_approval_draft(
+        &self,
+        call: &AuthorizedCall,
+        validated: &ValidatedSql,
+        params: &[Value],
+    ) -> ApprovalDraft {
+        ApprovalDraft {
+            token_id: call.identity.token_id.clone(),
+            agent: call.identity.agent.clone(),
+            source_id: call.source.id.clone(),
+            source_environment: call.source.environment,
+            tool: call.tool,
+            sql: Some(validated.sql.clone()),
+            params_json: serde_json::to_string(params).unwrap_or_else(|_| "[]".to_string()),
+            profile_id: call.profile.id,
+            profile_version: call.profile.version,
+            route_id: call.route.id,
+            route_version: call.route.version,
+            grant_policy: call.grant_policy,
+            route_min_policy: call.route_min_policy,
+            high_risk: validated.high_risk,
+        }
+    }
+
+    fn insert_approval(
+        &self,
+        draft: &ApprovalDraft,
+        channel: ApprovalChannel,
+        status: ApprovalStatus,
+        now: i64,
+        decided_by: Option<&str>,
+    ) -> std::result::Result<ApprovalRecord, CallToolResult> {
+        let expires_at = if status == ApprovalStatus::Pending {
+            now + self.state.approval_timeout_ms
+        } else {
+            now + self.state.approval_execution_ttl_ms
+        };
+        let request = NewApprovalRequest {
+            draft: draft.clone(),
+            channel,
+            status,
+            created_at: now,
+            expires_at,
+            decided_at: (status != ApprovalStatus::Pending).then_some(now),
+            decided_by: decided_by.map(str::to_string),
+            reason_code: None,
+            reason: None,
+        };
+        let store = match self.state.store.lock() {
+            Ok(store) => store,
+            Err(_) => return Err(state_unavailable()),
+        };
+        store.insert_approval_request(&request).map_err(tool_error)
+    }
+
+    async fn execute_claimed(
+        &self,
+        record: ApprovalRecord,
+        params: &[Value],
+    ) -> Result<CallToolResult, McpError> {
+        let profile = {
+            let store = self.lock_store()?;
+            store
+                .get_profile(record.draft.profile_id)
+                .map_err(store_error)?
+        };
+        let sql = record.draft.sql.as_deref().unwrap_or_default();
+        let result = self.state.executor.mutate(&profile, sql, params).await;
+        match result {
+            Ok(outcome) => {
+                let finished = {
+                    let store = self.lock_store()?;
+                    store.finish_approval(
+                        record.id,
+                        ApprovalOutcome::Succeeded,
+                        Some(outcome.row_count),
+                        None,
+                        now_ms(),
+                    )
+                };
+                if finished.is_err() {
+                    return Ok(CallToolResult::structured_error(json!({
+                        "code": "AUDIT_WRITE_FAILED",
+                        "approvalId": record.id,
+                    })));
+                }
+                Ok(CallToolResult::structured(json!({
+                    "source": record.draft.source_id,
+                    "rowCount": outcome.row_count,
+                    "highRisk": record.draft.high_risk,
+                    "approvalId": record.id,
+                })))
+            }
+            Err(error) => {
+                let _ = {
+                    let store = self.lock_store()?;
+                    store.finish_approval(
+                        record.id,
+                        ApprovalOutcome::Unknown,
+                        None,
+                        Some("EXECUTION_UNKNOWN"),
+                        now_ms(),
+                    )
+                };
+                Ok(CallToolResult::structured_error(json!({
+                    "code": "EXECUTION_UNKNOWN",
+                    "message": "external execution result is unknown; do not retry automatically",
+                    "approvalId": record.id,
+                    "detail": error.to_string(),
+                })))
+            }
+        }
+    }
+
+    async fn claim_and_execute(
+        &self,
+        record: ApprovalRecord,
+        params: Vec<Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let claim = {
+            let store = self.lock_store()?;
+            store.claim_approval(
+                record.id,
+                &record.draft.token_id,
+                &record.request_digest,
+                now_ms(),
+            )
+        };
+        match claim {
+            Ok(ClaimOutcome::Claimed(record)) => self.execute_claimed(*record, &params).await,
+            Ok(other) => Ok(claim_error(other)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    async fn execute_write(
+        &self,
+        context: &RequestContext<RoleServer>,
+        call: AuthorizedCall,
+        validated: ValidatedSql,
+        params: Vec<Value>,
+        approval_id: Option<i64>,
+    ) -> Result<CallToolResult, McpError> {
+        let draft = self.build_approval_draft(&call, &validated, &params);
+        let now = now_ms();
+
+        if let Some(id) = approval_id {
+            let claim = {
+                let store = self.lock_store()?;
+                store.claim_approval(id, &draft.token_id, &draft.digest(), now)
+            };
+            return match claim {
+                Ok(ClaimOutcome::Claimed(record)) => self.execute_claimed(*record, &params).await,
+                Ok(other) => Ok(claim_error(other)),
+                Err(error) => Ok(tool_error(error)),
+            };
+        }
+
+        if call.policy == ApprovalPolicy::Direct && !validated.high_risk {
+            let result = self
+                .state
+                .executor
+                .mutate(&call.profile, &validated.sql, &params)
+                .await;
+            match result {
+                Ok(outcome) => {
+                    let mut event = crate::approval::AuditEvent::for_draft(
+                        &draft,
+                        "direct_executed",
+                        "allowed",
+                        "mcp-client",
+                        now,
+                    );
+                    event.row_count = Some(outcome.row_count as i64);
+                    let _ = {
+                        let store = self.lock_store()?;
+                        store.record_audit_event(&event)
+                    };
+                    return Ok(CallToolResult::structured(json!({
+                        "source": call.source.id,
+                        "rowCount": outcome.row_count,
+                        "highRisk": false,
+                    })));
+                }
+                Err(error) => {
+                    let event = crate::approval::AuditEvent::for_draft(
+                        &draft,
+                        "direct_failed",
+                        "error",
+                        "mcp-client",
+                        now,
+                    );
+                    let _ = {
+                        let store = self.lock_store()?;
+                        store.record_audit_event(&event)
+                    };
+                    return Ok(tool_error(error));
+                }
+            }
+        }
+
+        let mut admin_required = validated.high_risk || call.tool == Tool::CreateDatabase;
+        if !admin_required {
+            let prompt = format!(
+                "Approve {} on source {}?",
+                call.tool.as_str(),
+                call.source.id
+            );
+            match self.state.elicitation.ask(context, &prompt).await {
+                ElicitationOutcome::Accepted => {
+                    let record = match self.insert_approval(
+                        &draft,
+                        ApprovalChannel::Elicitation,
+                        ApprovalStatus::Approved,
+                        now,
+                        Some("mcp-client"),
+                    ) {
+                        Ok(record) => record,
+                        Err(result) => return Ok(result),
+                    };
+                    return self.claim_and_execute(record, params).await;
+                }
+                ElicitationOutcome::Declined | ElicitationOutcome::Cancelled => {
+                    let _ = self.insert_approval(
+                        &draft,
+                        ApprovalChannel::Elicitation,
+                        ApprovalStatus::Denied,
+                        now,
+                        Some("mcp-client"),
+                    );
+                    return Ok(CallToolResult::structured_error(json!({
+                        "code": "APPROVAL_DENIED",
+                        "message": "approval was declined or cancelled",
+                    })));
+                }
+                ElicitationOutcome::Unsupported => admin_required = true,
+                ElicitationOutcome::Failed => {
+                    return Ok(CallToolResult::structured_error(json!({
+                        "code": "ELICITATION_FAILED",
+                        "message": "elicitation failed",
+                    })));
+                }
+            }
+        }
+
+        if admin_required {
+            let record = match self.insert_approval(
+                &draft,
+                ApprovalChannel::Admin,
+                ApprovalStatus::Pending,
+                now,
+                None,
+            ) {
+                Ok(record) => record,
+                Err(result) => return Ok(result),
+            };
+            return Ok(approval_required(&record));
+        }
+
+        Ok(CallToolResult::structured_error(json!({
+            "code": "APPROVAL_REQUIRED",
+            "message": "approval could not be completed",
+        })))
     }
 }
 
@@ -235,28 +556,8 @@ impl McpDbServer {
             Ok(validated) => validated,
             Err(error) => return Ok(tool_error(error)),
         };
-        // T-06 owns the approval queue; until then, approval-required and high-risk writes fail closed.
-        if call.policy == ApprovalPolicy::Approval || validated.high_risk {
-            return Ok(CallToolResult::structured_error(json!({
-                "code": "APPROVAL_REQUIRED",
-                "message": "admin approval is required before execution",
-                "highRisk": validated.high_risk,
-            })));
-        }
-        let outcome = match self
-            .state
-            .executor
-            .mutate(&call.profile, &validated.sql, &args.params)
+        self.execute_write(&context, call, validated, args.params, args.approval_id)
             .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return Ok(tool_error(error)),
-        };
-        Ok(CallToolResult::structured(json!({
-            "source": call.source.id,
-            "rowCount": outcome.row_count,
-            "highRisk": validated.high_risk,
-        })))
     }
 
     #[tool(description = "Execute one database-local DDL statement.")]
@@ -274,28 +575,8 @@ impl McpDbServer {
             Ok(validated) => validated,
             Err(error) => return Ok(tool_error(error)),
         };
-        // T-06 owns the approval queue; until then, approval-required and high-risk writes fail closed.
-        if call.policy == ApprovalPolicy::Approval || validated.high_risk {
-            return Ok(CallToolResult::structured_error(json!({
-                "code": "APPROVAL_REQUIRED",
-                "message": "admin approval is required before execution",
-                "highRisk": validated.high_risk,
-            })));
-        }
-        let outcome = match self
-            .state
-            .executor
-            .mutate(&call.profile, &validated.sql, &args.params)
+        self.execute_write(&context, call, validated, args.params, args.approval_id)
             .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => return Ok(tool_error(error)),
-        };
-        Ok(CallToolResult::structured(json!({
-            "source": call.source.id,
-            "rowCount": outcome.row_count,
-            "highRisk": validated.high_risk,
-        })))
     }
 
     #[tool(description = "Return the database query plan for one read-only statement.")]
@@ -428,4 +709,60 @@ fn tool_error(error: Error) -> CallToolResult {
         "code": code,
         "message": error.to_string(),
     }))
+}
+
+fn state_unavailable() -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "code": "STATE_UNAVAILABLE",
+        "message": "state store lock poisoned",
+    }))
+}
+
+fn approval_required(record: &ApprovalRecord) -> CallToolResult {
+    CallToolResult::structured_error(json!({
+        "code": "APPROVAL_REQUIRED",
+        "message": "admin approval is required before execution",
+        "approvalId": record.id,
+        "expiresAt": record.expires_at,
+        "channel": record.channel.as_str(),
+        "highRisk": record.draft.high_risk,
+    }))
+}
+
+fn claim_error(outcome: ClaimOutcome) -> CallToolResult {
+    match outcome {
+        ClaimOutcome::NotFound => CallToolResult::structured_error(json!({
+            "code": "APPROVAL_NOT_FOUND",
+            "message": "approval request was not found",
+        })),
+        ClaimOutcome::TokenMismatch | ClaimOutcome::DigestMismatch => {
+            CallToolResult::structured_error(json!({
+                "code": "APPROVAL_STALE",
+                "message": "approval does not match the exact request",
+            }))
+        }
+        ClaimOutcome::NotApproved => CallToolResult::structured_error(json!({
+            "code": "APPROVAL_NOT_PENDING",
+            "message": "approval is not available for consumption",
+        })),
+        ClaimOutcome::Expired => CallToolResult::structured_error(json!({
+            "code": "APPROVAL_EXPIRED",
+            "message": "approval expired before execution",
+        })),
+        ClaimOutcome::Stale(reason) => CallToolResult::structured_error(json!({
+            "code": "APPROVAL_STALE",
+            "message": "approval is no longer valid",
+            "reasonCode": reason,
+        })),
+        ClaimOutcome::Claimed(_) => CallToolResult::structured_error(json!({
+            "code": "APPROVAL_STATE_ERROR",
+        })),
+    }
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }

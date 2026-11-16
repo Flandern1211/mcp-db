@@ -12,6 +12,8 @@ pub struct Config {
     pub state_path: PathBuf,
     pub credential_store: Option<PathBuf>,
     pub master_key_file: Option<PathBuf>,
+    pub approval_timeout_ms: i64,
+    pub approval_execution_ttl_ms: i64,
 }
 
 #[derive(Debug)]
@@ -65,6 +67,8 @@ impl Config {
             state_path,
             credential_store,
             master_key_file,
+            approval_timeout_ms: 120_000,
+            approval_execution_ttl_ms: 60_000,
         })
     }
 }

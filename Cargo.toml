@@ -13,7 +13,7 @@ base64 = "0.22"
 chacha20poly1305 = "0.10"
 http = "1"
 rand = "0.8"
-rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "schemars"] }
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-streamable-http-server", "schemars", "elicitation"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
