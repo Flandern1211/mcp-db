@@ -15,6 +15,8 @@ pub struct AuthorizedCall {
     pub tool: Tool,
     pub profile: Profile,
     pub route: Route,
+    pub grant_policy: ApprovalPolicy,
+    pub route_min_policy: ApprovalPolicy,
     pub policy: ApprovalPolicy,
 }
 
@@ -121,6 +123,7 @@ impl<'a> Authorizer<'a> {
         } else {
             stricter(grant.policy, route.min_approval_policy)
         };
+        let route_min_policy = route.min_approval_policy;
 
         Ok(AuthorizedCall {
             identity,
@@ -128,6 +131,8 @@ impl<'a> Authorizer<'a> {
             tool,
             profile,
             route,
+            grant_policy: grant.policy,
+            route_min_policy,
             policy,
         })
     }

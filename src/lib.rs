@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod auth;
 pub mod authorization;
 pub mod config;
@@ -10,6 +11,10 @@ pub mod sql_policy;
 pub mod state;
 pub mod transport;
 
+pub use approval::{
+    ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalRecord, ApprovalStatus, AuditEvent,
+    ClaimOutcome, DecisionOutcome, NewApprovalRequest, RecoverySummary,
+};
 pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
 pub use credentials::{CredentialResolver, EncryptedFileResolver};
@@ -18,7 +23,7 @@ pub use executor::{
     MutationOutcome, PostgresExecutor, QueryOutcome, SqlExecutor, UnavailableExecutor,
     DEFAULT_MAX_ROWS,
 };
-pub use mcp::{AppState, McpDbServer};
+pub use mcp::{AppState, ElicitationGate, ElicitationOutcome, McpDbServer, PeerElicitation};
 pub use metadata::{MetadataProvider, PostgresMetadata, UnavailableMetadata};
 pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
 pub use state::{

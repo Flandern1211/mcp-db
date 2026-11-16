@@ -13,7 +13,7 @@ use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, Stream
 use tokio::net::TcpListener;
 
 use crate::auth::parse_bearer;
-use crate::mcp::{AppState, McpDbServer};
+use crate::mcp::{AppState, McpDbServer, PeerElicitation};
 use crate::{Config, Error, MetadataProvider, SqlExecutor, Store, DEFAULT_MAX_ROWS};
 
 pub async fn run(
@@ -34,7 +34,10 @@ pub async fn run(
             store,
             metadata,
             executor,
+            elicitation: Arc::new(PeerElicitation),
             max_rows: DEFAULT_MAX_ROWS,
+            approval_timeout_ms: config.approval_timeout_ms,
+            approval_execution_ttl_ms: config.approval_execution_ttl_ms,
             sessions: Default::default(),
         }),
     )

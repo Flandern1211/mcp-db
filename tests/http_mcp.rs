@@ -10,13 +10,71 @@ use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use mcp_db::transport::http::app;
 use mcp_db::{
-    AppState, ApprovalPolicy, Driver, EncryptedFileResolver, Environment, MetadataProvider,
-    NewGrant, NewProfile, NewRoute, NewSource, PostgresExecutor, PostgresMetadata, Profile,
-    ProfilePurpose, Store, Tool, UnavailableExecutor, DEFAULT_MAX_ROWS,
+    AppState, ApprovalPolicy, Driver, ElicitationGate, ElicitationOutcome, EncryptedFileResolver,
+    Environment, MetadataProvider, MutationOutcome, NewGrant, NewProfile, NewRoute, NewSource,
+    PeerElicitation, PostgresExecutor, PostgresMetadata, Profile, ProfilePurpose, QueryOutcome,
+    SqlExecutor, Store, Tool, UnavailableExecutor, DEFAULT_MAX_ROWS,
 };
+use rmcp::service::RequestContext;
+use rmcp::RoleServer;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+#[derive(Default)]
+struct MockSqlExecutor {
+    mutations: AtomicUsize,
+}
+
+struct FixedElicitation(ElicitationOutcome);
+
+#[async_trait]
+impl ElicitationGate for FixedElicitation {
+    async fn ask(
+        &self,
+        _context: &RequestContext<RoleServer>,
+        _prompt: &str,
+    ) -> ElicitationOutcome {
+        self.0
+    }
+}
+
+#[async_trait]
+impl SqlExecutor for MockSqlExecutor {
+    async fn query(
+        &self,
+        _profile: &Profile,
+        _sql: &str,
+        _params: &[Value],
+        _max_rows: usize,
+    ) -> Result<QueryOutcome, mcp_db::Error> {
+        Ok(QueryOutcome {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            returned_rows: 0,
+            truncated: false,
+        })
+    }
+
+    async fn mutate(
+        &self,
+        _profile: &Profile,
+        _sql: &str,
+        _params: &[Value],
+    ) -> Result<MutationOutcome, mcp_db::Error> {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        Ok(MutationOutcome { row_count: 1 })
+    }
+
+    async fn explain(
+        &self,
+        _profile: &Profile,
+        _explain_sql: &str,
+    ) -> Result<Value, mcp_db::Error> {
+        Ok(json!([]))
+    }
+}
 
 #[derive(Default)]
 struct MockMetadata {
@@ -73,7 +131,10 @@ fn setup() -> (TempDir, AppState, String, Arc<MockMetadata>) {
         store: Arc::new(Mutex::new(store)),
         metadata: metadata.clone(),
         executor: Arc::new(UnavailableExecutor),
+        elicitation: Arc::new(PeerElicitation),
         max_rows: DEFAULT_MAX_ROWS,
+        approval_timeout_ms: 120_000,
+        approval_execution_ttl_ms: 60_000,
         sessions: Default::default(),
     };
     (dir, state, token.token, metadata)
@@ -583,7 +644,10 @@ async fn encrypted_credentials_flow_through_mcp_to_postgres() {
         store: Arc::new(Mutex::new(store)),
         metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
         executor: Arc::new(PostgresExecutor::new(resolver)),
+        elicitation: Arc::new(PeerElicitation),
         max_rows: DEFAULT_MAX_ROWS,
+        approval_timeout_ms: 120_000,
+        approval_execution_ttl_ms: 60_000,
         sessions: Default::default(),
     };
     let router = app(state);
@@ -724,7 +788,10 @@ async fn encrypted_credentials_flow_through_mcp_sql_tools() {
         store: Arc::new(Mutex::new(store)),
         metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
         executor: Arc::new(PostgresExecutor::new(resolver)),
+        elicitation: Arc::new(PeerElicitation),
         max_rows: 1,
+        approval_timeout_ms: 120_000,
+        approval_execution_ttl_ms: 60_000,
         sessions: Default::default(),
     };
     let router = app(state);
@@ -929,4 +996,213 @@ async fn approval_policy_and_high_risk_fail_closed_before_executor() {
         "APPROVAL_REQUIRED"
     );
     assert_eq!(body["result"]["structuredContent"]["highRisk"], true);
+}
+
+#[tokio::test]
+async fn admin_approval_is_consumed_once_via_retry() {
+    let (_dir, mut state, token, _metadata) = setup();
+    let mock = Arc::new(MockSqlExecutor::default());
+    state.executor = mock.clone();
+
+    {
+        let store = state.store.lock().expect("store lock");
+        let source = store
+            .create_source(&NewSource {
+                id: "a".to_string(),
+                driver: Driver::Postgres,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: None,
+            })
+            .expect("create source");
+        let profile = store
+            .create_profile(&NewProfile {
+                source_id: source.id.clone(),
+                name: "mutate".to_string(),
+                purpose: ProfilePurpose::Mutate,
+                credential_ref: "keyring:mcp-db/test/query".to_string(),
+                max_connections: Some(1),
+                statement_timeout_ms: Some(1_000),
+            })
+            .expect("create profile");
+        let route = store
+            .create_route(&NewRoute {
+                source_id: source.id.clone(),
+                tool: Tool::MutateSql,
+                profile_id: profile.id,
+                min_approval_policy: ApprovalPolicy::Direct,
+            })
+            .expect("create route");
+        let token_id = store.authenticate(&token).expect("auth").token_id;
+        store
+            .create_grant(&NewGrant {
+                token_id,
+                source_id: source.id,
+                tool: Tool::MutateSql,
+                policy: Some(ApprovalPolicy::Approval),
+            })
+            .expect("create grant");
+        let _ = route;
+    }
+
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            MUTATE_INSERT,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_REQUIRED"
+    );
+    let approval_id = body["result"]["structuredContent"]["approvalId"]
+        .as_i64()
+        .expect("approval id");
+    assert_eq!(mock.mutations.load(Ordering::SeqCst), 0);
+
+    {
+        let store = state.store.lock().expect("store lock");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        assert_eq!(
+            store
+                .decide_approval(approval_id, true, "admin", now, 60_000)
+                .expect("decide"),
+            mcp_db::DecisionOutcome::Approved
+        );
+    }
+
+    let retry = format!(
+        r#"{{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{{"name":"mutate_sql","arguments":{{"source":"a","sql":"INSERT INTO users (id, name) VALUES ($1, $2)","params":[99,"mcp"],"approval_id":{approval_id}}}}}}}"#
+    );
+    let (status, _, body) = send(
+        router.clone(),
+        request(Method::POST, "/mcp", &retry, Some(&token), Some(&session)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["rowCount"], 1);
+    assert_eq!(mock.mutations.load(Ordering::SeqCst), 1);
+
+    let (status, _, body) = send(
+        router,
+        request(Method::POST, "/mcp", &retry, Some(&token), Some(&session)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_NOT_PENDING"
+    );
+    assert_eq!(mock.mutations.load(Ordering::SeqCst), 1);
+}
+
+fn elicitation_state(
+    outcome: ElicitationOutcome,
+) -> (TempDir, AppState, String, Arc<MockSqlExecutor>) {
+    let (dir, mut state, token, _metadata) = setup();
+    let mock = Arc::new(MockSqlExecutor::default());
+    state.executor = mock.clone();
+    state.elicitation = Arc::new(FixedElicitation(outcome));
+    {
+        let store = state.store.lock().expect("store lock");
+        let source = store
+            .create_source(&NewSource {
+                id: "a".to_string(),
+                driver: Driver::Postgres,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: None,
+            })
+            .expect("create source");
+        let profile = store
+            .create_profile(&NewProfile {
+                source_id: source.id.clone(),
+                name: "mutate".to_string(),
+                purpose: ProfilePurpose::Mutate,
+                credential_ref: "keyring:mcp-db/test/query".to_string(),
+                max_connections: Some(1),
+                statement_timeout_ms: Some(1_000),
+            })
+            .expect("create profile");
+        store
+            .create_route(&NewRoute {
+                source_id: source.id.clone(),
+                tool: Tool::MutateSql,
+                profile_id: profile.id,
+                min_approval_policy: ApprovalPolicy::Direct,
+            })
+            .expect("create route");
+        let token_id = store.authenticate(&token).expect("auth").token_id;
+        store
+            .create_grant(&NewGrant {
+                token_id,
+                source_id: source.id,
+                tool: Tool::MutateSql,
+                policy: Some(ApprovalPolicy::Approval),
+            })
+            .expect("create grant");
+    }
+    (dir, state, token, mock)
+}
+
+#[tokio::test]
+async fn elicitation_accept_executes_once() {
+    let (_dir, state, token, mock) = elicitation_state(ElicitationOutcome::Accepted);
+    let router = app(state);
+    let session = init_session(router.clone(), &token).await;
+    let (status, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            MUTATE_INSERT,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["rowCount"], 1);
+    assert_eq!(mock.mutations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn elicitation_decline_and_cancel_do_not_execute() {
+    for outcome in [ElicitationOutcome::Declined, ElicitationOutcome::Cancelled] {
+        let (_dir, state, token, mock) = elicitation_state(outcome);
+        let router = app(state);
+        let session = init_session(router.clone(), &token).await;
+        let (status, _, body) = send(
+            router,
+            request(
+                Method::POST,
+                "/mcp",
+                MUTATE_INSERT,
+                Some(&token),
+                Some(&session),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["result"]["structuredContent"]["code"],
+            "APPROVAL_DENIED"
+        );
+        assert_eq!(mock.mutations.load(Ordering::SeqCst), 0);
+    }
 }
