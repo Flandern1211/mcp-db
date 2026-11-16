@@ -3,14 +3,14 @@
 | 项目 | 内容 |
 | --- | --- |
 | 档位 | 完整：高风险写入审批、一次性消费与持久状态 |
-| 状态 | 未开始 |
+| 状态 | 🟡 待验收 |
 | 依赖 | T-02、T-04、T-05 |
 | AC | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 |
 | 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-06-approval-audit` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |
-| 集成分支提交 | — |
+| 集成分支提交 | 待合入 |
 
 ## 1. 范围
 
@@ -41,14 +41,25 @@
 
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
-| 模块集成/E2E | AC2-04、05、09、16、22 | 审批渠道、竞态、重启和未知结果矩阵 | Mock executor + 临时 SQLite | 未开始 | 全部 |
+| 模块集成 | AC2-04、05、09、16、22 | `cargo test --test approval_store` | 临时 SQLite | 6 passed：批准/拒绝/过期/一次性消费；摘要不符；token 撤销；route 版本变化失效；重启 pending/approved 失效、in-flight unknown；unknown 结果不可覆盖；审计事件 | 无 |
+| MCP/E2E | AC2-04、05、16 | `cargo test --test http_mcp` | Mock executor + 临时 SQLite | 7 passed：elicitation accept 执行一次；decline/cancel 不执行；高危与 approval grant 进入 admin；admin 批准后 retry 只消费一次；重复 retry 被拒 | 真实 MCP 客户端 elicitation 未验证 |
+| 全量回归 | 工程基线 | `cargo fmt --check`；clippy driver；`cargo test` | Docker Desktop Linux 容器 | 47 passed, 6 ignored；lint 通过 | 无 |
 
-外部写调用数：0（Mock）。证据位置：本任务文件（仓库可见）。
+外部写调用数：0（Mock）。证据位置：本任务文件和提交正文（仓库可见）。
+
+实现说明：
+
+- 新增 `approval_requests` 与 `audit_events`，schema v2；legacy `approvals`/`audit` 保持只读历史。
+- 摘要绑定 token/agent/source/environment/tool/SQL/参数/profile 版本/route 版本/grant 策略/route 最低策略/高危标记。
+- admin pending 通过 `approvalId` 返回；批准后 agent 用同一请求 + `approval_id` 重试，claim 原子消费一次。
+- elicitation 由 `ElicitationGate` 抽象，生产实现使用 rmcp `Peer`；测试用 fake gate 覆盖 accept/decline/cancel。
+- 高危 SQL 和 `create_database` 永不接受 elicitation，只进入 admin。
+- 执行错误在 claim 后记录 `unknown`，不自动重试。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：`47a531a`；待合入 `develop` 并回写状态。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | AC2-04、05、09、16、22 | 任务未开始 | 审批与审计无实现证据 | 实现状态机并执行竞态/重启矩阵 | 是 |
+| 🔴 未测试 | 真实 MCP 客户端 elicitation | 生产 `PeerElicitation` 已实现，但当前测试使用 fake gate；没有真实客户端 accept/decline/cancel 会话记录 | 真实协议交互未验证；不影响状态机和 admin 队列 | 在支持 elicitation 的 MCP 客户端执行 accept/decline/cancel 并记录会话；关闭条件：三条真实交互证据 | 否 |
