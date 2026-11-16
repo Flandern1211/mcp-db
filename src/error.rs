@@ -5,6 +5,14 @@ pub enum Error {
     InvalidInput(String),
     Unauthenticated,
     TokenRevoked,
+    SourceRequired,
+    SourceNotGranted(String),
+    SourceArchived(String),
+    ToolNotGranted(String),
+    ProductionWriteForbidden,
+    RouteNotFound(String),
+    ProfileUnavailable(i64),
+    ProfileDisabled(i64),
     NotFound(String),
     Conflict(String),
     Database(rusqlite::Error),
@@ -18,6 +26,22 @@ impl fmt::Display for Error {
             Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
             Self::Unauthenticated => write!(f, "unauthenticated"),
             Self::TokenRevoked => write!(f, "token revoked"),
+            Self::SourceRequired => {
+                write!(f, "source is required when multiple sources are available")
+            }
+            Self::SourceNotGranted(source) => write!(f, "source is not granted: {source}"),
+            Self::SourceArchived(source) => write!(f, "source is archived: {source}"),
+            Self::ToolNotGranted(tool) => write!(f, "tool is not granted: {tool}"),
+            Self::ProductionWriteForbidden => {
+                write!(f, "production sources do not allow agent writes")
+            }
+            Self::RouteNotFound(route) => write!(f, "tool route is not configured: {route}"),
+            Self::ProfileUnavailable(profile) => {
+                write!(f, "connection profile is unavailable: {profile}")
+            }
+            Self::ProfileDisabled(profile) => {
+                write!(f, "connection profile is disabled: {profile}")
+            }
             Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::Conflict(message) => write!(f, "conflict: {message}"),
             Self::Database(error) => write!(f, "state database error: {error}"),

@@ -256,7 +256,7 @@ impl Store {
             }
         }
         if let Some(token_id) = &source.created_token_id {
-            self.active_token(token_id)?;
+            self.get_token_identity(token_id)?;
         }
         let now = now_ms();
         self.conn.execute(
@@ -495,7 +495,7 @@ impl Store {
     }
 
     pub fn create_grant(&self, grant: &NewGrant) -> Result<Grant> {
-        self.active_token(&grant.token_id)?;
+        self.get_token_identity(&grant.token_id)?;
         let source = self.get_source(&grant.source_id)?;
         if source.status != SourceStatus::Active {
             return Err(Error::InvalidInput(
@@ -590,7 +590,34 @@ impl Store {
             .collect()
     }
 
-    fn active_token(&self, token_id: &str) -> Result<TokenIdentity> {
+    /// Sources with at least one grant and not archived. Used for discovery only.
+    pub fn list_visible_sources(&self, token_id: &str) -> Result<Vec<Source>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT s.id
+               FROM tool_grants g JOIN sources s ON s.id = g.source_id
+              WHERE g.token_id = ? AND s.status = 'active'
+              ORDER BY s.id",
+        )?;
+        let ids = statement
+            .query_map([token_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter().map(|id| self.get_source(&id)).collect()
+    }
+
+    /// Distinct tools granted on active sources. Visibility does not authorize a call.
+    pub fn list_granted_tools(&self, token_id: &str) -> Result<Vec<Tool>> {
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT g.tool
+               FROM tool_grants g JOIN sources s ON s.id = g.source_id
+              WHERE g.token_id = ? AND s.status = 'active'",
+        )?;
+        let rows = statement
+            .query_map([token_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter().map(|tool| Tool::parse(&tool)).collect()
+    }
+
+    pub fn get_token_identity(&self, token_id: &str) -> Result<TokenIdentity> {
         let row = self
             .conn
             .query_row(

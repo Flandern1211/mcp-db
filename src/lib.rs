@@ -1,8 +1,10 @@
 pub mod auth;
+pub mod authorization;
 pub mod config;
 pub mod error;
 pub mod state;
 
+pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
 pub use error::Error;
 pub use state::{

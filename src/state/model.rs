@@ -181,6 +181,20 @@ impl Tool {
     pub fn is_write(self) -> bool {
         matches!(self, Self::MutateSql | Self::ExecuteDdl)
     }
+
+    /// Stable presentation order for tool discovery.
+    pub fn order(self) -> u8 {
+        match self {
+            Self::ListSources => 0,
+            Self::ListTables => 1,
+            Self::DescribeTable => 2,
+            Self::ExplainQuery => 3,
+            Self::QuerySql => 4,
+            Self::MutateSql => 5,
+            Self::ExecuteDdl => 6,
+            Self::CreateDatabase => 7,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -286,7 +300,7 @@ pub struct Grant {
 }
 
 pub(crate) fn validate_source_id(value: &str) -> Result<()> {
-    validate_identifier(value, 2, 64, "source id")
+    validate_identifier(value, 1, 64, "source id")
 }
 
 pub(crate) fn validate_profile_name(value: &str) -> Result<()> {
