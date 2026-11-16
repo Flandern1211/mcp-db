@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolRequestParams, CallToolResult, ListToolsResult, PaginatedRequestParams,
     ServerCapabilities, ServerInfo,
@@ -9,14 +10,45 @@ use rmcp::model::{
 use rmcp::serde_json::json;
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::Value;
 
-use crate::{Authorizer, Error, Store, TokenIdentity, Tool};
+use crate::metadata::MetadataProvider;
+use crate::{AuthorizedCall, Authorizer, Error, Store, TokenIdentity, Tool};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
+    pub metadata: Arc<dyn MetadataProvider>,
     /// MCP session id -> token id. Prevents a session from switching identity.
     pub sessions: Arc<Mutex<HashMap<String, String>>>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SourceArgs {
+    #[schemars(description = "Source id; may be omitted when the token has one source")]
+    source: Option<String>,
+    #[schemars(description = "Optional schema name")]
+    schema: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct DescribeArgs {
+    #[schemars(description = "Source id; may be omitted when the token has one source")]
+    source: Option<String>,
+    table: String,
+    #[schemars(description = "Optional schema name")]
+    schema: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct ExplainArgs {
+    #[schemars(description = "Source id; may be omitted when the token has one source")]
+    source: Option<String>,
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -34,6 +66,26 @@ impl McpDbServer {
             .store
             .lock()
             .map_err(|_| McpError::internal_error("state store lock poisoned", None))
+    }
+
+    fn authorize_call(
+        &self,
+        identity: &TokenIdentity,
+        source: Option<&str>,
+        tool: Tool,
+    ) -> std::result::Result<AuthorizedCall, CallToolResult> {
+        let store = match self.state.store.lock() {
+            Ok(store) => store,
+            Err(_) => {
+                return Err(CallToolResult::structured_error(json!({
+                    "code": "STATE_UNAVAILABLE",
+                    "message": "state store lock poisoned",
+                })))
+            }
+        };
+        Authorizer::new(&store)
+            .authorize(&identity.token_id, source, tool)
+            .map_err(tool_error)
     }
 }
 
@@ -62,6 +114,85 @@ impl McpDbServer {
             })
             .collect::<Vec<_>>();
         Ok(CallToolResult::structured(json!({ "sources": sources })))
+    }
+
+    #[tool(description = "List tables and views in a source.")]
+    async fn list_tables(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<SourceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::ListTables) {
+            Ok(call) => call,
+            Err(result) => return Ok(result),
+        };
+        let tables = match self
+            .state
+            .metadata
+            .list_tables(&call.profile, args.schema.as_deref())
+        {
+            Ok(tables) => tables,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        Ok(CallToolResult::structured(json!({
+            "source": call.source.id,
+            "tables": tables,
+        })))
+    }
+
+    #[tool(description = "Describe a table, including columns, keys and relationships.")]
+    async fn describe_table(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<DescribeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::DescribeTable)
+        {
+            Ok(call) => call,
+            Err(result) => return Ok(result),
+        };
+        let description = match self.state.metadata.describe_table(
+            &call.profile,
+            &args.table,
+            args.schema.as_deref(),
+        ) {
+            Ok(description) => description,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        Ok(CallToolResult::structured(json!({
+            "source": call.source.id,
+            "table": args.table,
+            "description": description,
+        })))
+    }
+
+    #[tool(description = "Return the database query plan for a statement.")]
+    async fn explain_query(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<ExplainArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::ExplainQuery)
+        {
+            Ok(call) => call,
+            Err(result) => return Ok(result),
+        };
+        // shortcut: SQL class and non-executing plan policy are owned by T-05.
+        let plan = match self
+            .state
+            .metadata
+            .explain(&call.profile, &args.sql, &args.params)
+        {
+            Ok(plan) => plan,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        Ok(CallToolResult::structured(json!({
+            "source": call.source.id,
+            "plan": plan,
+        })))
     }
 }
 
@@ -154,6 +285,7 @@ fn tool_error(error: Error) -> CallToolResult {
         Error::RouteNotFound(_) => "ROUTE_NOT_FOUND",
         Error::ProfileUnavailable(_) => "PROFILE_UNAVAILABLE",
         Error::ProfileDisabled(_) => "PROFILE_DISABLED",
+        Error::MetadataUnavailable => "METADATA_UNAVAILABLE",
         _ => "REQUEST_REJECTED",
     };
     CallToolResult::structured_error(json!({

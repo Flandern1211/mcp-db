@@ -1,23 +1,74 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use mcp_db::transport::http::app;
-use mcp_db::{AppState, Driver, Environment, NewGrant, NewSource, Store, Tool};
-use serde_json::Value;
+use mcp_db::{
+    AppState, ApprovalPolicy, Driver, Environment, MetadataProvider, NewGrant, NewProfile,
+    NewRoute, NewSource, Profile, ProfilePurpose, Store, Tool,
+};
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
-fn setup() -> (TempDir, AppState, String) {
+#[derive(Default)]
+struct MockMetadata {
+    list_calls: AtomicUsize,
+    describe_calls: AtomicUsize,
+    explain_calls: AtomicUsize,
+}
+
+impl MetadataProvider for MockMetadata {
+    fn list_tables(
+        &self,
+        _profile: &Profile,
+        schema: Option<&str>,
+    ) -> Result<Value, mcp_db::Error> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!([{
+            "schema": schema.unwrap_or("public"),
+            "name": "users",
+            "kind": "table"
+        }]))
+    }
+
+    fn describe_table(
+        &self,
+        _profile: &Profile,
+        table: &str,
+        _schema: Option<&str>,
+    ) -> Result<Value, mcp_db::Error> {
+        self.describe_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!({
+            "table": table,
+            "columns": [{"name": "id", "type": "bigint", "nullable": false}]
+        }))
+    }
+
+    fn explain(
+        &self,
+        _profile: &Profile,
+        _sql: &str,
+        _params: &[Value],
+    ) -> Result<Value, mcp_db::Error> {
+        self.explain_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(json!([{"Plan": {"Node Type": "Seq Scan"}}]))
+    }
+}
+
+fn setup() -> (TempDir, AppState, String, Arc<MockMetadata>) {
     let dir = TempDir::new().expect("temp dir");
     let store = Store::open(dir.path().join("state.db")).expect("open store");
     let token = store.create_token("agent-a").expect("issue token");
+    let metadata = Arc::new(MockMetadata::default());
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
+        metadata: metadata.clone(),
         sessions: Default::default(),
     };
-    (dir, state, token.token)
+    (dir, state, token.token, metadata)
 }
 
 fn request(
@@ -76,10 +127,86 @@ const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","param
 const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 const TOOLS_LIST: &str = r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#;
 const LIST_SOURCES: &str = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#;
+const LIST_TABLES: &str = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_tables","arguments":{"source":"a"}}}"#;
+const DESCRIBE_TABLE: &str = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"describe_table","arguments":{"source":"a","table":"users"}}}"#;
+const EXPLAIN_QUERY: &str = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"explain_query","arguments":{"source":"a","sql":"SELECT 1"}}}"#;
+const LIST_TABLES_B: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_tables","arguments":{"source":"b"}}}"#;
+
+async fn init_session(router: axum::Router, token: &str) -> String {
+    let (status, headers, _) = send(
+        router.clone(),
+        request(Method::POST, "/mcp", INITIALIZE, Some(token), None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let session = headers
+        .get("mcp-session-id")
+        .expect("session header")
+        .to_str()
+        .expect("session value")
+        .to_string();
+    let (status, _, _) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            INITIALIZED,
+            Some(token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    session
+}
+
+fn add_metadata_access(state: &AppState, token: &str) {
+    let store = state.store.lock().expect("store lock");
+    let source = store
+        .create_source(&NewSource {
+            id: "a".to_string(),
+            driver: Driver::Postgres,
+            environment: Environment::NonProduction,
+            parent_source_id: None,
+            created_token_id: None,
+            created_agent: None,
+            created_origin: None,
+        })
+        .expect("create source");
+    let profile = store
+        .create_profile(&NewProfile {
+            source_id: source.id.clone(),
+            name: "query".to_string(),
+            purpose: ProfilePurpose::Query,
+            credential_ref: "keyring:mcp-db/test/query".to_string(),
+            max_connections: Some(5),
+            statement_timeout_ms: Some(1_000),
+        })
+        .expect("create profile");
+    let token_id = store.authenticate(token).expect("auth").token_id;
+    for tool in [Tool::ListTables, Tool::DescribeTable, Tool::ExplainQuery] {
+        store
+            .create_route(&NewRoute {
+                source_id: source.id.clone(),
+                tool,
+                profile_id: profile.id,
+                min_approval_policy: ApprovalPolicy::Direct,
+            })
+            .expect("create route");
+        store
+            .create_grant(&NewGrant {
+                token_id: token_id.clone(),
+                source_id: source.id.clone(),
+                tool,
+                policy: None,
+            })
+            .expect("create grant");
+    }
+}
 
 #[tokio::test]
 async fn mcp_requires_a_bearer_token() {
-    let (_dir, state, _token) = setup();
+    let (_dir, state, _token, _metadata) = setup();
     let (status, _, _) = send(
         app(state),
         request(Method::POST, "/mcp", INITIALIZE, None, None),
@@ -90,7 +217,7 @@ async fn mcp_requires_a_bearer_token() {
 
 #[tokio::test]
 async fn mcp_lists_only_granted_sources_and_binds_sessions_to_tokens() {
-    let (_dir, state, token) = setup();
+    let (_dir, state, token, _metadata) = setup();
     let router = app(state.clone());
 
     let (status, headers, _) = send(
@@ -213,4 +340,122 @@ async fn mcp_lists_only_granted_sources_and_binds_sessions_to_tokens() {
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn metadata_tools_authorize_before_provider_and_expose_structured_results() {
+    let (_dir, state, token, metadata) = setup();
+    add_metadata_access(&state, &token);
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            TOOLS_LIST,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let names = body["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"list_sources"));
+    assert!(names.contains(&"list_tables"));
+    assert!(names.contains(&"describe_table"));
+    assert!(names.contains(&"explain_query"));
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_TABLES,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["tables"][0]["name"],
+        "users"
+    );
+    assert_eq!(metadata.list_calls.load(Ordering::SeqCst), 1);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            DESCRIBE_TABLE,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["description"]["columns"][0]["name"],
+        "id"
+    );
+    assert_eq!(metadata.describe_calls.load(Ordering::SeqCst), 1);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            EXPLAIN_QUERY,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["plan"][0]["Plan"]["Node Type"],
+        "Seq Scan"
+    );
+    assert_eq!(metadata.explain_calls.load(Ordering::SeqCst), 1);
+
+    {
+        let store = state.store.lock().expect("store lock");
+        store
+            .create_source(&NewSource {
+                id: "b".to_string(),
+                driver: Driver::Postgres,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: None,
+            })
+            .expect("create second source");
+    }
+    let (status, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_TABLES_B,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["isError"], true);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "TOOL_NOT_GRANTED"
+    );
+    assert_eq!(metadata.list_calls.load(Ordering::SeqCst), 1);
 }
