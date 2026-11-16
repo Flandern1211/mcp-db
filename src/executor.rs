@@ -221,7 +221,12 @@ impl SqlExecutor for PostgresExecutor {
         let row_count = client
             .execute(sql, &refs)
             .await
-            .map_err(|_| Error::MetadataUnavailable)?;
+            .map_err(|error| match error.code() {
+                Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
+                    Error::Conflict("unique constraint violation".to_string())
+                }
+                _ => Error::MetadataUnavailable,
+            })?;
         Ok(MutationOutcome { row_count })
     }
 
@@ -234,6 +239,12 @@ impl SqlExecutor for PostgresExecutor {
         let Some(row) = rows.first() else {
             return Ok(Value::Null);
         };
+        if row.columns()[0].type_() == &Type::JSON {
+            return row
+                .try_get::<_, Option<Value>>(0)
+                .map_err(|_| Error::MetadataUnavailable)?
+                .ok_or(Error::MetadataUnavailable);
+        }
         let plan: String = row.try_get(0).map_err(|_| Error::MetadataUnavailable)?;
         serde_json::from_str(&plan).map_err(|_| Error::MetadataUnavailable)
     }

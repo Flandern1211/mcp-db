@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use mcp_db::{
-    CredentialResolver, Error, MetadataProvider, PostgresMetadata, Profile, ProfilePurpose,
+    CredentialResolver, Error, MetadataProvider, PostgresExecutor, PostgresMetadata, Profile,
+    ProfilePurpose, SqlExecutor,
 };
 
 struct EmptyResolver;
@@ -61,4 +62,56 @@ async fn real_postgres_metadata_reads_tables_and_columns() {
             .expect("describe table");
         assert!(description["columns"].is_array());
     }
+}
+
+#[tokio::test]
+#[ignore = "requires MCPDB_TEST_PG_DSN and a controlled PostgreSQL test account"]
+async fn real_postgres_executor_queries_inserts_and_explains() {
+    let dsn = std::env::var("MCPDB_TEST_PG_DSN")
+        .expect("MCPDB_TEST_PG_DSN must point at a controlled PostgreSQL test database");
+    let executor = PostgresExecutor::new(Arc::new(StaticResolver(dsn)));
+    let target = profile();
+
+    let outcome = executor
+        .query(&target, "SELECT id, name FROM users ORDER BY id", &[], 500)
+        .await
+        .expect("query users");
+    assert!(!outcome.truncated);
+    assert!(outcome.row_count >= 1);
+    assert_eq!(outcome.columns, vec!["id", "name"]);
+
+    let mutation = executor
+        .mutate(
+            &target,
+            "INSERT INTO users (id, name) VALUES (99, 'executor')",
+            &[],
+        )
+        .await
+        .expect("insert");
+    assert_eq!(mutation.row_count, 1);
+
+    let verify = executor
+        .query(&target, "SELECT name FROM users WHERE id = 99", &[], 500)
+        .await
+        .expect("verify insert");
+    assert_eq!(verify.rows[0]["name"], "executor");
+
+    let explain = executor
+        .explain(&target, "EXPLAIN (FORMAT JSON) SELECT * FROM users")
+        .await
+        .expect("explain");
+    assert!(explain.is_array());
+
+    let limit = executor
+        .query(&target, "SELECT * FROM users ORDER BY id", &[], 1)
+        .await
+        .expect("limited query");
+    assert_eq!(limit.returned_rows, 1);
+    assert_eq!(limit.row_count, 2);
+    assert!(limit.truncated);
+
+    executor
+        .mutate(&target, "DELETE FROM users WHERE id = 99", &[])
+        .await
+        .expect("cleanup");
 }
