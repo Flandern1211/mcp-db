@@ -290,6 +290,7 @@ fn tool_error(error: Error) -> CallToolResult {
         Error::ProfileDisabled(_) => "PROFILE_DISABLED",
         Error::MetadataUnavailable => "METADATA_UNAVAILABLE",
         Error::CredentialUnavailable => "CREDENTIAL_UNAVAILABLE",
+        Error::SqlRejected(_) => "SQL_REJECTED",
         _ => "REQUEST_REJECTED",
     };
     CallToolResult::structured_error(json!({
