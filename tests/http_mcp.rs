@@ -140,6 +140,11 @@ const DESCRIBE_TABLE: &str = r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","p
 const EXPLAIN_QUERY: &str = r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"explain_query","arguments":{"source":"a","sql":"SELECT 1"}}}"#;
 const QUERY_SQL: &str = r#"{"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT 1"}}}"#;
 const QUERY_SQL_CROSS: &str = r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"CREATE TABLE t (id bigint)"}}}"#;
+const QUERY_SQL_PARAM: &str = r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT name FROM users WHERE id = $1","params":[1]}}}"#;
+const QUERY_SQL_ALL: &str = r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT id, name FROM users ORDER BY id"}}}"#;
+const MUTATE_INSERT: &str = r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"mutate_sql","arguments":{"source":"a","sql":"INSERT INTO users (id, name) VALUES ($1, $2)","params":[99,"mcp"]}}}"#;
+const QUERY_VERIFY: &str = r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT name FROM users WHERE id = $1","params":[99]}}}"#;
+const DDL_CREATE: &str = r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"execute_ddl","arguments":{"source":"a","sql":"CREATE TABLE mcp_e2e (id bigint)"}}}"#;
 const LIST_TABLES_B: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_tables","arguments":{"source":"b"}}}"#;
 
 async fn init_session(router: axum::Router, token: &str) -> String {
@@ -623,4 +628,211 @@ async fn encrypted_credentials_flow_through_mcp_to_postgres() {
             .iter()
             .any(|column| column["name"] == "id")
     );
+}
+
+#[tokio::test]
+#[ignore = "requires MCPDB_TEST_PG_DSN and a controlled PostgreSQL test account"]
+async fn encrypted_credentials_flow_through_mcp_sql_tools() {
+    let dsn = env::var("MCPDB_TEST_PG_DSN")
+        .expect("MCPDB_TEST_PG_DSN must point at a controlled PostgreSQL test database");
+    let dir = TempDir::new().expect("temp dir");
+    let key = [11_u8; 32];
+    let key_hex = key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let key_file = dir.path().join("master.key");
+    fs::write(&key_file, key_hex).expect("write key");
+    let store_path = dir.path().join("credentials.enc");
+    let entries = BTreeMap::from([("keyring:mcp-db/test/query".to_string(), dsn)]);
+    EncryptedFileResolver::seal(&store_path, &key, &entries).expect("seal");
+    let resolver =
+        Arc::new(EncryptedFileResolver::open(&store_path, &key_file).expect("open credentials"));
+
+    let store = Store::open(dir.path().join("state.db")).expect("open store");
+    let token = store.create_token("agent-a").expect("issue token");
+    let source = store
+        .create_source(&NewSource {
+            id: "a".to_string(),
+            driver: Driver::Postgres,
+            environment: Environment::NonProduction,
+            parent_source_id: None,
+            created_token_id: None,
+            created_agent: None,
+            created_origin: None,
+        })
+        .expect("create source");
+    let token_id = store.authenticate(&token.token).expect("auth").token_id;
+
+    let query_profile = store
+        .create_profile(&NewProfile {
+            source_id: source.id.clone(),
+            name: "query".to_string(),
+            purpose: ProfilePurpose::Query,
+            credential_ref: "keyring:mcp-db/test/query".to_string(),
+            max_connections: Some(1),
+            statement_timeout_ms: Some(2_000),
+        })
+        .expect("create query profile");
+    let mutate_profile = store
+        .create_profile(&NewProfile {
+            source_id: source.id.clone(),
+            name: "mutate".to_string(),
+            purpose: ProfilePurpose::Mutate,
+            credential_ref: "keyring:mcp-db/test/query".to_string(),
+            max_connections: Some(1),
+            statement_timeout_ms: Some(2_000),
+        })
+        .expect("create mutate profile");
+    let schema_profile = store
+        .create_profile(&NewProfile {
+            source_id: source.id.clone(),
+            name: "schema".to_string(),
+            purpose: ProfilePurpose::Schema,
+            credential_ref: "keyring:mcp-db/test/query".to_string(),
+            max_connections: Some(1),
+            statement_timeout_ms: Some(2_000),
+        })
+        .expect("create schema profile");
+
+    for (tool, profile_id) in [
+        (Tool::QuerySql, query_profile.id),
+        (Tool::ExplainQuery, query_profile.id),
+        (Tool::MutateSql, mutate_profile.id),
+        (Tool::ExecuteDdl, schema_profile.id),
+    ] {
+        store
+            .create_route(&NewRoute {
+                source_id: source.id.clone(),
+                tool,
+                profile_id,
+                min_approval_policy: ApprovalPolicy::Direct,
+            })
+            .expect("create route");
+        store
+            .create_grant(&NewGrant {
+                token_id: token_id.clone(),
+                source_id: source.id.clone(),
+                tool,
+                policy: Some(ApprovalPolicy::Direct),
+            })
+            .expect("create grant");
+    }
+
+    let state = AppState {
+        store: Arc::new(Mutex::new(store)),
+        metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
+        executor: Arc::new(PostgresExecutor::new(resolver)),
+        max_rows: 1,
+        sessions: Default::default(),
+    };
+    let router = app(state);
+    let session = init_session(router.clone(), &token.token).await;
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            QUERY_SQL_PARAM,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["rows"][0]["name"],
+        "alice"
+    );
+    assert_eq!(body["result"]["structuredContent"]["truncated"], false);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            QUERY_SQL_ALL,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["rowCount"], 2);
+    assert_eq!(body["result"]["structuredContent"]["returnedRows"], 1);
+    assert_eq!(body["result"]["structuredContent"]["truncated"], true);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            MUTATE_INSERT,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["rowCount"], 1);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            QUERY_VERIFY,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["rows"][0]["name"],
+        "mcp"
+    );
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            DDL_CREATE,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["highRisk"], false);
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            EXPLAIN_QUERY,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["result"]["structuredContent"]["plan"].is_array());
+
+    let (status, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            QUERY_SQL_CROSS,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["code"], "SQL_REJECTED");
 }
