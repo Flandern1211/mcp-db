@@ -19,7 +19,7 @@
 | T-09 | 实现首版本机 CLI 与 Web 管理面 | 完整 | 未开始 | T-02、T-06、T-08 | AC2-10（首版本机）、AC2-21、AC2-22 | — | — | [tasks/2026-11-13-t-09-local-admin.md](tasks/2026-11-13-t-09-local-admin.md) |
 | T-10 | 完成首版 AC2 跨边界验收与发布收口 | 完整 | 未开始 | T-03～T-09 | AC2-01～AC2-23（首版 PostgreSQL 范围） | — | — | [tasks/2026-11-13-t-10-ac2-acceptance.md](tasks/2026-11-13-t-10-ac2-acceptance.md) |
 | T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 未开始 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | — | — | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
-| T-12 | 实现凭证解析与 PostgreSQL 元数据 provider | 完整 | 未开始 | T-02 | AC2-01、AC2-09、AC2-11、AC2-12（凭证与元数据基础） | — | — | [tasks/2026-11-16-t-12-credentials-postgres-metadata.md](tasks/2026-11-16-t-12-credentials-postgres-metadata.md) |
+| T-12 | 实现凭证解析与 PostgreSQL 元数据 provider | 完整 | 进行中 | T-02 | AC2-01、AC2-09、AC2-11、AC2-12（凭证与元数据基础） | — | — | [tasks/2026-11-16-t-12-credentials-postgres-metadata.md](tasks/2026-11-16-t-12-credentials-postgres-metadata.md) |
 
 ## 状态定义
 
