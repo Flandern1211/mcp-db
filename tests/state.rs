@@ -197,6 +197,17 @@ fn route_requires_matching_profile_purpose() {
         min_approval_policy: ApprovalPolicy::Direct,
     });
     assert!(matches!(discovery, Err(Error::InvalidInput(_))));
+
+    let provision = store
+        .create_profile(&profile("main", "provision", ProfilePurpose::Provision))
+        .expect("create provision profile");
+    let query_on_provision = store.create_route(&NewRoute {
+        source_id: "main".to_string(),
+        tool: Tool::QuerySql,
+        profile_id: provision.id,
+        min_approval_policy: ApprovalPolicy::Direct,
+    });
+    assert!(matches!(query_on_provision, Err(Error::InvalidInput(_))));
 }
 
 #[test]
@@ -293,7 +304,11 @@ fn legacy_approvals_and_audit_survive_upgrade() {
     let tokens: i64 = connection
         .query_row("SELECT COUNT(*) FROM tokens", [], |row| row.get(0))
         .expect("count tokens");
+    let grants: i64 = connection
+        .query_row("SELECT COUNT(*) FROM tool_grants", [], |row| row.get(0))
+        .expect("count grants");
     assert_eq!(approvals, 1);
     assert_eq!(audit, 1);
     assert_eq!(tokens, 0);
+    assert_eq!(grants, 0);
 }

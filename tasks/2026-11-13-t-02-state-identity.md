@@ -3,14 +3,14 @@
 | 项目 | 内容 |
 | --- | --- |
 | 档位 | 完整：持久数据模型、身份、跨模块安全边界与工程基线 |
-| 状态 | 未开始 |
+| 状态 | 🟢 已完成（仅状态/身份基础；运行时 AC2 行为归 T-04/T-06） |
 | 依赖 | 无 |
 | AC | AC2-01、AC2-09、AC2-11、AC2-22 的持久化基础 |
 | 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-02-state-identity` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |
-| 集成分支提交 | — |
+| 集成分支提交 | `0f4a3c6`（任务分支，待合入） |
 
 ## 1. 范围
 
@@ -52,18 +52,18 @@
 
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
-| 单元/模块集成 | AC2-01、09、11、22（基础） | `cargo test` | 本地临时目录/SQLite | 未开始 | 全部 |
-| 构建/容器 | 工程基线 | `cargo fmt --check`；`cargo clippy --all-targets --all-features -- -D warnings`；`cargo build --release --locked`；`docker build`；容器健康检查 | 本地 Rust + Docker | 未开始 | 全部 |
+| 单元/模块集成 | AC2-01、09、11、22（基础） | `cargo test` | Docker Linux 临时目录 + bundled SQLite | 15 passed（5 lib、2 main、8 state） | 无（运行时 HTTP/MCP 映射归 T-04/T-06） |
+| 构建/容器 | 工程基线 | `cargo fmt --check`；`cargo clippy --all-targets --all-features -- -D warnings`；`cargo build --release --locked`；`docker build`；容器启动与 `/healthz` | Docker Desktop Linux 容器 | 全部通过；容器 `user=10001:10001`、`health=healthy`，`/data/state.db` 创建成功 | 无 |
 
 外部写调用数：0。
 
-证据位置：本任务文件和本地提交正文（仓库可见）。
+证据位置：本任务文件和本地提交正文（仓库可见）。本任务只证明持久化与身份基础；不声称 AC2-01/09/11/22 的 HTTP 状态码、MCP 发现或审计行为已整体验收。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：`0f4a3c6`；待合入 `develop` 并回写状态。已接受风险：无。
 - 重规划记录：本任务最初按 Bun/TypeScript 基线创建；2026-11-16 用户确认核心服务改为 Rust，原分支无独有提交，原 Bun 验证命令未执行，任务号继续表示同一产品结果。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | 全部 AC | 任务未开始，尚未执行任何验证 | 无实现证据；不能标完成 | 按范围实现并运行第 4 节命令；全部通过后关闭 | 否 |
+| 🔴 无 | — | — | — | — | — |
