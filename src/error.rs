@@ -13,6 +13,7 @@ pub enum Error {
     RouteNotFound(String),
     ProfileUnavailable(i64),
     ProfileDisabled(i64),
+    MetadataUnavailable,
     NotFound(String),
     Conflict(String),
     Database(rusqlite::Error),
@@ -42,6 +43,7 @@ impl fmt::Display for Error {
             Self::ProfileDisabled(profile) => {
                 write!(f, "connection profile is disabled: {profile}")
             }
+            Self::MetadataUnavailable => write!(f, "database metadata provider is unavailable"),
             Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::Conflict(message) => write!(f, "conflict: {message}"),
             Self::Database(error) => write!(f, "state database error: {error}"),

@@ -3,6 +3,7 @@ pub mod authorization;
 pub mod config;
 pub mod error;
 pub mod mcp;
+pub mod metadata;
 pub mod state;
 pub mod transport;
 
@@ -10,6 +11,7 @@ pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
 pub use error::Error;
 pub use mcp::{AppState, McpDbServer};
+pub use metadata::{MetadataProvider, UnavailableMetadata};
 pub use state::{
     ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
     NewSource, Profile, ProfilePurpose, Route, Source, SourceStatus, Store, TokenIdentity, Tool,
