@@ -6,7 +6,7 @@
 | 状态 | 未开始 |
 | 依赖 | 无 |
 | AC | AC2-01、AC2-09、AC2-11、AC2-22 的持久化基础 |
-| 基线 | Rust 基线治理提交（待回写） |
+| 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-02-state-identity` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |

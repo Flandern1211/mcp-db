@@ -6,7 +6,7 @@
 | 状态 | 未开始 |
 | 依赖 | T-02、T-04、T-05 |
 | AC | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 |
-| 基线 | Rust 基线治理提交（待回写） |
+| 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-06-approval-audit` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |

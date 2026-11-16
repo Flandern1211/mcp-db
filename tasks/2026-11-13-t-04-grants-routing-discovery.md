@@ -6,7 +6,7 @@
 | 状态 | 未开始 |
 | 依赖 | T-02 |
 | AC | AC2-03、AC2-12～AC2-14 |
-| 基线 | Rust 基线治理提交（待回写） |
+| 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-04-grants-routing-discovery` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |

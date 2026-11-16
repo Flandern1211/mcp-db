@@ -6,7 +6,7 @@
 | 状态 | 未开始 |
 | 依赖 | T-03～T-09 |
 | AC | AC2-01～AC2-23 的首版 PostgreSQL 范围 |
-| 基线 | Rust 基线治理提交（待回写） |
+| 基线 | `57041e4` |
 | 任务分支 | `test/zcode/t-10-ac2-acceptance` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |

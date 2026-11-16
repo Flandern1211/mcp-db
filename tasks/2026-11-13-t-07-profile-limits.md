@@ -6,7 +6,7 @@
 | 状态 | 未开始 |
 | 依赖 | T-04、T-05 |
 | AC | AC2-02、AC2-08、AC2-11 |
-| 基线 | Rust 基线治理提交（待回写） |
+| 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-07-profile-limits` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |
