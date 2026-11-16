@@ -17,7 +17,7 @@ use serde_json::Value;
 use crate::executor::SqlExecutor;
 use crate::metadata::MetadataProvider;
 use crate::sql_policy::validate_for_tool;
-use crate::{AuthorizedCall, Authorizer, Error, Store, TokenIdentity, Tool};
+use crate::{ApprovalPolicy, AuthorizedCall, Authorizer, Error, Store, TokenIdentity, Tool};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -235,7 +235,14 @@ impl McpDbServer {
             Ok(validated) => validated,
             Err(error) => return Ok(tool_error(error)),
         };
-        // shortcut: approval policy handoff (direct vs admin queue) is owned by T-06.
+        // T-06 owns the approval queue; until then, approval-required and high-risk writes fail closed.
+        if call.policy == ApprovalPolicy::Approval || validated.high_risk {
+            return Ok(CallToolResult::structured_error(json!({
+                "code": "APPROVAL_REQUIRED",
+                "message": "admin approval is required before execution",
+                "highRisk": validated.high_risk,
+            })));
+        }
         let outcome = match self
             .state
             .executor
@@ -267,7 +274,14 @@ impl McpDbServer {
             Ok(validated) => validated,
             Err(error) => return Ok(tool_error(error)),
         };
-        // shortcut: approval policy handoff (direct vs admin queue) is owned by T-06.
+        // T-06 owns the approval queue; until then, approval-required and high-risk writes fail closed.
+        if call.policy == ApprovalPolicy::Approval || validated.high_risk {
+            return Ok(CallToolResult::structured_error(json!({
+                "code": "APPROVAL_REQUIRED",
+                "message": "admin approval is required before execution",
+                "highRisk": validated.high_risk,
+            })));
+        }
         let outcome = match self
             .state
             .executor
