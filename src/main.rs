@@ -2,7 +2,10 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use mcp_db::{check_health, Config, Store, DEFAULT_ADDR, HEALTHCHECK_ADDR};
+use mcp_db::{
+    check_health, Config, EncryptedFileResolver, MetadataProvider, PostgresMetadata, Store,
+    UnavailableMetadata, DEFAULT_ADDR, HEALTHCHECK_ADDR,
+};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -35,12 +38,21 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let store = Store::open(&config.state_path)
                 .map_err(|error| format!("state init failed: {error}"))?;
             let store = Arc::new(Mutex::new(store));
+            let metadata: Arc<dyn MetadataProvider> =
+                match (&config.credential_store, &config.master_key_file) {
+                    (Some(store_path), Some(key_path)) => {
+                        let resolver = EncryptedFileResolver::open(store_path, key_path)
+                            .map_err(|error| format!("credential init failed: {error}"))?;
+                        Arc::new(PostgresMetadata::new(Arc::new(resolver)))
+                    }
+                    _ => Arc::new(UnavailableMetadata),
+                };
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| format!("runtime init failed: {error}"))?;
             runtime
-                .block_on(mcp_db::transport::http::run(config, store))
+                .block_on(mcp_db::transport::http::run(config, store, metadata))
                 .map_err(|error| format!("server error: {error}"))
         }
     }

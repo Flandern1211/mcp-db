@@ -14,9 +14,13 @@ use tokio::net::TcpListener;
 
 use crate::auth::parse_bearer;
 use crate::mcp::{AppState, McpDbServer};
-use crate::{Config, Error, Store, UnavailableMetadata};
+use crate::{Config, Error, MetadataProvider, Store};
 
-pub async fn run(config: Config, store: Arc<Mutex<Store>>) -> io::Result<()> {
+pub async fn run(
+    config: Config,
+    store: Arc<Mutex<Store>>,
+    metadata: Arc<dyn MetadataProvider>,
+) -> io::Result<()> {
     let listener = TcpListener::bind(&config.addr).await?;
     println!(
         "mcp-db {} listening on http://{}",
@@ -27,7 +31,7 @@ pub async fn run(config: Config, store: Arc<Mutex<Store>>) -> io::Result<()> {
         listener,
         app(AppState {
             store,
-            metadata: Arc::new(UnavailableMetadata),
+            metadata,
             sessions: Default::default(),
         }),
     )

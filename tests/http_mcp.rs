@@ -1,13 +1,18 @@
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use http_body_util::BodyExt;
 use mcp_db::transport::http::app;
 use mcp_db::{
-    AppState, ApprovalPolicy, Driver, Environment, MetadataProvider, NewGrant, NewProfile,
-    NewRoute, NewSource, Profile, ProfilePurpose, Store, Tool,
+    AppState, ApprovalPolicy, Driver, EncryptedFileResolver, Environment, MetadataProvider,
+    NewGrant, NewProfile, NewRoute, NewSource, PostgresMetadata, Profile, ProfilePurpose, Store,
+    Tool,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -20,8 +25,9 @@ struct MockMetadata {
     explain_calls: AtomicUsize,
 }
 
+#[async_trait]
 impl MetadataProvider for MockMetadata {
-    fn list_tables(
+    async fn list_tables(
         &self,
         _profile: &Profile,
         schema: Option<&str>,
@@ -34,7 +40,7 @@ impl MetadataProvider for MockMetadata {
         }]))
     }
 
-    fn describe_table(
+    async fn describe_table(
         &self,
         _profile: &Profile,
         table: &str,
@@ -47,7 +53,7 @@ impl MetadataProvider for MockMetadata {
         }))
     }
 
-    fn explain(
+    async fn explain(
         &self,
         _profile: &Profile,
         _sql: &str,
@@ -458,4 +464,115 @@ async fn metadata_tools_authorize_before_provider_and_expose_structured_results(
         "TOOL_NOT_GRANTED"
     );
     assert_eq!(metadata.list_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires MCPDB_TEST_PG_DSN and a read-only PostgreSQL test account"]
+async fn encrypted_credentials_flow_through_mcp_to_postgres() {
+    let dsn = env::var("MCPDB_TEST_PG_DSN")
+        .expect("MCPDB_TEST_PG_DSN must point at a controlled PostgreSQL test database");
+    let dir = TempDir::new().expect("temp dir");
+    let key = [9_u8; 32];
+    let key_hex = key
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let key_file = dir.path().join("master.key");
+    fs::write(&key_file, key_hex).expect("write key");
+    let store_path = dir.path().join("credentials.enc");
+    let entries = BTreeMap::from([("keyring:mcp-db/test/query".to_string(), dsn)]);
+    EncryptedFileResolver::seal(&store_path, &key, &entries).expect("seal");
+    let resolver = EncryptedFileResolver::open(&store_path, &key_file).expect("open credentials");
+
+    let store = Store::open(dir.path().join("state.db")).expect("open store");
+    let token = store.create_token("agent-a").expect("issue token");
+    store
+        .create_source(&NewSource {
+            id: "a".to_string(),
+            driver: Driver::Postgres,
+            environment: Environment::NonProduction,
+            parent_source_id: None,
+            created_token_id: None,
+            created_agent: None,
+            created_origin: None,
+        })
+        .expect("create source");
+    let profile = store
+        .create_profile(&NewProfile {
+            source_id: "a".to_string(),
+            name: "query".to_string(),
+            purpose: ProfilePurpose::Query,
+            credential_ref: "keyring:mcp-db/test/query".to_string(),
+            max_connections: Some(1),
+            statement_timeout_ms: Some(1_000),
+        })
+        .expect("create profile");
+    let token_id = store.authenticate(&token.token).expect("auth").token_id;
+    for tool in [Tool::ListTables, Tool::DescribeTable] {
+        store
+            .create_route(&NewRoute {
+                source_id: "a".to_string(),
+                tool,
+                profile_id: profile.id,
+                min_approval_policy: ApprovalPolicy::Direct,
+            })
+            .expect("create route");
+        store
+            .create_grant(&NewGrant {
+                token_id: token_id.clone(),
+                source_id: "a".to_string(),
+                tool,
+                policy: None,
+            })
+            .expect("create grant");
+    }
+
+    let state = AppState {
+        store: Arc::new(Mutex::new(store)),
+        metadata: Arc::new(PostgresMetadata::new(Arc::new(resolver))),
+        sessions: Default::default(),
+    };
+    let router = app(state);
+    let session = init_session(router.clone(), &token.token).await;
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_TABLES,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tables = body["result"]["structuredContent"]["tables"]
+        .as_array()
+        .expect("tables");
+    assert!(tables.iter().any(|table| table["name"] == "users"));
+
+    let (status, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            DESCRIBE_TABLE,
+            Some(&token.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["description"]["table"],
+        "users"
+    );
+    assert!(
+        body["result"]["structuredContent"]["description"]["columns"]
+            .as_array()
+            .expect("columns")
+            .iter()
+            .any(|column| column["name"] == "id")
+    );
 }
