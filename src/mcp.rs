@@ -12,6 +12,7 @@ use rmcp::service::RequestContext;
 use rmcp::{tool, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use schemars::JsonSchema;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::executor::SqlExecutor;
 use crate::metadata::MetadataProvider;
@@ -43,6 +44,15 @@ struct DescribeArgs {
     table: String,
     #[schemars(description = "Optional schema name")]
     schema: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SqlArgs {
+    #[schemars(description = "Source id; may be omitted when the token has one source")]
+    source: Option<String>,
+    sql: String,
+    #[serde(default)]
+    params: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -175,7 +185,7 @@ impl McpDbServer {
     async fn query_sql(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<ExplainArgs>,
+        Parameters(args): Parameters<SqlArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = request_identity(&context)?;
         let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::QuerySql) {
@@ -189,7 +199,12 @@ impl McpDbServer {
         let outcome = match self
             .state
             .executor
-            .query(&call.profile, &validated.sql, &[], self.state.max_rows)
+            .query(
+                &call.profile,
+                &validated.sql,
+                &args.params,
+                self.state.max_rows,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -209,7 +224,7 @@ impl McpDbServer {
     async fn mutate_sql(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<ExplainArgs>,
+        Parameters(args): Parameters<SqlArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = request_identity(&context)?;
         let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::MutateSql) {
@@ -224,7 +239,7 @@ impl McpDbServer {
         let outcome = match self
             .state
             .executor
-            .mutate(&call.profile, &validated.sql, &[])
+            .mutate(&call.profile, &validated.sql, &args.params)
             .await
         {
             Ok(outcome) => outcome,
@@ -241,7 +256,7 @@ impl McpDbServer {
     async fn execute_ddl(
         &self,
         context: RequestContext<RoleServer>,
-        Parameters(args): Parameters<ExplainArgs>,
+        Parameters(args): Parameters<SqlArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = request_identity(&context)?;
         let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::ExecuteDdl) {
@@ -256,7 +271,7 @@ impl McpDbServer {
         let outcome = match self
             .state
             .executor
-            .mutate(&call.profile, &validated.sql, &[])
+            .mutate(&call.profile, &validated.sql, &args.params)
             .await
         {
             Ok(outcome) => outcome,
