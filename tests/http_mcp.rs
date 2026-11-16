@@ -145,6 +145,7 @@ const QUERY_SQL_ALL: &str = r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","p
 const MUTATE_INSERT: &str = r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"mutate_sql","arguments":{"source":"a","sql":"INSERT INTO users (id, name) VALUES ($1, $2)","params":[99,"mcp"]}}}"#;
 const QUERY_VERIFY: &str = r#"{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT name FROM users WHERE id = $1","params":[99]}}}"#;
 const DDL_CREATE: &str = r#"{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"execute_ddl","arguments":{"source":"a","sql":"CREATE TABLE mcp_e2e (id bigint)"}}}"#;
+const DDL_DROP: &str = r#"{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"execute_ddl","arguments":{"source":"a","sql":"DROP TABLE users"}}}"#;
 const LIST_TABLES_B: &str = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"list_tables","arguments":{"source":"b"}}}"#;
 
 async fn init_session(router: axum::Router, token: &str) -> String {
@@ -835,4 +836,97 @@ async fn encrypted_credentials_flow_through_mcp_sql_tools() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["structuredContent"]["code"], "SQL_REJECTED");
+}
+
+#[tokio::test]
+async fn approval_policy_and_high_risk_fail_closed_before_executor() {
+    let (_dir, state, token, _metadata) = setup();
+    {
+        let store = state.store.lock().expect("store lock");
+        let source = store
+            .create_source(&NewSource {
+                id: "a".to_string(),
+                driver: Driver::Postgres,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: None,
+            })
+            .expect("create source");
+        let mutate = store
+            .create_profile(&NewProfile {
+                source_id: source.id.clone(),
+                name: "mutate".to_string(),
+                purpose: ProfilePurpose::Mutate,
+                credential_ref: "keyring:mcp-db/test/query".to_string(),
+                max_connections: Some(1),
+                statement_timeout_ms: Some(1_000),
+            })
+            .expect("create mutate profile");
+        let schema = store
+            .create_profile(&NewProfile {
+                source_id: source.id.clone(),
+                name: "schema".to_string(),
+                purpose: ProfilePurpose::Schema,
+                credential_ref: "keyring:mcp-db/test/query".to_string(),
+                max_connections: Some(1),
+                statement_timeout_ms: Some(1_000),
+            })
+            .expect("create schema profile");
+        let token_id = store.authenticate(&token).expect("auth").token_id;
+        for (tool, profile_id, policy) in [
+            (Tool::MutateSql, mutate.id, ApprovalPolicy::Approval),
+            (Tool::ExecuteDdl, schema.id, ApprovalPolicy::Direct),
+        ] {
+            store
+                .create_route(&NewRoute {
+                    source_id: source.id.clone(),
+                    tool,
+                    profile_id,
+                    min_approval_policy: ApprovalPolicy::Direct,
+                })
+                .expect("create route");
+            store
+                .create_grant(&NewGrant {
+                    token_id: token_id.clone(),
+                    source_id: source.id.clone(),
+                    tool,
+                    policy: Some(policy),
+                })
+                .expect("create grant");
+        }
+    }
+
+    let router = app(state);
+    let session = init_session(router.clone(), &token).await;
+
+    let (status, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            MUTATE_INSERT,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_REQUIRED"
+    );
+
+    let (status, _, body) = send(
+        router,
+        request(Method::POST, "/mcp", DDL_DROP, Some(&token), Some(&session)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_REQUIRED"
+    );
+    assert_eq!(body["result"]["structuredContent"]["highRisk"], true);
 }
