@@ -5,6 +5,7 @@ pub mod credentials;
 pub mod error;
 pub mod mcp;
 pub mod metadata;
+pub mod sql_policy;
 pub mod state;
 pub mod transport;
 
@@ -14,6 +15,7 @@ pub use credentials::{CredentialResolver, EncryptedFileResolver};
 pub use error::Error;
 pub use mcp::{AppState, McpDbServer};
 pub use metadata::{MetadataProvider, PostgresMetadata, UnavailableMetadata};
+pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
 pub use state::{
     ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
     NewSource, Profile, ProfilePurpose, Route, Source, SourceStatus, Store, TokenIdentity, Tool,
