@@ -131,6 +131,7 @@ impl McpDbServer {
             .state
             .metadata
             .list_tables(&call.profile, args.schema.as_deref())
+            .await
         {
             Ok(tables) => tables,
             Err(error) => return Ok(tool_error(error)),
@@ -153,11 +154,12 @@ impl McpDbServer {
             Ok(call) => call,
             Err(result) => return Ok(result),
         };
-        let description = match self.state.metadata.describe_table(
-            &call.profile,
-            &args.table,
-            args.schema.as_deref(),
-        ) {
+        let description = match self
+            .state
+            .metadata
+            .describe_table(&call.profile, &args.table, args.schema.as_deref())
+            .await
+        {
             Ok(description) => description,
             Err(error) => return Ok(tool_error(error)),
         };
@@ -185,6 +187,7 @@ impl McpDbServer {
             .state
             .metadata
             .explain(&call.profile, &args.sql, &args.params)
+            .await
         {
             Ok(plan) => plan,
             Err(error) => return Ok(tool_error(error)),
@@ -286,6 +289,7 @@ fn tool_error(error: Error) -> CallToolResult {
         Error::ProfileUnavailable(_) => "PROFILE_UNAVAILABLE",
         Error::ProfileDisabled(_) => "PROFILE_DISABLED",
         Error::MetadataUnavailable => "METADATA_UNAVAILABLE",
+        Error::CredentialUnavailable => "CREDENTIAL_UNAVAILABLE",
         _ => "REQUEST_REJECTED",
     };
     CallToolResult::structured_error(json!({

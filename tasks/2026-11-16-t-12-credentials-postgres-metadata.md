@@ -3,14 +3,14 @@
 | 项目 | 内容 |
 | --- | --- |
 | 档位 | 完整：凭证安全存储、真实数据库连接与 MCP 元数据工具 |
-| 状态 | 未开始 |
+| 状态 | 🟢 已完成 |
 | 依赖 | T-02 |
 | AC | AC2-01、AC2-09、AC2-11、AC2-12 的凭证与元数据基础 |
 | 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-12-credentials-postgres-metadata` |
 | 合并目标 | `develop` |
 | worktree | 未分配 |
-| 集成分支提交 | — |
+| 集成分支提交 | 待合入 |
 
 ## 1. 范围
 
@@ -53,16 +53,17 @@
 
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
-| 单元 | 凭证存储 | `cargo test --test credentials` | 临时目录 + 虚构 DSN | 未开始 | 全部 |
-| 模块集成 | AC2-12 | `cargo test --test http_mcp`（真实 provider 或 fake connector） | Mock/受控 PostgreSQL | 未开始 | 全部 |
-| 真实集成 | AC2-12 | 受控 PostgreSQL 只读账号，MCP `list_tables`/`describe_table` | 受控测试数据库 | 未开始 | 全部 |
+| 单元 | 凭证存储 | `cargo test --test credentials`；两个 ignored fixture 测试单独运行 | 临时目录 + 虚构 DSN | 3 default passed；seal/open fixture passed；密文不含明文 DSN/密码；错误密钥、缺失密钥、篡改均失败关闭 | 无 |
+| 模块集成 | AC2-12 | `cargo test --test http_mcp` | Mock metadata | 3 default passed：未授权 source 不调用 provider；工具错误码可区分 | 无 |
+| 真实集成 | AC2-12 | `cargo test --test postgres_metadata -- --ignored`；`cargo test --test http_mcp -- --ignored` | 本地临时 PostgreSQL 16 + 只读账号 | 2 passed：真实 `list_tables`/`describe_table`；加密凭证经 MCP 查询真实 `users` 表和列；只读账号 INSERT 被数据库拒绝 | 无 |
+| 容器 | AC2-12 | `docker build`；带挂载加密凭证和主密钥启动；缺失凭证启动 | Docker Desktop Linux 容器 | 构建通过；`user=10001:10001`、`health=healthy`；缺失凭证 `exit=1` | 无 |
 
-外部写调用数：0（只读元数据查询）。证据位置：本任务文件和受控集成记录。
+外部写调用数：0 个外部业务写入；本地测试数据库仅插入 1 条夹具，只读账号按预期被拒绝写入。证据位置：本任务文件和本地提交正文（仓库可见）。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：`c790f64`；待合入 `develop` 并回写状态。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | 全部 AC | 任务未开始 | 无凭证/provider 证据 | 按范围实现并执行测试与受控集成 | 是 |
+| 🔴 无 | — | — | — | — | — |

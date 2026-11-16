@@ -14,6 +14,7 @@ pub enum Error {
     ProfileUnavailable(i64),
     ProfileDisabled(i64),
     MetadataUnavailable,
+    CredentialUnavailable,
     NotFound(String),
     Conflict(String),
     Database(rusqlite::Error),
@@ -44,6 +45,7 @@ impl fmt::Display for Error {
                 write!(f, "connection profile is disabled: {profile}")
             }
             Self::MetadataUnavailable => write!(f, "database metadata provider is unavailable"),
+            Self::CredentialUnavailable => write!(f, "credential reference cannot be resolved"),
             Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::Conflict(message) => write!(f, "conflict: {message}"),
             Self::Database(error) => write!(f, "state database error: {error}"),
