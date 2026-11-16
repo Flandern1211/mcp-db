@@ -2,7 +2,7 @@ use std::env;
 use std::net::TcpListener;
 use std::process::ExitCode;
 
-use mcp_db::{check_health, serve, DEFAULT_ADDR, HEALTHCHECK_ADDR};
+use mcp_db::{check_health, serve, Config, Store, DEFAULT_ADDR, HEALTHCHECK_ADDR};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -31,12 +31,15 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         }
         Some(other) => Err(format!("unknown argument: {other}")),
         None => {
-            let addr = env::var("MCPDB_ADDR").unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-            let listener =
-                TcpListener::bind(&addr).map_err(|err| format!("cannot bind {addr}: {err}"))?;
+            let config = Config::from_env().map_err(|error| error.to_string())?;
+            let _store = Store::open(&config.state_path)
+                .map_err(|error| format!("state init failed: {error}"))?;
+            let listener = TcpListener::bind(&config.addr)
+                .map_err(|err| format!("cannot bind {}: {err}", config.addr))?;
             println!(
-                "mcp-db {} listening on http://{addr} (skeleton: /healthz only)",
-                env!("CARGO_PKG_VERSION")
+                "mcp-db {} listening on http://{} (skeleton: /healthz only)",
+                env!("CARGO_PKG_VERSION"),
+                config.addr
             );
             serve(listener).map_err(|err| format!("server error: {err}"))
         }

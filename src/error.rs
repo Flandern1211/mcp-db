@@ -1,0 +1,46 @@
+use std::fmt;
+
+#[derive(Debug)]
+pub enum Error {
+    InvalidInput(String),
+    Unauthenticated,
+    TokenRevoked,
+    NotFound(String),
+    Conflict(String),
+    Database(rusqlite::Error),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidInput(message) => write!(f, "invalid input: {message}"),
+            Self::Unauthenticated => write!(f, "unauthenticated"),
+            Self::TokenRevoked => write!(f, "token revoked"),
+            Self::NotFound(what) => write!(f, "not found: {what}"),
+            Self::Conflict(message) => write!(f, "conflict: {message}"),
+            Self::Database(error) => write!(f, "state database error: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Database(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<rusqlite::Error> for Error {
+    fn from(error: rusqlite::Error) -> Self {
+        if let rusqlite::Error::SqliteFailure(code, _) = &error {
+            if code.code == rusqlite::ErrorCode::ConstraintViolation {
+                return Self::Conflict("constraint violation".to_string());
+            }
+        }
+        Self::Database(error)
+    }
+}
