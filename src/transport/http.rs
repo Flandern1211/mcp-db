@@ -14,12 +14,13 @@ use tokio::net::TcpListener;
 
 use crate::auth::parse_bearer;
 use crate::mcp::{AppState, McpDbServer};
-use crate::{Config, Error, MetadataProvider, Store};
+use crate::{Config, Error, MetadataProvider, SqlExecutor, Store, DEFAULT_MAX_ROWS};
 
 pub async fn run(
     config: Config,
     store: Arc<Mutex<Store>>,
     metadata: Arc<dyn MetadataProvider>,
+    executor: Arc<dyn SqlExecutor>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(&config.addr).await?;
     println!(
@@ -32,6 +33,8 @@ pub async fn run(
         app(AppState {
             store,
             metadata,
+            executor,
+            max_rows: DEFAULT_MAX_ROWS,
             sessions: Default::default(),
         }),
     )

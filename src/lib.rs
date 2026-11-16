@@ -3,6 +3,7 @@ pub mod authorization;
 pub mod config;
 pub mod credentials;
 pub mod error;
+pub mod executor;
 pub mod mcp;
 pub mod metadata;
 pub mod sql_policy;
@@ -13,6 +14,10 @@ pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
 pub use credentials::{CredentialResolver, EncryptedFileResolver};
 pub use error::Error;
+pub use executor::{
+    MutationOutcome, PostgresExecutor, QueryOutcome, SqlExecutor, UnavailableExecutor,
+    DEFAULT_MAX_ROWS,
+};
 pub use mcp::{AppState, McpDbServer};
 pub use metadata::{MetadataProvider, PostgresMetadata, UnavailableMetadata};
 pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
