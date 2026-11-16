@@ -1,8 +1,8 @@
 use std::env;
-use std::net::TcpListener;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
-use mcp_db::{check_health, serve, Config, Store, DEFAULT_ADDR, HEALTHCHECK_ADDR};
+use mcp_db::{check_health, Config, Store, DEFAULT_ADDR, HEALTHCHECK_ADDR};
 
 fn main() -> ExitCode {
     match run(env::args().skip(1)) {
@@ -32,23 +32,23 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         Some(other) => Err(format!("unknown argument: {other}")),
         None => {
             let config = Config::from_env().map_err(|error| error.to_string())?;
-            let _store = Store::open(&config.state_path)
+            let store = Store::open(&config.state_path)
                 .map_err(|error| format!("state init failed: {error}"))?;
-            let listener = TcpListener::bind(&config.addr)
-                .map_err(|err| format!("cannot bind {}: {err}", config.addr))?;
-            println!(
-                "mcp-db {} listening on http://{} (skeleton: /healthz only)",
-                env!("CARGO_PKG_VERSION"),
-                config.addr
-            );
-            serve(listener).map_err(|err| format!("server error: {err}"))
+            let store = Arc::new(Mutex::new(store));
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| format!("runtime init failed: {error}"))?;
+            runtime
+                .block_on(mcp_db::transport::http::run(config, store))
+                .map_err(|error| format!("server error: {error}"))
         }
     }
 }
 
 fn print_help() {
     println!(
-        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the service (MCPDB_ADDR, default {DEFAULT_ADDR})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help",
+        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help",
         env!("CARGO_PKG_VERSION")
     );
 }
