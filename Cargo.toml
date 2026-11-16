@@ -7,6 +7,13 @@ description = "Authorized multi-database MCP service"
 publish = false
 
 [dependencies]
+base64 = "0.22"
+rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 lto = true

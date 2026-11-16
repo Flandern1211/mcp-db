@@ -1,4 +1,16 @@
-use std::io::{Error, ErrorKind, Read, Write};
+pub mod auth;
+pub mod config;
+pub mod error;
+pub mod state;
+
+pub use config::Config;
+pub use error::Error;
+pub use state::{
+    ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
+    NewSource, Profile, ProfilePurpose, Route, Source, SourceStatus, Store, TokenIdentity, Tool,
+};
+
+use std::io::{Error as IoError, ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
@@ -27,7 +39,7 @@ pub fn check_health(addr: &str) -> std::io::Result<()> {
     if response.starts_with("HTTP/1.1 200") {
         Ok(())
     } else {
-        Err(Error::new(
+        Err(IoError::new(
             ErrorKind::Other,
             format!("unexpected health response: {}", first_line(&response)),
         ))
