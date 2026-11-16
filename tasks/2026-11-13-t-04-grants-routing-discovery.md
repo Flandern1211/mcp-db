@@ -4,7 +4,7 @@
 | --- | --- |
 | 档位 | 完整：对外 MCP 契约与跨模块授权改造 |
 | 状态 | 进行中 |
-| 依赖 | T-02 |
+| 依赖 | T-02、T-12 |
 | AC | AC2-03、AC2-12～AC2-14 |
 | 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-04-grants-routing-discovery` |
@@ -16,7 +16,8 @@
 
 - 每次调用复核 `(token, source, tool)` grant，并解析 PostgreSQL 的明确 route/profile；缺失或停用不回退。
 - 工具列表为有效 grants 的并集；`list_sources` 只返回有效且未归档 source。
-- 实现 `list_sources`、`list_tables`、`describe_table`、`explain_query` 的 MCP 工具与调用门禁；元数据通过 `MetadataProvider` seam 获取，真实 PostgreSQL provider/凭证解析尚待接入。
+- 实现 `list_sources`、`list_tables`、`describe_table` 的 MCP 工具与调用门禁；元数据通过 `MetadataProvider` seam 获取，真实 PostgreSQL provider/凭证解析由 T-12 接入。
+- `explain_query` 的 SQL 策略属于 T-05，不在本任务完成范围内。
 - 生产普通写保存和调用均拒绝。
 - 会话刷新语义：每次 `tools/list` 和调用都从状态库重算，不缓存；当前会话重新请求 `tools/list` 即可看到变化，不实现主动 `tools/list_changed` 通知。
 - 不实现 SQL AST 策略（T-05）、审批消费（T-06）或建库（T-08）。
@@ -44,18 +45,17 @@
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
 | 单元/模块集成 | AC2-03、AC2-12～14 | `cargo test --test authorization` | Docker Linux + 临时 SQLite | 8 passed：工具并集、精确 grant、source 推断、route/profile、生产写、禁用 profile、归档 source、动态刷新 | 无 |
-| HTTP/MCP 集成 | AC2-01、AC2-12、AC2-13 | `cargo test --test http_mcp` | Docker Linux + axum/rmcp + Mock metadata | 3 passed：无 token 401；initialize/tools/list；`list_sources` 动态发现；跨 token session 403；四个工具授权后返回结构化结果；未授权 source 返回 `TOOL_NOT_GRANTED` 且 provider 调用数不增加 | 真实 PostgreSQL provider 未接入 |
+| HTTP/MCP 集成 | AC2-01、AC2-12、AC2-13 | `cargo test --test http_mcp` | Docker Linux + axum/rmcp + Mock metadata | 3 passed：无 token 401；initialize/tools/list；`list_sources` 动态发现；跨 token session 403；四个工具契约与授权矩阵；未授权 source 返回 `TOOL_NOT_GRANTED` 且 provider 调用数不增加 | 真实 provider 归 T-12；explain 策略归 T-05 |
 | 构建/容器 | 工程基线 | `cargo fmt --check`；`cargo clippy --all-targets --all-features -- -D warnings`；`cargo test`；`cargo build --release --locked`；`docker build`；容器健康检查 | Docker Desktop Linux 容器（Rust 1.89） | 26 tests passed；镜像构建通过；`user=10001:10001`、`health=healthy`；`/mcp` 无认证 401 | 无 |
 
 外部写调用数：0。证据位置：本任务文件和提交正文（仓库可见）。
 
-当前已实现授权事实、MCP transport、认证、会话绑定、四个工具的 schema/调用门禁和 Mock metadata 验证。生产路径使用 `UnavailableMetadata` 失败关闭；真实 PostgreSQL provider、凭证解析和 `explain_query` 的 SQL 策略尚未接入，不能把 T-04 标为完成。
+当前已实现授权事实、MCP transport、认证、会话绑定、四个工具的 schema/调用门禁和 Mock metadata 验证。T-12 负责真实凭证解析和 PostgreSQL provider；T-05 负责 `explain_query` 的只读/非执行策略。T-04 在 T-12 完成后才能关闭。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：`7c8374c`、`2c7fddf`、`c995885`、`eb9b87c`、`57bae34`，集成分支提交 `50762a3`；状态进行中，未关闭项 2 阻塞。已接受风险：无。
+- 提交与 `TASK.md`：`7c8374c`、`2c7fddf`、`c995885`、`eb9b87c`、`57bae34`，集成分支提交 `50762a3`；状态进行中，未关闭项 1 阻塞。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | 真实 PostgreSQL 元数据 provider 与凭证解析 | 当前只有 `MetadataProvider` 契约、Mock 测试和 `UnavailableMetadata`；T-02 只允许 `keyring:` 引用，尚未实现安全解析与连接 | 生产 `list_tables`/`describe_table`/`explain_query` 失败关闭；AC2-12 只能证明契约，不能证明真实数据库可用 | 实现系统密钥环/等价安全存储解析和 PostgreSQL 元数据 provider；用受控实例执行 MCP 成功/拒绝矩阵；关闭条件：真实 provider 与凭证路径有独立集成证据 | 是 |
-| 🔴 未验收 | `explain_query` 的 SQL 策略 | 工具现在把 SQL 交给 provider；T-05 尚未实现只读、非执行型 explain 的方言策略 | 接入真实 provider 后可能执行 `EXPLAIN ANALYZE` 或写语句；不能据此开放 | 在 T-05 实现 AST 策略并让 explain 只接受已验证的只读非执行计划；关闭条件：执行型/写/多语句 explain 全部在驱动前拒绝 | 是 |
+| 🔴 未测试 | 真实 PostgreSQL 元数据 provider 与凭证解析 | T-12 尚未接入；当前只有 `MetadataProvider` 契约、Mock 测试和 `UnavailableMetadata` | 生产 `list_tables`/`describe_table` 失败关闭；AC2-12 只能证明契约 | 完成 T-12 的凭证 resolver 和 PostgreSQL provider；用受控实例执行 MCP 矩阵；关闭条件：真实 provider 与凭证路径有独立集成证据 | 是 |
