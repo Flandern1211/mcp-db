@@ -2,7 +2,7 @@
 
 任务状态、档位和证据位置的唯一入口。轻档只在本表登记；完整档在 `tasks/` 下建立任务文件，并在此链接。
 
-当前产品基线见 [docs/PRD.md](docs/PRD.md)，系统基线见 [SPEC.md](SPEC.md)。T-02～T-11 按 Rust AC2 基线重规划；T-01 保留为 legacy Bun/TypeScript v1 历史任务。
+当前产品基线见 [docs/PRD.md](docs/PRD.md)，系统基线见 [SPEC.md](SPEC.md)。Rust 基线治理提交为 `57041e4`，任务基线回写为 `c78ee6d`。T-02～T-11 按 Rust AC2 基线重规划；T-01 保留为 legacy Bun/TypeScript v1 历史任务。
 
 ## 任务表
 
