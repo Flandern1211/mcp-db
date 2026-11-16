@@ -3,9 +3,9 @@
 | 项目 | 内容 |
 | --- | --- |
 | 档位 | 完整：对外 MCP 契约与跨模块授权改造 |
-| 状态 | 进行中 |
+| 状态 | 🟢 已完成 |
 | 依赖 | T-02、T-12 |
-| AC | AC2-03、AC2-12～AC2-14 |
+| AC | AC2-12～AC2-14 |
 | 基线 | `57041e4` |
 | 任务分支 | `feat/zcode/t-04-grants-routing-discovery` |
 | 合并目标 | `develop` |
@@ -17,7 +17,7 @@
 - 每次调用复核 `(token, source, tool)` grant，并解析 PostgreSQL 的明确 route/profile；缺失或停用不回退。
 - 工具列表为有效 grants 的并集；`list_sources` 只返回有效且未归档 source。
 - 实现 `list_sources`、`list_tables`、`describe_table` 的 MCP 工具与调用门禁；元数据通过 `MetadataProvider` seam 获取，真实 PostgreSQL provider/凭证解析由 T-12 接入。
-- `explain_query` 的 SQL 策略属于 T-05，不在本任务完成范围内。
+- `explain_query` 的 SQL 策略属于 T-05，不在本任务完成范围内；AC2-03 的普通写入执行归 T-05/T-06。
 - 生产普通写保存和调用均拒绝。
 - 会话刷新语义：每次 `tools/list` 和调用都从状态库重算，不缓存；当前会话重新请求 `tools/list` 即可看到变化，不实现主动 `tools/list_changed` 通知。
 - 不实现 SQL AST 策略（T-05）、审批消费（T-06）或建库（T-08）。
@@ -50,12 +50,12 @@
 
 外部写调用数：0。证据位置：本任务文件和提交正文（仓库可见）。
 
-当前已实现授权事实、MCP transport、认证、会话绑定、四个工具的 schema/调用门禁和 Mock metadata 验证。T-12 负责真实凭证解析和 PostgreSQL provider；T-05 负责 `explain_query` 的只读/非执行策略。T-04 在 T-12 完成后才能关闭。
+当前已实现授权事实、MCP transport、认证、会话绑定、四个工具的 schema/调用门禁和 Mock metadata 验证；T-12 已接入真实凭证解析和 PostgreSQL provider。T-04 的授权与发现范围已完成；`explain_query` 策略和普通写入执行分别由 T-05/T-06 承接。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：`7c8374c`、`2c7fddf`、`c995885`、`eb9b87c`、`57bae34`，集成分支提交 `50762a3`；状态进行中，未关闭项 1 阻塞。已接受风险：无。
+- 提交与 `TASK.md`：`7c8374c`、`2c7fddf`、`c995885`、`eb9b87c`、`57bae34`，集成分支提交 `50762a3`；状态 🟢 已完成，未关闭项「无」。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | 真实 PostgreSQL 元数据 provider 与凭证解析 | T-12 尚未接入；当前只有 `MetadataProvider` 契约、Mock 测试和 `UnavailableMetadata` | 生产 `list_tables`/`describe_table` 失败关闭；AC2-12 只能证明契约 | 完成 T-12 的凭证 resolver 和 PostgreSQL provider；用受控实例执行 MCP 矩阵；关闭条件：真实 provider 与凭证路径有独立集成证据 | 是 |
+| 🔴 无 | — | — | — | — | — |
