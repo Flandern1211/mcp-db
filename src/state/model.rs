@@ -299,6 +299,75 @@ pub struct Grant {
     pub policy: ApprovalPolicy,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationStatus {
+    Reserved,
+    Committed,
+    Released,
+    Quarantined,
+}
+
+impl ReservationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Committed => "committed",
+            Self::Released => "released",
+            Self::Quarantined => "quarantined",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "committed" => Ok(Self::Committed),
+            "released" => Ok(Self::Released),
+            "quarantined" => Ok(Self::Quarantined),
+            _ => Err(Error::InvalidInput(format!(
+                "unknown reservation status: {value}"
+            ))),
+        }
+    }
+}
+
+/// One provisioning quota slot, reserved before any external database is created.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaReservation {
+    pub id: i64,
+    pub token_id: String,
+    pub parent_source_id: String,
+    pub database_name: String,
+    pub approval_id: Option<i64>,
+    pub status: ReservationStatus,
+    pub reserved_at: i64,
+    pub settled_at: Option<i64>,
+    pub reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProvisionUsage {
+    pub active: i64,
+    pub recent: i64,
+    pub quarantined: i64,
+}
+
+/// A route created together with a provisioned source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedRoute {
+    pub tool: Tool,
+    pub profile_name: String,
+    pub min_approval_policy: ApprovalPolicy,
+}
+
+/// Everything registered atomically after a database was created successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedSource {
+    pub source: NewSource,
+    pub profiles: Vec<NewProfile>,
+    pub routes: Vec<ProvisionedRoute>,
+    pub grants: Vec<Tool>,
+}
+
 pub(crate) fn validate_source_id(value: &str) -> Result<()> {
     validate_identifier(value, 1, 64, "source id")
 }

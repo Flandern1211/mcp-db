@@ -13,10 +13,11 @@ use crate::error::{Error, Result};
 use crate::state::model::{
     validate_credential_ref, validate_profile_name, validate_source_id, ApprovalPolicy, Driver,
     Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
-    ProfilePurpose, Route, Source, SourceStatus, TokenIdentity, Tool,
+    ProfilePurpose, ProvisionUsage, QuotaReservation, ReservationStatus, Route, Source,
+    SourceStatus, TokenIdentity, Tool,
 };
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -189,12 +190,37 @@ CREATE INDEX IF NOT EXISTS audit_events_approval ON audit_events(approval_id, id
 CREATE INDEX IF NOT EXISTS audit_events_ts ON audit_events(ts);
 "#;
 
+const MIGRATION_3: &str = r#"
+CREATE TABLE IF NOT EXISTS quota_reservations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_id TEXT NOT NULL REFERENCES tokens(id),
+  parent_source_id TEXT NOT NULL REFERENCES sources(id),
+  database_name TEXT NOT NULL UNIQUE,
+  approval_id INTEGER REFERENCES approval_requests(id),
+  status TEXT NOT NULL CHECK (status IN ('reserved', 'committed', 'released', 'quarantined')),
+  reserved_at INTEGER NOT NULL,
+  settled_at INTEGER,
+  reason_code TEXT
+);
+CREATE INDEX IF NOT EXISTS quota_reservations_scope
+  ON quota_reservations(token_id, parent_source_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS quota_reservations_approval
+  ON quota_reservations(approval_id) WHERE approval_id IS NOT NULL;
+"#;
+
 pub struct Store {
     conn: Connection,
 }
 
 impl Store {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let store = Self::open_admin(path)?;
+        store.recover_after_restart(now_ms())?;
+        Ok(store)
+    }
+
+    /// Admin access to a running service must not run service-start recovery.
+    pub fn open_admin(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -239,12 +265,18 @@ impl Store {
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (2, ?)",
                 [now_ms()],
             )?;
+            version = 2;
+        }
+        if version < 3 {
+            transaction.execute_batch(MIGRATION_3)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+                [now_ms()],
+            )?;
         }
         transaction.commit()?;
 
-        let store = Self { conn };
-        store.recover_after_restart(now_ms())?;
-        Ok(store)
+        Ok(Self { conn })
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -410,6 +442,124 @@ impl Store {
         })
     }
 
+    pub fn count_grants_for_source(&self, source_id: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM tool_grants WHERE source_id = ?",
+            [source_id],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Archive keeps every local record and never touches the physical database.
+    pub fn archive_source(&self, id: &str, actor: &str, now: i64) -> Result<Source> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE sources SET status = 'archived', archived_at = ?, updated_at = ?
+              WHERE id = ? AND status = 'active'",
+            params![now, now, id],
+        )?;
+        if changed == 0 {
+            let status: Option<String> = transaction
+                .query_row("SELECT status FROM sources WHERE id = ?", [id], |row| {
+                    row.get(0)
+                })
+                .optional()?;
+            return match status {
+                None => Err(Error::NotFound(format!("source {id}"))),
+                Some(_) => Err(Error::Conflict("source is not active".to_string())),
+            };
+        }
+        let stale = approval_rows(
+            &transaction,
+            "WHERE source_id = ? AND status IN ('pending', 'approved')",
+            [id],
+        )?;
+        for record in &stale {
+            transaction.execute(
+                "UPDATE approval_requests SET status = 'expired', reason_code = 'SOURCE_ARCHIVED'
+                  WHERE id = ? AND status IN ('pending', 'approved')",
+                [record.id],
+            )?;
+            let record = approval_from_conn(&transaction, record.id)?;
+            insert_audit(
+                &transaction,
+                &AuditEvent::for_approval(&record, "invalidated", "rejected", actor, now),
+            )?;
+        }
+        insert_audit(
+            &transaction,
+            &source_event(id, "archived", actor, "SOURCE_ARCHIVED", now),
+        )?;
+        transaction.commit()?;
+        self.get_source(id)
+    }
+
+    /// Restore re-checks profiles, grants and the provisioning quota before reactivating.
+    pub fn restore_source(
+        &self,
+        id: &str,
+        limits: &crate::provision::ProvisionLimits,
+        actor: &str,
+        now: i64,
+    ) -> Result<Source> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let source = self.get_source(id)?;
+        if source.status != SourceStatus::Archived {
+            return Err(Error::Conflict("source is not archived".to_string()));
+        }
+        let profiles = self.list_profiles(id)?;
+        if !profiles.iter().any(|profile| profile.enabled) {
+            return Err(Error::InvalidInput(
+                "archived source has no enabled profile".to_string(),
+            ));
+        }
+        if self.count_grants_for_source(id)? == 0 {
+            return Err(Error::InvalidInput(
+                "archived source has no grants to restore".to_string(),
+            ));
+        }
+        if let Some(reservation) = self.reservation_by_database(id)? {
+            if reservation.status != ReservationStatus::Committed {
+                return Err(Error::Conflict(
+                    "provisioned source has no committed reservation".to_string(),
+                ));
+            }
+            self.get_token_identity(&reservation.token_id)?;
+            let parent = self.get_source(&reservation.parent_source_id)?;
+            if parent.status != SourceStatus::Active {
+                return Err(Error::ProvisionBlocked(
+                    "parent source is archived".to_string(),
+                ));
+            }
+            let usage = self.provision_usage(
+                &reservation.token_id,
+                &reservation.parent_source_id,
+                now,
+                limits.min_interval_ms(),
+            )?;
+            if usage.active >= i64::from(limits.max_active()) {
+                return Err(Error::ResourceLimit(
+                    "restoring this source would exceed the provisioning quota".to_string(),
+                ));
+            }
+        }
+        let changed = transaction.execute(
+            "UPDATE sources SET status = 'active', archived_at = NULL, updated_at = ?
+              WHERE id = ? AND status = 'archived'",
+            params![now, id],
+        )?;
+        if changed == 0 {
+            return Err(Error::Conflict("source is not archived".to_string()));
+        }
+        insert_audit(
+            &transaction,
+            &source_event(id, "restored", actor, "SOURCE_RESTORED", now),
+        )?;
+        let restored = self.get_source(id)?;
+        transaction.commit()?;
+        Ok(restored)
+    }
+
     pub fn create_profile(&self, profile: &NewProfile) -> Result<Profile> {
         let source = self.get_source(&profile.source_id)?;
         if source.status != SourceStatus::Active {
@@ -419,6 +569,14 @@ impl Store {
         }
         validate_profile_name(&profile.name)?;
         validate_credential_ref(&profile.credential_ref)?;
+        // The provision admin credential must never be reachable from an ordinary profile.
+        let provision_namespace = profile.credential_ref.starts_with("keyring:provision/");
+        if (profile.purpose == ProfilePurpose::Provision) != provision_namespace {
+            return Err(Error::InvalidInput(
+                "provision profiles must use keyring:provision/ and other profiles must not"
+                    .to_string(),
+            ));
+        }
         crate::postgres::validate_limits(profile.max_connections, profile.statement_timeout_ms)?;
         let now = now_ms();
         self.conn.execute(
@@ -890,68 +1048,49 @@ impl Store {
         now: i64,
     ) -> Result<ClaimOutcome> {
         let transaction = self.conn.unchecked_transaction()?;
-        let Some(record) = approval_optional(&transaction, id)? else {
-            transaction.commit()?;
-            return Ok(ClaimOutcome::NotFound);
+        let outcome = match claim_step(&transaction, id, token_id, expected_digest, now)? {
+            ClaimStep::Outcome(outcome) => outcome,
+            ClaimStep::Claimed(record) => ClaimOutcome::Claimed(record),
         };
-        if record.draft.token_id != token_id {
-            transaction.commit()?;
-            return Ok(ClaimOutcome::TokenMismatch);
-        }
-        if record.request_digest != expected_digest || record.draft.digest() != expected_digest {
-            transaction.commit()?;
-            return Ok(ClaimOutcome::DigestMismatch);
-        }
-        if record.status != ApprovalStatus::Approved {
-            transaction.commit()?;
-            return Ok(ClaimOutcome::NotApproved);
-        }
-        if record.expires_at <= now {
-            transaction.execute(
-                "UPDATE approval_requests SET status = 'expired', reason_code = 'APPROVAL_EXPIRED'
-                  WHERE id = ? AND status = 'approved'",
-                [id],
-            )?;
-            let record = approval_from_conn(&transaction, id)?;
-            insert_audit(
-                &transaction,
-                &AuditEvent::for_approval(&record, "expired", "expired", "system", now),
-            )?;
-            transaction.commit()?;
-            return Ok(ClaimOutcome::Expired);
-        }
-
-        if let Some(reason) = claim_stale_reason(&transaction, &record)? {
-            transaction.execute(
-                "UPDATE approval_requests SET status = 'expired', reason_code = ?
-                  WHERE id = ? AND status = 'approved'",
-                params![reason, id],
-            )?;
-            let record = approval_from_conn(&transaction, id)?;
-            insert_audit(
-                &transaction,
-                &AuditEvent::for_approval(&record, "invalidated", "rejected", "system", now),
-            )?;
-            transaction.commit()?;
-            return Ok(ClaimOutcome::Stale(reason.to_string()));
-        }
-
-        let changed = transaction.execute(
-            "UPDATE approval_requests SET status = 'consumed', consumed_at = ?
-              WHERE id = ? AND status = 'approved' AND consumed_at IS NULL",
-            params![now, id],
-        )?;
-        if changed == 0 {
-            transaction.commit()?;
-            return Ok(ClaimOutcome::NotApproved);
-        }
-        let record = approval_from_conn(&transaction, id)?;
-        insert_audit(
-            &transaction,
-            &AuditEvent::for_approval(&record, "claimed", "allowed", "system", now),
-        )?;
         transaction.commit()?;
-        Ok(ClaimOutcome::Claimed(Box::new(record)))
+        Ok(outcome)
+    }
+
+    /// Claims a provisioning approval and reserves quota in the same transaction, so a
+    /// concurrent request either gets both or neither.
+    pub fn claim_provision(
+        &self,
+        id: i64,
+        token_id: &str,
+        expected_digest: &str,
+        database_name: &str,
+        limits: &crate::provision::ProvisionLimits,
+        now: i64,
+    ) -> Result<ClaimOutcome> {
+        let transaction = self.conn.unchecked_transaction()?;
+        match claim_step(&transaction, id, token_id, expected_digest, now)? {
+            ClaimStep::Outcome(outcome) => {
+                transaction.commit()?;
+                Ok(outcome)
+            }
+            ClaimStep::Claimed(record) => {
+                let reservation = reserve_in_conn(
+                    &transaction,
+                    token_id,
+                    &record.draft.source_id,
+                    database_name,
+                    Some(id),
+                    limits,
+                    now,
+                )?;
+                insert_audit(
+                    &transaction,
+                    &reservation_event(&reservation, "reserved", "allowed", "QUOTA_RESERVED", now),
+                )?;
+                transaction.commit()?;
+                Ok(ClaimOutcome::Claimed(record))
+            }
+        }
     }
 
     pub fn finish_approval(
@@ -1062,6 +1201,18 @@ impl Store {
             )?;
         }
 
+        // A reservation with no recorded outcome may have created a database; isolate it
+        // until an admin reconciles instead of silently releasing the quota slot.
+        let reserved = reservation_rows(&transaction, "WHERE status = 'reserved'", [])?;
+        for reservation in &reserved {
+            transaction.execute(
+                "UPDATE quota_reservations
+                    SET status = 'quarantined', settled_at = ?, reason_code = 'RESTART_UNKNOWN'
+                  WHERE id = ? AND status = 'reserved'",
+                params![now, reservation.id],
+            )?;
+        }
+
         for record in pending.iter().chain(approved.iter()) {
             let record = approval_from_conn(&transaction, record.id)?;
             insert_audit(
@@ -1074,6 +1225,18 @@ impl Store {
             insert_audit(
                 &transaction,
                 &AuditEvent::for_approval(&record, "unknown", "unknown", "system", now),
+            )?;
+        }
+        for reservation in &reserved {
+            insert_audit(
+                &transaction,
+                &reservation_event(
+                    reservation,
+                    "quarantined",
+                    "unknown",
+                    "RESTART_UNKNOWN",
+                    now,
+                ),
             )?;
         }
         transaction.commit()?;
@@ -1112,6 +1275,227 @@ impl Store {
         }
         transaction.commit()?;
         Ok(count)
+    }
+
+    /// Non-reserving quota view, used before an approval request is created.
+    pub fn provision_usage(
+        &self,
+        token_id: &str,
+        parent_source_id: &str,
+        now: i64,
+        min_interval_ms: i64,
+    ) -> Result<ProvisionUsage> {
+        usage_from_conn(&self.conn, token_id, parent_source_id, now, min_interval_ms)
+    }
+
+    /// Atomically re-checks quota and records a reservation before any external creation.
+    pub fn reserve_provision(
+        &self,
+        token_id: &str,
+        parent_source_id: &str,
+        database_name: &str,
+        approval_id: Option<i64>,
+        limits: &crate::provision::ProvisionLimits,
+        now: i64,
+    ) -> Result<QuotaReservation> {
+        validate_source_id(database_name)?;
+        self.get_token_identity(token_id)?;
+        let parent = self.get_source(parent_source_id)?;
+        if parent.status != SourceStatus::Active {
+            return Err(Error::ProvisionBlocked(
+                "parent source is archived".to_string(),
+            ));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let reservation = reserve_in_conn(
+            &transaction,
+            token_id,
+            parent_source_id,
+            database_name,
+            approval_id,
+            limits,
+            now,
+        )?;
+        transaction.commit()?;
+        Ok(reservation)
+    }
+
+    /// Settles a reservation. Admin reconciliation may move a quarantined slot to
+    /// committed or released, but settled slots never return to reserved.
+    pub fn settle_reservation(
+        &self,
+        id: i64,
+        target: ReservationStatus,
+        reason_code: Option<&str>,
+        now: i64,
+    ) -> Result<QuotaReservation> {
+        if target == ReservationStatus::Committed {
+            let reservation = self.get_reservation(id)?;
+            if !exists(
+                &self.conn,
+                "SELECT 1 FROM sources WHERE id = ? AND status = 'active'",
+                [&reservation.database_name],
+            )? {
+                return Err(Error::InvalidInput(
+                    "cannot commit a reservation without a registered active source".to_string(),
+                ));
+            }
+        }
+        let previous = match target {
+            ReservationStatus::Committed | ReservationStatus::Released => "reserved",
+            ReservationStatus::Quarantined => "reserved",
+            ReservationStatus::Reserved => {
+                return Err(Error::InvalidInput(
+                    "reservation cannot return to reserved".to_string(),
+                ))
+            }
+        };
+        let alternative = match target {
+            ReservationStatus::Committed | ReservationStatus::Released => Some("quarantined"),
+            _ => None,
+        };
+        let changed = match alternative {
+            Some(alternative) => self.conn.execute(
+                "UPDATE quota_reservations SET status = ?, settled_at = ?, reason_code = ?
+                  WHERE id = ? AND status IN (?, ?)",
+                params![target.as_str(), now, reason_code, id, previous, alternative],
+            )?,
+            None => self.conn.execute(
+                "UPDATE quota_reservations SET status = ?, settled_at = ?, reason_code = ?
+                  WHERE id = ? AND status = ?",
+                params![target.as_str(), now, reason_code, id, previous],
+            )?,
+        };
+        if changed == 0 {
+            return Err(Error::Conflict(
+                "reservation is not in a settleable state".to_string(),
+            ));
+        }
+        self.get_reservation(id)
+    }
+
+    /// Registers a created database atomically: source, profiles, routes, result grants
+    /// and the reservation commitment. Any failure rolls back every local row.
+    pub fn register_provisioned_source(
+        &self,
+        input: &crate::state::model::ProvisionedSource,
+        reservation_id: i64,
+        now: i64,
+    ) -> Result<Source> {
+        let reservation = self.get_reservation(reservation_id)?;
+        if reservation.status != ReservationStatus::Reserved {
+            return Err(Error::Conflict("reservation is not reserved".to_string()));
+        }
+        if reservation.database_name != input.source.id {
+            return Err(Error::Conflict(
+                "reservation does not match the database name".to_string(),
+            ));
+        }
+        if input.source.created_token_id.as_deref() != Some(reservation.token_id.as_str()) {
+            return Err(Error::InvalidInput(
+                "provisioned source must record the creating token".to_string(),
+            ));
+        }
+        if input.source.parent_source_id.as_deref() != Some(reservation.parent_source_id.as_str()) {
+            return Err(Error::InvalidInput(
+                "provisioned source must record the parent source".to_string(),
+            ));
+        }
+        let transaction = self.conn.unchecked_transaction()?;
+        let result = (|| -> Result<()> {
+            self.create_source(&input.source)?;
+            let mut profile_ids = std::collections::HashMap::new();
+            for profile in &input.profiles {
+                let created = self.create_profile(profile)?;
+                profile_ids.insert(created.name, created.id);
+            }
+            for route in &input.routes {
+                let profile_id = *profile_ids.get(&route.profile_name).ok_or_else(|| {
+                    Error::InvalidInput(format!(
+                        "route profile is not part of this source: {}",
+                        route.profile_name
+                    ))
+                })?;
+                self.create_route(&NewRoute {
+                    source_id: input.source.id.clone(),
+                    tool: route.tool,
+                    profile_id,
+                    min_approval_policy: route.min_approval_policy,
+                })?;
+            }
+            for tool in &input.grants {
+                self.create_grant(&NewGrant {
+                    token_id: reservation.token_id.clone(),
+                    source_id: input.source.id.clone(),
+                    tool: *tool,
+                    policy: None,
+                })?;
+            }
+            let changed = self.conn.execute(
+                "UPDATE quota_reservations
+                    SET status = 'committed', settled_at = ?, reason_code = NULL
+                  WHERE id = ? AND status = 'reserved'",
+                params![now, reservation_id],
+            )?;
+            if changed == 0 {
+                return Err(Error::Conflict(
+                    "reservation was settled concurrently".to_string(),
+                ));
+            }
+            Ok(())
+        })();
+        result?;
+        transaction.commit()?;
+        let committed = self.get_reservation(reservation_id)?;
+        self.record_audit_event(&reservation_event(
+            &committed,
+            "registered",
+            "allowed",
+            "REGISTERED",
+            now,
+        ))?;
+        self.get_source(&input.source.id)
+    }
+
+    pub fn reservation_for_approval(&self, approval_id: i64) -> Result<Option<QuotaReservation>> {
+        Ok(reservation_rows(
+            &self.conn,
+            "WHERE approval_id = ? ORDER BY id DESC",
+            [approval_id],
+        )?
+        .into_iter()
+        .next())
+    }
+
+    pub fn reservation_by_database(&self, database_name: &str) -> Result<Option<QuotaReservation>> {
+        Ok(reservation_rows(
+            &self.conn,
+            "WHERE database_name = ? ORDER BY id DESC",
+            [database_name],
+        )?
+        .into_iter()
+        .next())
+    }
+
+    pub fn list_recent_reservations(&self, limit: usize) -> Result<Vec<QuotaReservation>> {
+        reservation_rows(
+            &self.conn,
+            "ORDER BY reserved_at DESC, id DESC LIMIT ?",
+            [limit as i64],
+        )
+    }
+
+    pub fn get_reservation(&self, id: i64) -> Result<QuotaReservation> {
+        reservation_optional(&self.conn, id)?
+            .ok_or_else(|| Error::NotFound(format!("quota reservation {id}")))
+    }
+
+    pub fn list_quarantined_reservations(&self) -> Result<Vec<QuotaReservation>> {
+        reservation_rows(
+            &self.conn,
+            "WHERE status = 'quarantined' ORDER BY reserved_at, id",
+            [],
+        )
     }
 
     pub fn record_audit_event(&self, event: &AuditEvent) -> Result<()> {
@@ -1358,6 +1742,244 @@ fn approval_rows<P: rusqlite::Params>(
     rows.into_iter().map(ApprovalRow::into_record).collect()
 }
 
+const RESERVATION_SELECT: &str = "SELECT id, token_id, parent_source_id, database_name,
+       approval_id, status, reserved_at, settled_at, reason_code
+  FROM quota_reservations";
+
+struct ReservationRow {
+    id: i64,
+    token_id: String,
+    parent_source_id: String,
+    database_name: String,
+    approval_id: Option<i64>,
+    status: String,
+    reserved_at: i64,
+    settled_at: Option<i64>,
+    reason_code: Option<String>,
+}
+
+impl ReservationRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            token_id: row.get(1)?,
+            parent_source_id: row.get(2)?,
+            database_name: row.get(3)?,
+            approval_id: row.get(4)?,
+            status: row.get(5)?,
+            reserved_at: row.get(6)?,
+            settled_at: row.get(7)?,
+            reason_code: row.get(8)?,
+        })
+    }
+
+    fn into_reservation(self) -> Result<QuotaReservation> {
+        Ok(QuotaReservation {
+            id: self.id,
+            token_id: self.token_id,
+            parent_source_id: self.parent_source_id,
+            database_name: self.database_name,
+            approval_id: self.approval_id,
+            status: ReservationStatus::parse(&self.status)?,
+            reserved_at: self.reserved_at,
+            settled_at: self.settled_at,
+            reason_code: self.reason_code,
+        })
+    }
+}
+
+fn reservation_optional(conn: &Connection, id: i64) -> Result<Option<QuotaReservation>> {
+    let sql = format!("{RESERVATION_SELECT} WHERE id = ?");
+    conn.query_row(&sql, [id], ReservationRow::from_row)
+        .optional()?
+        .map(ReservationRow::into_reservation)
+        .transpose()
+}
+
+fn reservation_rows<P: rusqlite::Params>(
+    conn: &Connection,
+    where_clause: &str,
+    params: P,
+) -> Result<Vec<QuotaReservation>> {
+    let sql = format!("{RESERVATION_SELECT} {where_clause}");
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement
+        .query_map(params, ReservationRow::from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    rows.into_iter()
+        .map(ReservationRow::into_reservation)
+        .collect()
+}
+
+fn usage_from_conn(
+    conn: &Connection,
+    token_id: &str,
+    parent_source_id: &str,
+    now: i64,
+    min_interval_ms: i64,
+) -> Result<ProvisionUsage> {
+    let window_start = now - min_interval_ms;
+    let (active, recent, quarantined) = conn.query_row(
+        "SELECT
+           (SELECT COUNT(*) FROM quota_reservations q
+              LEFT JOIN sources s ON s.id = q.database_name
+             WHERE q.token_id = ?1 AND q.parent_source_id = ?2
+               AND q.status IN ('reserved', 'committed')
+               AND (q.status = 'reserved' OR s.status = 'active' OR s.id IS NULL)),
+           (SELECT COUNT(*) FROM quota_reservations q
+             WHERE q.token_id = ?1 AND q.parent_source_id = ?2
+               AND q.status IN ('reserved', 'committed')
+               AND COALESCE(q.settled_at, q.reserved_at) > ?3),
+           (SELECT COUNT(*) FROM quota_reservations q
+             WHERE q.token_id = ?1 AND q.parent_source_id = ?2 AND q.status = 'quarantined')",
+        params![token_id, parent_source_id, window_start],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    Ok(ProvisionUsage {
+        active,
+        recent,
+        quarantined,
+    })
+}
+
+fn reserve_in_conn(
+    conn: &Connection,
+    token_id: &str,
+    parent_source_id: &str,
+    database_name: &str,
+    approval_id: Option<i64>,
+    limits: &crate::provision::ProvisionLimits,
+    now: i64,
+) -> Result<QuotaReservation> {
+    if let Some(approval_id) = approval_id {
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT token_id FROM approval_requests WHERE id = ?",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner {
+            Some(owner) if owner == token_id => {}
+            Some(_) => {
+                return Err(Error::Conflict(
+                    "approval belongs to another token".to_string(),
+                ))
+            }
+            None => return Err(Error::NotFound(format!("approval {approval_id}"))),
+        }
+    }
+    if exists(
+        conn,
+        "SELECT 1 FROM quota_reservations WHERE database_name = ?",
+        [database_name],
+    )? {
+        return Err(Error::Conflict(
+            "database name is already reserved".to_string(),
+        ));
+    }
+    let usage = usage_from_conn(
+        conn,
+        token_id,
+        parent_source_id,
+        now,
+        limits.min_interval_ms(),
+    )?;
+    if usage.quarantined > 0 {
+        return Err(Error::ProvisionBlocked(
+            "an unsettled provisioning reservation blocks new databases for this token and parent"
+                .to_string(),
+        ));
+    }
+    if usage.active >= i64::from(limits.max_active()) {
+        return Err(Error::ResourceLimit(
+            "provision active database quota reached".to_string(),
+        ));
+    }
+    if usage.recent > 0 {
+        return Err(Error::ResourceLimit(
+            "provision creation rate reached; retry after the interval".to_string(),
+        ));
+    }
+    conn.execute(
+        "INSERT INTO quota_reservations
+           (token_id, parent_source_id, database_name, approval_id, status, reserved_at)
+         VALUES (?, ?, ?, ?, 'reserved', ?)",
+        params![token_id, parent_source_id, database_name, approval_id, now],
+    )?;
+    reservation_optional(conn, conn.last_insert_rowid())?
+        .ok_or_else(|| Error::NotFound("quota reservation".to_string()))
+}
+
+fn reservation_event(
+    reservation: &QuotaReservation,
+    event: &str,
+    decision: &str,
+    reason_code: &str,
+    now: i64,
+) -> AuditEvent {
+    AuditEvent {
+        ts: now,
+        event: event.to_string(),
+        approval_id: reservation.approval_id,
+        token_id: Some(reservation.token_id.clone()),
+        agent: None,
+        source_id: Some(reservation.parent_source_id.clone()),
+        tool: Tool::CreateDatabase.as_str().to_string(),
+        profile_id: None,
+        profile_version: None,
+        route_id: None,
+        route_version: None,
+        request_digest: None,
+        channel: None,
+        decision: decision.to_string(),
+        actor: "system".to_string(),
+        high_risk: true,
+        reason_code: Some(reason_code.to_string()),
+        reason: None,
+        duration_ms: None,
+        row_count: None,
+        error_code: None,
+    }
+}
+
+fn source_event(
+    source_id: &str,
+    event: &str,
+    actor: &str,
+    reason_code: &str,
+    now: i64,
+) -> AuditEvent {
+    AuditEvent {
+        ts: now,
+        event: event.to_string(),
+        approval_id: None,
+        token_id: None,
+        agent: None,
+        source_id: Some(source_id.to_string()),
+        tool: "source_lifecycle".to_string(),
+        profile_id: None,
+        profile_version: None,
+        route_id: None,
+        route_version: None,
+        request_digest: None,
+        channel: None,
+        decision: if event == "restored" {
+            "allowed"
+        } else {
+            "rejected"
+        }
+        .to_string(),
+        actor: actor.to_string(),
+        high_risk: false,
+        reason_code: Some(reason_code.to_string()),
+        reason: None,
+        duration_ms: None,
+        row_count: None,
+        error_code: None,
+    }
+}
+
 fn insert_audit(conn: &Connection, event: &AuditEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO audit_events
@@ -1390,6 +2012,74 @@ fn insert_audit(conn: &Connection, event: &AuditEvent) -> Result<()> {
         ],
     )?;
     Ok(())
+}
+
+enum ClaimStep {
+    Outcome(ClaimOutcome),
+    Claimed(Box<ApprovalRecord>),
+}
+
+/// Shared approval consumption logic. The caller owns the transaction so it can add
+/// step-specific work (such as a quota reservation) before committing.
+fn claim_step(
+    conn: &Connection,
+    id: i64,
+    token_id: &str,
+    expected_digest: &str,
+    now: i64,
+) -> Result<ClaimStep> {
+    let Some(record) = approval_optional(conn, id)? else {
+        return Ok(ClaimStep::Outcome(ClaimOutcome::NotFound));
+    };
+    if record.draft.token_id != token_id {
+        return Ok(ClaimStep::Outcome(ClaimOutcome::TokenMismatch));
+    }
+    if record.request_digest != expected_digest || record.draft.digest() != expected_digest {
+        return Ok(ClaimStep::Outcome(ClaimOutcome::DigestMismatch));
+    }
+    if record.status != ApprovalStatus::Approved {
+        return Ok(ClaimStep::Outcome(ClaimOutcome::NotApproved));
+    }
+    if record.expires_at <= now {
+        conn.execute(
+            "UPDATE approval_requests SET status = 'expired', reason_code = 'APPROVAL_EXPIRED'
+              WHERE id = ? AND status = 'approved'",
+            [id],
+        )?;
+        let record = approval_from_conn(conn, id)?;
+        insert_audit(
+            conn,
+            &AuditEvent::for_approval(&record, "expired", "expired", "system", now),
+        )?;
+        return Ok(ClaimStep::Outcome(ClaimOutcome::Expired));
+    }
+    if let Some(reason) = claim_stale_reason(conn, &record)? {
+        conn.execute(
+            "UPDATE approval_requests SET status = 'expired', reason_code = ?
+              WHERE id = ? AND status = 'approved'",
+            params![reason, id],
+        )?;
+        let record = approval_from_conn(conn, id)?;
+        insert_audit(
+            conn,
+            &AuditEvent::for_approval(&record, "invalidated", "rejected", "system", now),
+        )?;
+        return Ok(ClaimStep::Outcome(ClaimOutcome::Stale(reason.to_string())));
+    }
+    let changed = conn.execute(
+        "UPDATE approval_requests SET status = 'consumed', consumed_at = ?
+          WHERE id = ? AND status = 'approved' AND consumed_at IS NULL",
+        params![now, id],
+    )?;
+    if changed == 0 {
+        return Ok(ClaimStep::Outcome(ClaimOutcome::NotApproved));
+    }
+    let record = approval_from_conn(conn, id)?;
+    insert_audit(
+        conn,
+        &AuditEvent::for_approval(&record, "claimed", "allowed", "system", now),
+    )?;
+    Ok(ClaimStep::Claimed(Box::new(record)))
 }
 
 fn claim_stale_reason(conn: &Connection, record: &ApprovalRecord) -> Result<Option<&'static str>> {

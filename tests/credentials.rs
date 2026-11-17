@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use mcp_db::{CredentialResolver, EncryptedFileResolver, Error};
+use mcp_db::{CredentialResolver, CredentialSink, EncryptedFileResolver, Error};
 use tempfile::TempDir;
 
 fn entries() -> BTreeMap<String, String> {
@@ -106,4 +106,91 @@ fn tampered_ciphertext_is_rejected() {
         EncryptedFileResolver::open(&store, &key_file),
         Err(Error::CredentialUnavailable)
     ));
+}
+
+#[test]
+fn upsert_persists_new_references_and_hot_loads_them() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+    let key = [7_u8; 32];
+    fs::write(&key_file, key_hex(&key)).expect("write key");
+    EncryptedFileResolver::seal(&store, &key, &entries()).expect("seal");
+
+    let resolver = EncryptedFileResolver::open(&store, &key_file).expect("open");
+    let reference = "keyring:provision/mcpdb_np_test/query";
+    let dsn = "postgres://mcpdb_np_test_ro:s3cret-pw@db.example:5432/mcpdb_np_test";
+    resolver.store(reference, dsn).expect("store credential");
+    assert_eq!(resolver.resolve(reference).expect("resolve"), dsn);
+    assert!(resolver.resolve("keyring:mcp-db/test/query").is_ok());
+
+    let on_disk = fs::read(&store).expect("read store");
+    assert!(!on_disk
+        .windows(b"s3cret-pw".len())
+        .any(|window| window == b"s3cret-pw"));
+
+    let reopened = EncryptedFileResolver::open(&store, &key_file).expect("reopen");
+    assert_eq!(reopened.resolve(reference).expect("resolve"), dsn);
+    assert!(reopened.resolve("keyring:mcp-db/test/query").is_ok());
+}
+
+#[test]
+fn upsert_rejects_invalid_references_and_multiline_values() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+    let key = [7_u8; 32];
+    fs::write(&key_file, key_hex(&key)).expect("write key");
+    EncryptedFileResolver::seal(&store, &key, &entries()).expect("seal");
+    let resolver = EncryptedFileResolver::open(&store, &key_file).expect("open");
+
+    assert!(matches!(
+        resolver.store("postgres://user:pw@host/db", "host=db"),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        resolver.store("keyring:provision/x", "postgres://a\nb"),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        resolver.store("keyring:provision/x", "   "),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(resolver.resolve("keyring:provision/x").is_err());
+}
+
+#[test]
+fn concurrent_reads_see_either_the_old_or_new_store() {
+    use std::sync::Arc;
+
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+    let key = [7_u8; 32];
+    fs::write(&key_file, key_hex(&key)).expect("write key");
+    EncryptedFileResolver::seal(&store, &key, &entries()).expect("seal");
+    let resolver = Arc::new(EncryptedFileResolver::open(&store, &key_file).expect("open"));
+
+    let reader = resolver.clone();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..200 {
+            reader
+                .resolve("keyring:mcp-db/test/query")
+                .expect("existing entry stays readable");
+        }
+    });
+    for index in 0..10 {
+        resolver
+            .store(
+                &format!("keyring:provision/db{index}/query"),
+                "postgres://role:pw@db.example:5432/test",
+            )
+            .expect("store");
+    }
+    handle.join().expect("reader");
+    for index in 0..10 {
+        assert!(resolver
+            .resolve(&format!("keyring:provision/db{index}/query"))
+            .is_ok());
+    }
 }

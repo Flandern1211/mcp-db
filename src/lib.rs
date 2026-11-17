@@ -9,6 +9,7 @@ pub mod limits;
 pub mod mcp;
 pub mod metadata;
 pub mod postgres;
+pub mod provision;
 pub mod sql_policy;
 pub mod state;
 pub mod transport;
@@ -19,7 +20,7 @@ pub use approval::{
 };
 pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
-pub use credentials::{CredentialResolver, EncryptedFileResolver};
+pub use credentials::{CredentialResolver, CredentialSink, EncryptedFileResolver};
 pub use error::Error;
 pub use executor::{
     MutationOutcome, PostgresExecutor, QueryOutcome, SqlExecutor, UnavailableExecutor,
@@ -28,10 +29,15 @@ pub use executor::{
 pub use limits::TokenRateLimiter;
 pub use mcp::{AppState, ElicitationGate, ElicitationOutcome, McpDbServer, PeerElicitation};
 pub use metadata::{MetadataProvider, PostgresMetadata, UnavailableMetadata};
+pub use provision::{
+    PostgresProvisioner, ProvisionLimits, ProvisionOutcome, ProvisionSpec, Provisioner,
+    UnavailableProvisioner,
+};
 pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
 pub use state::{
     ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
-    NewSource, Profile, ProfilePurpose, Route, Source, SourceStatus, Store, TokenIdentity, Tool,
+    NewSource, Profile, ProfilePurpose, QuotaReservation, ReservationStatus, Route, Source,
+    SourceStatus, Store, TokenIdentity, Tool,
 };
 
 use std::io::{Error as IoError, Read, Write};
