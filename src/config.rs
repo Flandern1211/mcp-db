@@ -11,6 +11,8 @@ pub const DEFAULT_STATE_PATH: &str = ".mcp-db/state.db";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub addr: String,
+    /// Separate listener for the local admin UI so the MCP port stays untouched.
+    pub admin_addr: String,
     pub state_path: PathBuf,
     pub credential_store: Option<PathBuf>,
     pub master_key_file: Option<PathBuf>,
@@ -110,6 +112,14 @@ impl Config {
             return Err(ConfigError("MCPDB_ADDR must not be empty".to_string()));
         }
 
+        let admin_addr =
+            env::var("MCPDB_ADMIN_ADDR").unwrap_or_else(|_| crate::ADMIN_ADDR.to_string());
+        if admin_addr.trim().is_empty() {
+            return Err(ConfigError(
+                "MCPDB_ADMIN_ADDR must not be empty".to_string(),
+            ));
+        }
+
         let state_path = env::var_os("MCPDB_STATE_PATH")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_STATE_PATH));
@@ -140,6 +150,7 @@ impl Config {
 
         Ok(Self {
             addr,
+            admin_addr,
             state_path,
             credential_store,
             master_key_file,

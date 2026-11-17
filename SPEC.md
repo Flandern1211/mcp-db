@@ -15,6 +15,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 - 单实例、多数据源的 Streamable HTTP MCP 服务；不要求与数据库同机，不要求全年常驻。
 - 首版正式交付形态为 OCI 容器镜像（Docker 服务）。MCP 端口默认只发布到宿主回环地址或受控网络。
 - 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的一次性登录令牌；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
+- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次，服务端只存其 SHA-256 hash；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 写请求校验 CSRF 与 `Origin`，Host 必须为回环地址。
 - 首版普通数据库能力仅支持 PostgreSQL；MySQL/MariaDB、SQLite、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
 - source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
 - agent 使用管理面签发的 Bearer token；明文只在签发时返回一次，服务端只保存哈希和识别信息。

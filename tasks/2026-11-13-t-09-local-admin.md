@@ -42,14 +42,18 @@
 
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
-| 模块集成/容器 E2E | AC2-10（本机）、21、22 | 一次性令牌、来源、CSRF、agent/admin 隔离和审批矩阵 | 本地 Docker + 临时状态库 | 未开始 | 全部 |
+| 单元/模块集成 | AC2-10、AC2-21 | `cargo test --locked --test admin_http` | axum router + 临时 SQLite | 8 passed：令牌单次/过期、缺/错 CSRF、错误 Origin、agent Bearer 拒绝、重复批准不执行、归档后 MCP 不可见、隔离预留结算、审计页无凭证 | 无 |
+| CLI 与审计 | AC2-09、AC2-21 | `cargo test --locked --bin mcp-db`；容器内 `mcp-db audit` | 临时状态库 | 21+3 passed：source/profile/route/token/grant 命令可用；7 类管理变更写 `admin_*` 审计且不含令牌明文/hash；审计倒序可查 | 无 |
+| 容器 E2E | AC2-10（本机） | `docker run -p 127.0.0.1:28787:8787 -p 127.0.0.1:28788:8788`；curl 登录/重放/CSRF/Origin/agent token | 本地 Docker + 非 root 容器 | `docker port` 仅回环；user 10001、health healthy；login 200/303、dashboard 200、重放 401、缺 CSRF 403、错误 Origin 403、agent Bearer 401 | 无 |
+| 构建与静态检查 | 工程基线 | `cargo fmt --check`；`cargo test --locked`；clippy；`cargo build --release --locked`；`docker build` | Docker Desktop Linux | 104 passed, 11 ignored；clippy 严格通过；release 与镜像构建通过 | 无 |
 
-外部写调用数：按管理操作记录。证据位置：本任务文件与受控 E2E 记录。
+外部写调用数：仅本地容器内状态库与管理操作；无外部系统写入。
+证据位置：本任务文件与本地容器冒烟记录（未记录登录令牌、agent token 明文或 cookie 值）。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：待合入。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | AC2-10（本机）、21、22 | 任务未开始，管理面尚未实现 | 首版 CLI/Web 管理闭环无证据 | 实现本机管理面并执行令牌/CSRF/隔离矩阵 | 是 |
+| 🔴 无 | — | — | — | — | — |

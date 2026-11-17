@@ -39,6 +39,7 @@ pub use state::{
     NewSource, Profile, ProfilePurpose, QuotaReservation, ReservationStatus, Route, Source,
     SourceStatus, Store, TokenIdentity, Tool,
 };
+pub use transport::admin::{admin_app, AdminSession, AdminState, ADMIN_LOGIN_TTL_MS};
 
 use std::io::{Error as IoError, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -46,6 +47,8 @@ use std::time::Duration;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:8787";
 pub const HEALTHCHECK_ADDR: &str = "127.0.0.1:8787";
+/// Local-only admin listener. Docker publishes this port to the host loopback only.
+pub const ADMIN_ADDR: &str = "127.0.0.1:8788";
 
 pub fn health_body() -> &'static str {
     r#"{"status":"ok","service":"mcp-db"}"#
