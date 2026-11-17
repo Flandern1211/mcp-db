@@ -930,6 +930,9 @@ async fn encrypted_credentials_flow_through_mcp_to_postgres() {
 async fn encrypted_credentials_flow_through_mcp_sql_tools() {
     let dsn = env::var("MCPDB_TEST_PG_DSN")
         .expect("MCPDB_TEST_PG_DSN must point at a controlled PostgreSQL test database");
+    // The shared fixture must be repeatable: reset rows and DDL left by earlier runs.
+    let cleanup_dsn = dsn.clone();
+    reset_sql_tools_fixture(&dsn).await;
     let dir = TempDir::new().expect("temp dir");
     let key = [11_u8; 32];
     let key_hex = key
@@ -1136,6 +1139,20 @@ async fn encrypted_credentials_flow_through_mcp_sql_tools() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["structuredContent"]["code"], "SQL_REJECTED");
+    reset_sql_tools_fixture(&cleanup_dsn).await;
+}
+
+async fn reset_sql_tools_fixture(dsn: &str) {
+    let (client, connection) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+        .await
+        .expect("fixture connection");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute("DELETE FROM users WHERE id = 99; DROP TABLE IF EXISTS mcp_e2e")
+        .await
+        .expect("reset sql tools fixture");
 }
 
 #[tokio::test]
