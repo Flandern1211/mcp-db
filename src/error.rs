@@ -16,6 +16,8 @@ pub enum Error {
     MetadataUnavailable,
     CredentialUnavailable,
     ResourceLimit(String),
+    ProvisionBlocked(String),
+    ProvisionUnavailable(String),
     ExecutionNotStarted(String),
     ExecutionUnknown,
     SqlRejected(String),
@@ -51,6 +53,10 @@ impl fmt::Display for Error {
             Self::MetadataUnavailable => write!(f, "database metadata provider is unavailable"),
             Self::CredentialUnavailable => write!(f, "credential reference cannot be resolved"),
             Self::ResourceLimit(reason) => write!(f, "resource limit reached: {reason}"),
+            Self::ProvisionBlocked(reason) => write!(f, "provisioning is blocked: {reason}"),
+            Self::ProvisionUnavailable(reason) => {
+                write!(f, "provisioning is unavailable: {reason}")
+            }
             Self::ExecutionNotStarted(reason) => write!(f, "execution not started: {reason}"),
             Self::ExecutionUnknown => write!(f, "external execution result unknown"),
             Self::SqlRejected(reason) => write!(f, "SQL rejected: {reason}"),
