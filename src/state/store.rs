@@ -11,9 +11,9 @@ use crate::approval::{
 use crate::auth;
 use crate::error::{Error, Result};
 use crate::state::model::{
-    validate_credential_ref, validate_limit, validate_profile_name, validate_source_id,
-    ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
-    NewSource, Profile, ProfilePurpose, Route, Source, SourceStatus, TokenIdentity, Tool,
+    validate_credential_ref, validate_profile_name, validate_source_id, ApprovalPolicy, Driver,
+    Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
+    ProfilePurpose, Route, Source, SourceStatus, TokenIdentity, Tool,
 };
 
 const SCHEMA_VERSION: i64 = 2;
@@ -419,8 +419,7 @@ impl Store {
         }
         validate_profile_name(&profile.name)?;
         validate_credential_ref(&profile.credential_ref)?;
-        validate_limit(profile.max_connections.map(u64::from), "max_connections")?;
-        validate_limit(profile.statement_timeout_ms, "statement_timeout_ms")?;
+        crate::postgres::validate_limits(profile.max_connections, profile.statement_timeout_ms)?;
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO connection_profiles

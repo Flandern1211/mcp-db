@@ -3,7 +3,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::{Number, Value};
 use tokio_postgres::types::Type;
-use tokio_postgres::{Client, NoTls, Row};
+use tokio_postgres::Row;
+
+use crate::postgres::{self, ProfileClient, ProfileConnections};
 
 use crate::credentials::CredentialResolver;
 use crate::error::{Error, Result};
@@ -73,25 +75,29 @@ impl SqlExecutor for UnavailableExecutor {
     }
 }
 
-/// Minimal PostgreSQL executor. Pooling, timeouts and rate limits belong to T-07.
+/// PostgreSQL executor with profile admission control and server-side timeouts.
 pub struct PostgresExecutor {
     resolver: Arc<dyn CredentialResolver>,
+    connections: Arc<ProfileConnections>,
 }
 
 impl PostgresExecutor {
     pub fn new(resolver: Arc<dyn CredentialResolver>) -> Self {
-        Self { resolver }
+        Self::with_connections(resolver, Arc::new(ProfileConnections::default()))
     }
 
-    async fn client(&self, profile: &Profile) -> Result<Client> {
-        let dsn = self.resolver.resolve(&profile.credential_ref)?;
-        let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
-            .await
-            .map_err(|_| Error::MetadataUnavailable)?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        Ok(client)
+    pub fn with_connections(
+        resolver: Arc<dyn CredentialResolver>,
+        connections: Arc<ProfileConnections>,
+    ) -> Self {
+        Self {
+            resolver,
+            connections,
+        }
+    }
+
+    async fn client(&self, profile: &Profile) -> Result<ProfileClient> {
+        postgres::connect(self.resolver.as_ref(), &self.connections, profile).await
     }
 }
 
@@ -176,6 +182,12 @@ impl SqlExecutor for PostgresExecutor {
         max_rows: usize,
     ) -> Result<QueryOutcome> {
         let client = self.client(profile).await?;
+        if profile.purpose == crate::state::ProfilePurpose::Query {
+            client
+                .batch_execute("BEGIN READ ONLY")
+                .await
+                .map_err(postgres::database_error)?;
+        }
         let bound = bind_params(params)?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
             .iter()
@@ -184,7 +196,7 @@ impl SqlExecutor for PostgresExecutor {
         let rows = client
             .query(sql, &refs)
             .await
-            .map_err(|_| Error::MetadataUnavailable)?;
+            .map_err(postgres::database_error)?;
         let columns = if rows.is_empty() {
             Vec::new()
         } else {
@@ -212,8 +224,11 @@ impl SqlExecutor for PostgresExecutor {
         sql: &str,
         params: &[Value],
     ) -> Result<MutationOutcome> {
-        let client = self.client(profile).await?;
         let bound = bind_params(params)?;
+        let client = self
+            .client(profile)
+            .await
+            .map_err(|error| Error::ExecutionNotStarted(error.to_string()))?;
         let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = bound
             .iter()
             .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
@@ -221,21 +236,24 @@ impl SqlExecutor for PostgresExecutor {
         let row_count = client
             .execute(sql, &refs)
             .await
-            .map_err(|error| match error.code() {
-                Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-                    Error::Conflict("unique constraint violation".to_string())
-                }
-                _ => Error::MetadataUnavailable,
+            .map_err(postgres::database_error)
+            .map_err(|error| match error {
+                Error::ResourceLimit(_) => Error::ExecutionUnknown,
+                other => other,
             })?;
         Ok(MutationOutcome { row_count })
     }
 
     async fn explain(&self, profile: &Profile, explain_sql: &str) -> Result<Value> {
         let client = self.client(profile).await?;
+        client
+            .batch_execute("BEGIN READ ONLY")
+            .await
+            .map_err(postgres::database_error)?;
         let rows = client
             .query(explain_sql, &[])
             .await
-            .map_err(|_| Error::MetadataUnavailable)?;
+            .map_err(postgres::database_error)?;
         let Some(row) = rows.first() else {
             return Ok(Value::Null);
         };
@@ -245,7 +263,7 @@ impl SqlExecutor for PostgresExecutor {
                 .map_err(|_| Error::MetadataUnavailable)?
                 .ok_or(Error::MetadataUnavailable);
         }
-        let plan: String = row.try_get(0).map_err(|_| Error::MetadataUnavailable)?;
+        let plan: String = row.try_get(0).map_err(postgres::database_error)?;
         serde_json::from_str(&plan).map_err(|_| Error::MetadataUnavailable)
     }
 }

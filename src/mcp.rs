@@ -29,6 +29,7 @@ pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub metadata: Arc<dyn MetadataProvider>,
     pub executor: Arc<dyn SqlExecutor>,
+    pub rate_limiter: Arc<crate::limits::TokenRateLimiter>,
     pub elicitation: Arc<dyn ElicitationGate>,
     pub max_rows: usize,
     pub approval_timeout_ms: i64,
@@ -212,6 +213,7 @@ impl McpDbServer {
 
     async fn execute_claimed(
         &self,
+        context: &RequestContext<RoleServer>,
         record: ApprovalRecord,
         params: &[Value],
     ) -> Result<CallToolResult, McpError> {
@@ -222,7 +224,11 @@ impl McpDbServer {
                 .map_err(store_error)?
         };
         let sql = record.draft.sql.as_deref().unwrap_or_default();
-        let result = self.state.executor.mutate(&profile, sql, params).await;
+        let result = tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => Err(Error::ExecutionUnknown),
+            result = self.state.executor.mutate(&profile, sql, params) => result,
+        };
         match result {
             Ok(outcome) => {
                 let finished = {
@@ -249,19 +255,29 @@ impl McpDbServer {
                 })))
             }
             Err(error) => {
+                let not_started =
+                    matches!(error, Error::ExecutionNotStarted(_) | Error::SqlRejected(_));
                 let _ = {
                     let store = self.lock_store()?;
                     store.finish_approval(
                         record.id,
-                        ApprovalOutcome::Unknown,
+                        if not_started {
+                            ApprovalOutcome::Failed
+                        } else {
+                            ApprovalOutcome::Unknown
+                        },
                         None,
-                        Some("EXECUTION_UNKNOWN"),
+                        Some(if not_started {
+                            "EXECUTION_NOT_STARTED"
+                        } else {
+                            "EXECUTION_UNKNOWN"
+                        }),
                         now_ms(),
                     )
                 };
                 Ok(CallToolResult::structured_error(json!({
-                    "code": "EXECUTION_UNKNOWN",
-                    "message": "external execution result is unknown; do not retry automatically",
+                    "code": if not_started { "EXECUTION_NOT_STARTED" } else { "EXECUTION_UNKNOWN" },
+                    "message": if not_started { "database statement was not sent; approval is consumed" } else { "external execution result is unknown; do not retry automatically" },
                     "approvalId": record.id,
                     "detail": error.to_string(),
                 })))
@@ -271,6 +287,7 @@ impl McpDbServer {
 
     async fn claim_and_execute(
         &self,
+        context: &RequestContext<RoleServer>,
         record: ApprovalRecord,
         params: Vec<Value>,
     ) -> Result<CallToolResult, McpError> {
@@ -284,7 +301,9 @@ impl McpDbServer {
             )
         };
         match claim {
-            Ok(ClaimOutcome::Claimed(record)) => self.execute_claimed(*record, &params).await,
+            Ok(ClaimOutcome::Claimed(record)) => {
+                self.execute_claimed(context, *record, &params).await
+            }
             Ok(other) => Ok(claim_error(other)),
             Err(error) => Ok(tool_error(error)),
         }
@@ -307,18 +326,20 @@ impl McpDbServer {
                 store.claim_approval(id, &draft.token_id, &draft.digest(), now)
             };
             return match claim {
-                Ok(ClaimOutcome::Claimed(record)) => self.execute_claimed(*record, &params).await,
+                Ok(ClaimOutcome::Claimed(record)) => {
+                    self.execute_claimed(context, *record, &params).await
+                }
                 Ok(other) => Ok(claim_error(other)),
                 Err(error) => Ok(tool_error(error)),
             };
         }
 
         if call.policy == ApprovalPolicy::Direct && !validated.high_risk {
-            let result = self
-                .state
-                .executor
-                .mutate(&call.profile, &validated.sql, &params)
-                .await;
+            let result = tokio::select! {
+                biased;
+                _ = context.ct.cancelled() => Err(Error::ExecutionUnknown),
+                result = self.state.executor.mutate(&call.profile, &validated.sql, &params) => result,
+            };
             match result {
                 Ok(outcome) => {
                     let mut event = crate::approval::AuditEvent::for_draft(
@@ -340,12 +361,25 @@ impl McpDbServer {
                     })));
                 }
                 Err(error) => {
-                    let event = crate::approval::AuditEvent::for_draft(
+                    let unknown = matches!(error, Error::ExecutionUnknown);
+                    let mut event = crate::approval::AuditEvent::for_draft(
                         &draft,
-                        "direct_failed",
-                        "error",
+                        if unknown {
+                            "direct_unknown"
+                        } else {
+                            "direct_failed"
+                        },
+                        if unknown { "unknown" } else { "error" },
                         "mcp-client",
                         now,
+                    );
+                    event.error_code = Some(
+                        if unknown {
+                            "EXECUTION_UNKNOWN"
+                        } else {
+                            "EXECUTION_FAILED"
+                        }
+                        .to_string(),
                     );
                     let _ = {
                         let store = self.lock_store()?;
@@ -375,7 +409,7 @@ impl McpDbServer {
                         Ok(record) => record,
                         Err(result) => return Ok(result),
                     };
-                    return self.claim_and_execute(record, params).await;
+                    return self.claim_and_execute(context, record, params).await;
                 }
                 ElicitationOutcome::Declined | ElicitationOutcome::Cancelled => {
                     let _ = self.insert_approval(
@@ -649,23 +683,109 @@ impl ServerHandler for McpDbServer {
         let identity = request_identity(&context)?;
         let tool = Tool::parse(&request.name)
             .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
-        if tool != Tool::ListSources {
+        let authorized = if tool != Tool::ListSources {
             let source_id = request
                 .arguments
                 .as_ref()
-                .and_then(|arguments| arguments.get("source"))
-                .and_then(|value| value.as_str());
-            let authorization = {
+                .and_then(|args| args.get("source"))
+                .and_then(Value::as_str);
+            let result = {
                 let store = self.lock_store()?;
                 Authorizer::new(&store).authorize(&identity.token_id, source_id, tool)
             };
-            if let Err(error) = authorization {
-                return Ok(tool_error(error));
+            match result {
+                Ok(call) => Some(call),
+                Err(error) => return Ok(tool_error(error)),
+            }
+        } else {
+            None
+        };
+        if !self.state.rate_limiter.check(&identity.token_id) {
+            let event = crate::approval::AuditEvent {
+                ts: now_ms(),
+                event: "rate_limited".to_string(),
+                approval_id: None,
+                token_id: Some(identity.token_id.clone()),
+                agent: Some(identity.agent.clone()),
+                source_id: authorized.as_ref().map(|call| call.source.id.clone()),
+                tool: request.name.to_string(),
+                profile_id: authorized.as_ref().map(|call| call.profile.id),
+                profile_version: authorized.as_ref().map(|call| call.profile.version),
+                route_id: authorized.as_ref().map(|call| call.route.id),
+                route_version: authorized.as_ref().map(|call| call.route.version),
+                request_digest: None,
+                channel: None,
+                decision: "rejected".to_string(),
+                actor: "system".to_string(),
+                high_risk: false,
+                reason_code: Some("RATE_LIMITED".to_string()),
+                reason: None,
+                duration_ms: None,
+                row_count: None,
+                error_code: None,
+            };
+            self.lock_store()?
+                .record_audit_event(&event)
+                .map_err(store_error)?;
+            return Ok(CallToolResult::structured_error(json!({
+                "code": "RATE_LIMITED",
+                "message": "token tool-call rate exceeded",
+            })));
+        }
+        let cancellation = context.ct.clone();
+        let router = Self::tool_router();
+        let result = if tool.is_write() {
+            // Write handlers persist the conservative outcome before returning from cancellation.
+            router
+                .call(ToolCallContext::new(self, request, context))
+                .await
+        } else {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => Ok(CallToolResult::structured_error(json!({
+                    "code": "REQUEST_CANCELLED",
+                    "message": "database request cancelled",
+                }))),
+                result = router.call(ToolCallContext::new(self, request, context)) => result,
+            }
+        };
+        if let (Some(call), Ok(output)) = (authorized.as_ref(), &result) {
+            if output.is_error == Some(true) {
+                let code = output
+                    .structured_content
+                    .as_ref()
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("TOOL_REJECTED");
+                let event = crate::approval::AuditEvent {
+                    ts: now_ms(),
+                    event: "tool_rejected".to_string(),
+                    approval_id: None,
+                    token_id: Some(call.identity.token_id.clone()),
+                    agent: Some(call.identity.agent.clone()),
+                    source_id: Some(call.source.id.clone()),
+                    tool: tool.as_str().to_string(),
+                    profile_id: Some(call.profile.id),
+                    profile_version: Some(call.profile.version),
+                    route_id: Some(call.route.id),
+                    route_version: Some(call.route.version),
+                    request_digest: None,
+                    channel: None,
+                    decision: "rejected".to_string(),
+                    actor: "system".to_string(),
+                    high_risk: false,
+                    reason_code: Some(code.to_string()),
+                    reason: None,
+                    duration_ms: None,
+                    row_count: None,
+                    error_code: None,
+                };
+                self.lock_store()?
+                    .record_audit_event(&event)
+                    .map_err(store_error)?;
             }
         }
-        Self::tool_router()
-            .call(ToolCallContext::new(self, request, context))
-            .await
+        result
     }
 }
 
@@ -702,6 +822,9 @@ fn tool_error(error: Error) -> CallToolResult {
         Error::ProfileDisabled(_) => "PROFILE_DISABLED",
         Error::MetadataUnavailable => "METADATA_UNAVAILABLE",
         Error::CredentialUnavailable => "CREDENTIAL_UNAVAILABLE",
+        Error::ResourceLimit(_) => "RESOURCE_LIMIT",
+        Error::ExecutionNotStarted(_) => "EXECUTION_NOT_STARTED",
+        Error::ExecutionUnknown => "EXECUTION_UNKNOWN",
         Error::SqlRejected(_) => "SQL_REJECTED",
         _ => "REQUEST_REJECTED",
     };

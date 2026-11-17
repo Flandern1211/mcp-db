@@ -14,6 +14,7 @@ pub struct Config {
     pub master_key_file: Option<PathBuf>,
     pub approval_timeout_ms: i64,
     pub approval_execution_ttl_ms: i64,
+    pub token_requests_per_minute: usize,
 }
 
 #[derive(Debug)]
@@ -26,6 +27,21 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+fn parse_token_rate(value: Option<&str>) -> Result<usize, ConfigError> {
+    match value {
+        None => Ok(crate::limits::DEFAULT_TOKEN_RATE_LIMIT),
+        Some(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=100_000).contains(value))
+            .ok_or_else(|| {
+                ConfigError(
+                    "MCPDB_TOKEN_REQUESTS_PER_MINUTE must be between 1 and 100000".to_string(),
+                )
+            }),
+    }
+}
 
 impl Config {
     pub fn from_env() -> Result<Self, ConfigError> {
@@ -69,6 +85,23 @@ impl Config {
             master_key_file,
             approval_timeout_ms: 120_000,
             approval_execution_ttl_ms: 60_000,
+            token_requests_per_minute: parse_token_rate(
+                env::var("MCPDB_TOKEN_REQUESTS_PER_MINUTE").ok().as_deref(),
+            )?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_rate_has_a_bounded_positive_configuration() {
+        assert_eq!(parse_token_rate(None).unwrap(), 60);
+        assert_eq!(parse_token_rate(Some("10")).unwrap(), 10);
+        for invalid in ["", "0", "-1", "invalid", "100001"] {
+            assert!(parse_token_rate(Some(invalid)).is_err());
+        }
     }
 }

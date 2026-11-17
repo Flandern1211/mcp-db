@@ -41,14 +41,17 @@
 
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
-| 单元/真实集成 | AC2-02、08、11 | Mock 限制测试；PostgreSQL 独立负向入口 | 临时 SQLite + 受控 PostgreSQL | 未开始 | 全部 |
+| 单元/模块集成 | AC2-08、AC2-11 | `cargo test`；限流窗口、SQLite 硬限制拒绝、profile capacity admission | Docker Linux + 临时 SQLite | 默认 11 tests passed；MCP 限流按 token 跨 session 共享，重启语义为内存窗口重置 | 无 |
+| PostgreSQL 真实集成 | AC2-02、AC2-08 | `cargo test --test postgres_readonly --test profile_limits -- --ignored` | 本地 Docker PostgreSQL 16；明确只读 fixture/角色 | 3 passed：账户直连与 query profile 会话两条路径各跑 INSERT/UPDATE/DELETE/CREATE TABLE，均被拒（42501 或只读事务 25006），夹具行与 public schema 不变且查询继续成功；单 profile 连接额度共享 SQL/metadata；50ms statement timeout 生效且之后查询可用 | 无 |
+| MCP 生命周期 | AC2-08、AC2-22 | `cargo test --test http_mcp mcp_cancellation` | Mock executor + 临时 SQLite | 1 passed：query 取消释放 future/permit；已发起写入取消记录 `direct_unknown`，不误记失败、不重试 | 无 |
+| 构建与静态检查 | 工程基线 | `cargo fmt --check`；clippy driver check；`cargo build --release --locked`；`docker build`；容器健康检查 | Docker Desktop Linux | 全量测试 57 passed, 9 ignored；clippy 严格检查通过；镜像构建与非 root 健康检查通过 | 无 |
 
-外部写调用数：按负向矩阵记录。证据位置：本任务文件与受控集成记录。
+测试/验收分离：本任务已由隔离容器、专用只读账号和无并发写的 fixture 自动验证；未声称人工客户端体验验收。token rate limit 和连接/timeout 默认值已写入 SPEC 与 CHANGELOG。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：待合入。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | AC2-02、08、11 | 任务未开始，尚无受控 PostgreSQL 验证 | 首版只读边界无证据 | 实现限制并用独立入口执行 DML/DDL 负向矩阵 | 是 |
+| 🔴 无 | — | — | — | — | — |

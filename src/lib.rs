@@ -5,8 +5,10 @@ pub mod config;
 pub mod credentials;
 pub mod error;
 pub mod executor;
+pub mod limits;
 pub mod mcp;
 pub mod metadata;
+pub mod postgres;
 pub mod sql_policy;
 pub mod state;
 pub mod transport;
@@ -23,6 +25,7 @@ pub use executor::{
     MutationOutcome, PostgresExecutor, QueryOutcome, SqlExecutor, UnavailableExecutor,
     DEFAULT_MAX_ROWS,
 };
+pub use limits::TokenRateLimiter;
 pub use mcp::{AppState, ElicitationGate, ElicitationOutcome, McpDbServer, PeerElicitation};
 pub use metadata::{MetadataProvider, PostgresMetadata, UnavailableMetadata};
 pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
