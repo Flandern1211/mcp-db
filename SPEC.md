@@ -239,6 +239,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 - 校验 staging 状态后，以 journal 记录提交点：激活新状态，并用同目录临时文件 + fsync + rename 替换当前生效 TOML，新的活动 TOML 不再包含旧 sources、agents、DSN 或旧 token 配置。原敏感配置移到非默认路径按凭证材料保护，不能由服务自动回退读取。跨文件切换中断时，新版本只能进入 migration recovery，不能启动 MCP；恢复根据 journal 完成或在提交点前回滚，不能猜测当前 source of truth。
 - 切换成功后只注册分类 tools，旧 `execute_sql` 直接调用也拒绝。使用活动配置启动旧 Bun/TypeScript binary 时不得获得 source 或 agent 权限；切换后不支持自动降级。管理员故意恢复旧敏感备份并运行旧二进制属于显式回滚/凭证风险，必须停服、人工执行并重新评估数据库凭证，不能由新服务承诺阻止。
 - 旧 Bun/TypeScript v1 源码和二进制在迁移验收完成前保留为迁移夹具和兼容测试对象，不作为正式开发入口；完成后是否移除由发布策略决定。
+- 首版迁移入口为 `mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]` 与 `mcp-db recover-legacy-migration`；状态库存在未 checkpoint 的 WAL 时拒绝迁移，production 与遗留写模式冲突时在写入任何目标文件前失败；迁移后 source 保持 archived，需 `mcp-db sources set-environment` 分类后才能恢复。
 - 缺失/未知/撤销 token 返回 401；grant 不足、profile 缺失/停用、归档、生产限制、错误 SQL 类别、限流/配额或审批拒绝返回可区分的拒绝原因并审计，不泄露凭证。
 - 审批和外部执行结果未知时停止自动重试、保留实际状态；外部副作用与本地登记不宣称跨库原子性。恢复步骤须在实现任务中明确验证。
 

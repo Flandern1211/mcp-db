@@ -8,6 +8,7 @@ pub mod executor;
 pub mod limits;
 pub mod mcp;
 pub mod metadata;
+pub mod migration;
 pub mod postgres;
 pub mod provision;
 pub mod sql_policy;
@@ -29,6 +30,10 @@ pub use executor::{
 pub use limits::TokenRateLimiter;
 pub use mcp::{AppState, ElicitationGate, ElicitationOutcome, McpDbServer, PeerElicitation};
 pub use metadata::{MetadataProvider, PostgresMetadata, UnavailableMetadata};
+pub use migration::{
+    guard_startup, journal_path, recover_legacy_migration, run_migration, FailPoint,
+    MigrateOptions, MigrationJournal, MigrationReport, RecoveryOutcome,
+};
 pub use provision::{
     PostgresProvisioner, ProvisionLimits, ProvisionOutcome, ProvisionSpec, Provisioner,
     UnavailableProvisioner,

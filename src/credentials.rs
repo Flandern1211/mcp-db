@@ -46,6 +46,25 @@ impl EncryptedFileResolver {
         })
     }
 
+    /// Opens an existing encrypted store or creates an empty one under the same master
+    /// key. The master key file itself must already exist.
+    pub fn open_or_create(store_path: &Path, key_path: &Path) -> Result<Self> {
+        let key = fs::read_to_string(key_path).map_err(|_| Error::CredentialUnavailable)?;
+        let key = parse_key(&key).ok_or(Error::CredentialUnavailable)?;
+        let entries = if store_path.exists() {
+            read_encrypted(store_path, &key)?
+        } else {
+            let entries = BTreeMap::new();
+            write_encrypted(store_path, &key, &entries)?;
+            entries
+        };
+        Ok(Self {
+            store_path: store_path.to_path_buf(),
+            key,
+            entries: Mutex::new(entries),
+        })
+    }
+
     /// Seal a credential map for tests and future admin commands.
     pub fn seal(
         store_path: &Path,

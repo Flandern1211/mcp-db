@@ -1,5 +1,12 @@
 # 变更记录
 
+## 2026-11-18
+
+- T-03 legacy v1 迁移：`migrate-legacy` 先快照再 staging 导入，通过持久 journal 完成状态库与 TOML 的 cutover；`recover-legacy-migration` 只能前滚已提交切换或回滚提交点前状态。
+- 旧 `readonly`/`readwrite`/`approval` 按固定矩阵转换为 grants 与策略，从不生成 `create_database`；旧 source 迁移后保持 archived，需 `sources set-environment` 分类后由 admin 恢复。
+- 旧 DSN 移入加密凭证库，活动 TOML 只保留 server 段，旧配置备份 0600 保护；存在未 checkpoint WAL 或 production 与写模式冲突时在写入前拒绝迁移。
+- 生产 source 存在写 grants 时拒绝 `set-environment production`，与 AC2-14 保持一致。
+
 ## 2026-11-17
 
 - T-07 固定 PostgreSQL 首版资源默认值与边界：每 profile 5 并发连接、30s 原生语句超时；SQL 与元数据共享额度，连接与初始化等待有界。

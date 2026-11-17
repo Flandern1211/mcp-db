@@ -308,6 +308,16 @@ impl Store {
         )?)
     }
 
+    /// Flushes the WAL into the main database file before an atomic file swap.
+    pub fn checkpoint(&self) -> Result<()> {
+        let _: (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        Ok(())
+    }
+
     pub fn create_token(&self, agent: &str) -> Result<IssuedToken> {
         let agent = agent.trim();
         if agent.is_empty() || agent.len() > 128 {
@@ -327,6 +337,29 @@ impl Store {
             token_id,
             agent: agent.to_string(),
         })
+    }
+
+    /// Imports a pre-existing agent token by hash. Only the hash is persisted; the
+    /// caller keeps the plaintext in memory and never writes it to disk.
+    pub fn import_token(&self, agent: &str, token_hash: &str) -> Result<String> {
+        let agent = agent.trim();
+        if agent.is_empty() || agent.len() > 128 {
+            return Err(Error::InvalidInput(
+                "agent must be 1-128 characters".to_string(),
+            ));
+        }
+        let token_hash = token_hash.trim().to_ascii_lowercase();
+        if token_hash.len() != 64 || !token_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err(Error::InvalidInput(
+                "token hash must be a 64-character SHA-256 hex value".to_string(),
+            ));
+        }
+        let token_id = auth::generate_token_id();
+        self.conn.execute(
+            "INSERT INTO tokens (id, agent, token_hash, status, created_at) VALUES (?, ?, ?, 'active', ?)",
+            params![token_id, agent, token_hash, now_ms()],
+        )?;
+        Ok(token_id)
     }
 
     pub fn authenticate(&self, raw_token: &str) -> Result<TokenIdentity> {
@@ -545,6 +578,43 @@ impl Store {
             &source_event(id, "archived", actor, "SOURCE_ARCHIVED", now),
         )?;
         transaction.commit()?;
+        self.get_source(id)
+    }
+
+    /// Sets the environment of an archived source. Archiving keeps the source disabled,
+    /// so an admin can classify a migrated legacy source before restoring it.
+    pub fn set_source_environment(&self, id: &str, environment: Environment) -> Result<Source> {
+        let source = self.get_source(id)?;
+        if source.status != SourceStatus::Archived {
+            return Err(Error::Conflict(
+                "source environment can only change while archived".to_string(),
+            ));
+        }
+        if environment == Environment::Production {
+            let write_grants: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM tool_grants
+                  WHERE source_id = ?
+                    AND tool IN ('mutate_sql', 'execute_ddl', 'create_database')",
+                [id],
+                |row| row.get(0),
+            )?;
+            if write_grants > 0 {
+                return Err(Error::InvalidInput(
+                    "cannot mark a source as production while it has write grants; revoke mutate_sql, execute_ddl and create_database first"
+                        .to_string(),
+                ));
+            }
+        }
+        let changed = self.conn.execute(
+            "UPDATE sources SET environment = ?, updated_at = ?
+              WHERE id = ? AND status = 'archived'",
+            params![environment.as_str(), now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Err(Error::Conflict(
+                "source environment can only change while archived".to_string(),
+            ));
+        }
         self.get_source(id)
     }
 
