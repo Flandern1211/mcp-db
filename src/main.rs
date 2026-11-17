@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +35,8 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             print_help();
             Ok(())
         }
+        Some("migrate-legacy") => run_migrate(args),
+        Some("recover-legacy-migration") => run_recover(args),
         Some(command)
             if matches!(
                 command,
@@ -58,6 +61,8 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         Some(other) => Err(format!("unknown argument: {other}")),
         None => {
             let config = Config::from_env().map_err(|error| error.to_string())?;
+            mcp_db::guard_startup(&config.state_path)
+                .map_err(|error| format!("state init failed: {error}"))?;
             let store = Store::open(&config.state_path)
                 .map_err(|error| format!("state init failed: {error}"))?;
             let store = Arc::new(Mutex::new(store));
@@ -108,9 +113,75 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     }
 }
 
+fn run_migrate(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    let mut config_path: Option<String> = None;
+    let mut environment = Environment::Production;
+    while let Some(argument) = args.next() {
+        match argument.as_str() {
+            "--config" => {
+                config_path = Some(args.next().ok_or("--config requires a legacy TOML path")?);
+            }
+            "--environment" => {
+                environment = Environment::parse(
+                    &args
+                        .next()
+                        .ok_or("--environment requires production|nonproduction")?,
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            other => return Err(format!("unknown migrate-legacy argument: {other}")),
+        }
+    }
+    let config_path = config_path.ok_or("migrate-legacy requires --config <legacy.toml>")?;
+    let config = Config::from_env().map_err(|error| error.to_string())?;
+    let credential_store = config.credential_store.ok_or(
+        "MCPDB_CREDENTIAL_STORE and MCPDB_MASTER_KEY_FILE must be configured for migration",
+    )?;
+    let master_key_file = config.master_key_file.ok_or(
+        "MCPDB_CREDENTIAL_STORE and MCPDB_MASTER_KEY_FILE must be configured for migration",
+    )?;
+    let report = mcp_db::run_migration(&mcp_db::MigrateOptions {
+        legacy_config: PathBuf::from(config_path),
+        environment,
+        state_path: config.state_path,
+        credential_store,
+        master_key_file,
+        fail_after: None,
+    })
+    .map_err(|error| error.to_string())?;
+    println!(
+        "migrated {} sources and {} agents; sources are archived",
+        report.sources.len(),
+        report.agents.len()
+    );
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!("snapshot: {}", report.snapshot_dir.display());
+    Ok(())
+}
+
+fn run_recover(mut args: impl Iterator<Item = String>) -> Result<(), String> {
+    if let Some(extra) = args.next() {
+        return Err(format!(
+            "recover-legacy-migration takes no arguments (got {extra})"
+        ));
+    }
+    let config = Config::from_env().map_err(|error| error.to_string())?;
+    let outcome =
+        mcp_db::recover_legacy_migration(&config.state_path).map_err(|error| error.to_string())?;
+    let label = match outcome {
+        mcp_db::RecoveryOutcome::RolledBack => "rolled back before the commit point",
+        mcp_db::RecoveryOutcome::Completed => "completed the committed cutover",
+        mcp_db::RecoveryOutcome::NothingToDo => "nothing to do",
+    };
+    println!("migration recovery: {label}");
+    Ok(())
+}
+
 fn print_help() {
     println!(
-        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction>\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
+        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction>\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
         env!("CARGO_PKG_VERSION"),
         mcp_db::ADMIN_ADDR
     );
@@ -194,6 +265,33 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                         source.status.as_str()
                     );
                 }
+                Ok(())
+            }
+            Some("set-environment") => {
+                let id = args
+                    .next()
+                    .ok_or("sources set-environment requires a source id")?;
+                let environment = Environment::parse(
+                    &args
+                        .next()
+                        .ok_or("sources set-environment requires production|nonproduction")?,
+                )
+                .map_err(|error| error.to_string())?;
+                let source = store
+                    .set_source_environment(&id, environment)
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "source {} environment set to {}",
+                    source.id,
+                    source.environment.as_str()
+                );
+                record_admin_audit(
+                    &store,
+                    "admin_source_environment_set",
+                    "source",
+                    Some(source.id.as_str()),
+                    None,
+                )?;
                 Ok(())
             }
             Some(other) => Err(format!("unknown sources subcommand: {other}")),

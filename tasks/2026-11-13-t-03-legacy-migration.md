@@ -42,14 +42,19 @@
 
 | 层级 | AC | 命令或步骤 | 环境 | 结果 | 🔴 未验证 |
 | --- | --- | --- | --- | --- | --- |
-| E2E/故障注入 | AC2-23 | 旧夹具迁移与各 cutover 点崩溃矩阵 | 临时目录 + legacy v1 夹具 | 未开始 | 全部 |
+| 单元/模块集成 | AC2-23 | `cargo test --locked --test legacy_migration` | 临时目录 + legacy TOML/SQLite 夹具 | 10 passed：固定 grants 矩阵、无 `create_database`、source archived、三个 profiles、凭证可解析、活动 TOML 无 DSN/sources/agents、备份 0600、legacy approvals/audit 保留 | 无 |
+| 故障注入 | AC2-23 | 同一测试内的 `FailPoint` 崩溃点 + recovery | 临时目录 | 提交点前失败 → 回滚且启动保护解除；状态库 rename 后失败 → recovery 前滚完成 TOML 并 `done`；未完成 journal 阻止启动 | 无 |
+| 拒绝路径 | AC2-23 | 非 postgres driver、缺 token env、重复迁移、WAL 未 checkpoint、production 与写模式冲突 | 临时目录 | 均在写入目标前失败，目标状态库与 TOML 未改变 | 无 |
+| 构建与静态检查 | 工程基线 | `cargo fmt --check`；`cargo test --locked`；clippy；`cargo build --release --locked` | Docker Linux | 114 passed, 11 ignored；clippy 严格通过；release 构建通过 | 无 |
 
-外部写调用数：0。证据位置：本任务文件（仓库可见）。
+外部写调用数：0；仅本地临时目录与加密凭证文件。
+证据位置：本任务文件；夹具为仓库内测试代码，不含真实 DSN/token。
+边界：未运行旧 Bun binary 的真实端到端；活动 TOML 的“无 source/agent 权限”由内容断言与 legacy schema 语义证明。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：待合入。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | AC2-23 | 任务未开始，迁移夹具和 journal 尚未建立 | 不能证明旧配置安全切换 | 建立夹具与崩溃注入矩阵并执行 | 是 |
+| 🔴 无 | — | — | — | — | — |
