@@ -80,9 +80,13 @@ async fn real_postgres_executor_queries_inserts_and_explains() {
     assert!(outcome.row_count >= 1);
     assert_eq!(outcome.columns, vec!["id", "name"]);
 
+    let mut write_target = profile();
+    write_target.id = 2;
+    write_target.name = "mutate".to_string();
+    write_target.purpose = ProfilePurpose::Mutate;
     let mutation = executor
         .mutate(
-            &target,
+            &write_target,
             "INSERT INTO users (id, name) VALUES (99, 'executor')",
             &[],
         )
@@ -111,7 +115,7 @@ async fn real_postgres_executor_queries_inserts_and_explains() {
     assert!(limit.truncated);
 
     executor
-        .mutate(&target, "DELETE FROM users WHERE id = 99", &[])
+        .mutate(&write_target, "DELETE FROM users WHERE id = 99", &[])
         .await
         .expect("cleanup");
 }

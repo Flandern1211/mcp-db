@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
+use crate::postgres::{self, ProfileClient, ProfileConnections};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio_postgres::types::ToSql;
-use tokio_postgres::{Client, NoTls};
 
 use crate::credentials::CredentialResolver;
 use crate::error::{Error, Result};
@@ -45,25 +45,29 @@ impl MetadataProvider for UnavailableMetadata {
     }
 }
 
-/// Minimal PostgreSQL metadata provider. Pooling and limits belong to T-07.
+/// Metadata queries share admission control with ordinary SQL execution.
 pub struct PostgresMetadata {
     resolver: Arc<dyn CredentialResolver>,
+    connections: Arc<ProfileConnections>,
 }
 
 impl PostgresMetadata {
     pub fn new(resolver: Arc<dyn CredentialResolver>) -> Self {
-        Self { resolver }
+        Self::with_connections(resolver, Arc::new(ProfileConnections::default()))
     }
 
-    async fn client(&self, profile: &Profile) -> Result<Client> {
-        let dsn = self.resolver.resolve(&profile.credential_ref)?;
-        let (client, connection) = tokio_postgres::connect(&dsn, NoTls)
-            .await
-            .map_err(|_| Error::MetadataUnavailable)?;
-        tokio::spawn(async move {
-            let _ = connection.await;
-        });
-        Ok(client)
+    pub fn with_connections(
+        resolver: Arc<dyn CredentialResolver>,
+        connections: Arc<ProfileConnections>,
+    ) -> Self {
+        Self {
+            resolver,
+            connections,
+        }
+    }
+
+    async fn client(&self, profile: &Profile) -> Result<ProfileClient> {
+        postgres::connect(self.resolver.as_ref(), &self.connections, profile).await
     }
 }
 
@@ -82,7 +86,7 @@ impl MetadataProvider for PostgresMetadata {
                 &params,
             )
             .await
-            .map_err(|_| Error::MetadataUnavailable)?;
+            .map_err(postgres::database_error)?;
         let tables = rows
             .iter()
             .map(|row| {
@@ -115,7 +119,7 @@ impl MetadataProvider for PostgresMetadata {
                 &params,
             )
             .await
-            .map_err(|_| Error::MetadataUnavailable)?
+            .map_err(postgres::database_error)?
             .iter()
             .map(|row| {
                 json!({
@@ -141,7 +145,7 @@ impl MetadataProvider for PostgresMetadata {
                 &params,
             )
             .await
-            .map_err(|_| Error::MetadataUnavailable)?
+            .map_err(postgres::database_error)?
             .iter()
             .map(|row| row.get::<_, String>(0))
             .collect::<Vec<_>>();
@@ -156,7 +160,7 @@ impl MetadataProvider for PostgresMetadata {
                 &params,
             )
             .await
-            .map_err(|_| Error::MetadataUnavailable)?
+            .map_err(postgres::database_error)?
             .iter()
             .map(|row| {
                 json!({
@@ -184,7 +188,7 @@ impl MetadataProvider for PostgresMetadata {
                 &params,
             )
             .await
-            .map_err(|_| Error::MetadataUnavailable)?
+            .map_err(postgres::database_error)?
             .iter()
             .map(|row| {
                 json!({

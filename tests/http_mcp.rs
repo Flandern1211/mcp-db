@@ -13,7 +13,7 @@ use mcp_db::{
     AppState, ApprovalPolicy, Driver, ElicitationGate, ElicitationOutcome, EncryptedFileResolver,
     Environment, MetadataProvider, MutationOutcome, NewGrant, NewProfile, NewRoute, NewSource,
     PeerElicitation, PostgresExecutor, PostgresMetadata, Profile, ProfilePurpose, QueryOutcome,
-    SqlExecutor, Store, Tool, UnavailableExecutor, DEFAULT_MAX_ROWS,
+    SqlExecutor, Store, TokenRateLimiter, Tool, UnavailableExecutor, DEFAULT_MAX_ROWS,
 };
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
@@ -24,6 +24,16 @@ use tower::ServiceExt;
 #[derive(Default)]
 struct MockSqlExecutor {
     mutations: AtomicUsize,
+    block: bool,
+    started: tokio::sync::Notify,
+    released: Arc<AtomicUsize>,
+}
+
+struct ReleaseOnDrop(Arc<AtomicUsize>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 struct FixedElicitation(ElicitationOutcome);
@@ -48,6 +58,11 @@ impl SqlExecutor for MockSqlExecutor {
         _params: &[Value],
         _max_rows: usize,
     ) -> Result<QueryOutcome, mcp_db::Error> {
+        if self.block {
+            let _guard = ReleaseOnDrop(self.released.clone());
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        }
         Ok(QueryOutcome {
             columns: Vec::new(),
             rows: Vec::new(),
@@ -64,6 +79,11 @@ impl SqlExecutor for MockSqlExecutor {
         _params: &[Value],
     ) -> Result<MutationOutcome, mcp_db::Error> {
         self.mutations.fetch_add(1, Ordering::SeqCst);
+        if self.block {
+            let _guard = ReleaseOnDrop(self.released.clone());
+            self.started.notify_one();
+            std::future::pending::<()>().await;
+        }
         Ok(MutationOutcome { row_count: 1 })
     }
 
@@ -122,6 +142,158 @@ impl MetadataProvider for MockMetadata {
     }
 }
 
+#[tokio::test]
+async fn rate_limit_is_shared_across_sessions_and_does_not_consume_approvals() {
+    let (_dir, mut state, token, metadata) = setup();
+    state.rate_limiter = Arc::new(TokenRateLimiter::new(1, std::time::Duration::from_secs(60)));
+    let router = app(state.clone());
+    let first = init_session(router.clone(), &token).await;
+    let second = init_session(router.clone(), &token).await;
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_SOURCES,
+            Some(&token),
+            Some(&first),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], false);
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_SOURCES,
+            Some(&token),
+            Some(&second),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["structuredContent"]["code"], "RATE_LIMITED");
+    assert_eq!(metadata.list_calls.load(Ordering::SeqCst), 0);
+    assert!(state
+        .store
+        .lock()
+        .unwrap()
+        .list_pending_approvals(10)
+        .unwrap()
+        .is_empty());
+    let other = state
+        .store
+        .lock()
+        .unwrap()
+        .create_token("agent-b")
+        .unwrap()
+        .token;
+    let other_session = init_session(router.clone(), &other).await;
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_SOURCES,
+            Some(&other),
+            Some(&other_session),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], false);
+}
+
+#[tokio::test]
+async fn mcp_cancellation_drops_query_and_records_unknown_write() {
+    for write in [false, true] {
+        let (_dir, mut state, token, _) = setup();
+        let mock = Arc::new(MockSqlExecutor {
+            block: true,
+            ..Default::default()
+        });
+        state.executor = mock.clone();
+        add_metadata_access(&state, &token);
+        if write {
+            let store = state.store.lock().unwrap();
+            let profile = store
+                .create_profile(&NewProfile {
+                    source_id: "a".to_string(),
+                    name: "write".to_string(),
+                    purpose: ProfilePurpose::Mutate,
+                    credential_ref: "keyring:test".to_string(),
+                    max_connections: Some(1),
+                    statement_timeout_ms: Some(1000),
+                })
+                .unwrap();
+            store
+                .create_route(&NewRoute {
+                    source_id: "a".to_string(),
+                    tool: Tool::MutateSql,
+                    profile_id: profile.id,
+                    min_approval_policy: ApprovalPolicy::Direct,
+                })
+                .unwrap();
+            store
+                .create_grant(&NewGrant {
+                    token_id: store.authenticate(&token).unwrap().token_id,
+                    source_id: "a".to_string(),
+                    tool: Tool::MutateSql,
+                    policy: Some(ApprovalPolicy::Direct),
+                })
+                .unwrap();
+        }
+        let router = app(state);
+        let session = init_session(router.clone(), &token).await;
+        let task = tokio::spawn(send(
+            router.clone(),
+            request(
+                Method::POST,
+                "/mcp",
+                if write { MUTATE_INSERT } else { QUERY_SQL },
+                Some(&token),
+                Some(&session),
+            ),
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(5), mock.started.notified())
+            .await
+            .unwrap();
+        let cancel = json!({"jsonrpc":"2.0", "method":"notifications/cancelled", "params": {
+            "requestId": if write {12} else {8}, "reason":"test cancellation"
+        }})
+        .to_string();
+        let _ = send(
+            router,
+            request(Method::POST, "/mcp", &cancel, Some(&token), Some(&session)),
+        )
+        .await;
+        let (_, _, body) = tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mock.released.load(Ordering::SeqCst), 1);
+        if write {
+            let connection = rusqlite::Connection::open(_dir.path().join("state.db")).unwrap();
+            let unknown: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM audit_events WHERE event = 'direct_unknown' AND decision = 'unknown' AND error_code = 'EXECUTION_UNKNOWN'",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(unknown, 1);
+        }
+        let code = body["result"]["structuredContent"]["code"].as_str();
+        // The SDK may suppress the cancelled response; when delivered, its outcome stays conservative.
+        if code.is_some() {
+            assert_eq!(
+                code,
+                Some(if write {
+                    "EXECUTION_UNKNOWN"
+                } else {
+                    "REQUEST_CANCELLED"
+                })
+            );
+        }
+    }
+}
+
 fn setup() -> (TempDir, AppState, String, Arc<MockMetadata>) {
     let dir = TempDir::new().expect("temp dir");
     let store = Store::open(dir.path().join("state.db")).expect("open store");
@@ -132,6 +304,7 @@ fn setup() -> (TempDir, AppState, String, Arc<MockMetadata>) {
         metadata: metadata.clone(),
         executor: Arc::new(UnavailableExecutor),
         elicitation: Arc::new(PeerElicitation),
+        rate_limiter: Arc::new(TokenRateLimiter::default()),
         max_rows: DEFAULT_MAX_ROWS,
         approval_timeout_ms: 120_000,
         approval_execution_ttl_ms: 60_000,
@@ -189,7 +362,17 @@ fn parse_body(bytes: &[u8]) -> Value {
             }
         }
     }
-    serde_json::from_str(text.trim()).expect("JSON or SSE body")
+    if text.lines().all(|line| {
+        line.trim().is_empty()
+            || line.starts_with(':')
+            || line.starts_with("event:")
+            || line.starts_with("id:")
+            || line.starts_with("retry:")
+            || line.trim() == "data:"
+    }) {
+        return Value::Null;
+    }
+    serde_json::from_str(text.trim()).unwrap_or_else(|_| panic!("JSON or SSE body: {text:?}"))
 }
 
 const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
@@ -645,6 +828,7 @@ async fn encrypted_credentials_flow_through_mcp_to_postgres() {
         metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
         executor: Arc::new(PostgresExecutor::new(resolver)),
         elicitation: Arc::new(PeerElicitation),
+        rate_limiter: Arc::new(TokenRateLimiter::default()),
         max_rows: DEFAULT_MAX_ROWS,
         approval_timeout_ms: 120_000,
         approval_execution_ttl_ms: 60_000,
@@ -789,6 +973,7 @@ async fn encrypted_credentials_flow_through_mcp_sql_tools() {
         metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
         executor: Arc::new(PostgresExecutor::new(resolver)),
         elicitation: Arc::new(PeerElicitation),
+        rate_limiter: Arc::new(TokenRateLimiter::default()),
         max_rows: 1,
         approval_timeout_ms: 120_000,
         approval_execution_ttl_ms: 60_000,

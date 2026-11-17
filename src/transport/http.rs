@@ -34,6 +34,10 @@ pub async fn run(
             store,
             metadata,
             executor,
+            rate_limiter: Arc::new(crate::limits::TokenRateLimiter::new(
+                config.token_requests_per_minute,
+                crate::limits::DEFAULT_TOKEN_RATE_WINDOW,
+            )),
             elicitation: Arc::new(PeerElicitation),
             max_rows: DEFAULT_MAX_ROWS,
             approval_timeout_ms: config.approval_timeout_ms,

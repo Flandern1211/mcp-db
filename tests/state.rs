@@ -36,6 +36,29 @@ fn profile(source_id: &str, name: &str, purpose: ProfilePurpose) -> NewProfile {
 }
 
 #[test]
+fn unsupported_limits_are_rejected_before_persistence() {
+    let (_dir, store) = store();
+    store
+        .create_source(&source("limits", Environment::NonProduction))
+        .unwrap();
+    for (connections, timeout) in [
+        (Some(0), None),
+        (Some(1001), None),
+        (None, Some(0)),
+        (None, Some(u64::MAX)),
+    ] {
+        let mut input = profile("limits", "invalid", ProfilePurpose::Query);
+        input.max_connections = connections;
+        input.statement_timeout_ms = timeout;
+        assert!(matches!(
+            store.create_profile(&input),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    assert!(store.list_profiles("limits").unwrap().is_empty());
+}
+
+#[test]
 fn token_is_hashed_and_revocable_across_restart() {
     let (dir, store) = store();
     let issued = store.create_token("agent-a").expect("issue token");

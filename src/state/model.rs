@@ -348,12 +348,3 @@ pub(crate) fn validate_credential_ref(value: &str) -> Result<()> {
     }
     Ok(())
 }
-
-pub(crate) fn validate_limit(value: Option<u64>, what: &str) -> Result<()> {
-    if value == Some(0) {
-        return Err(Error::InvalidInput(format!(
-            "{what} must be greater than zero"
-        )));
-    }
-    Ok(())
-}

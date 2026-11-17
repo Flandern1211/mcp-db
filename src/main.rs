@@ -46,8 +46,12 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     let resolver = EncryptedFileResolver::open(store_path, key_path)
                         .map_err(|error| format!("credential init failed: {error}"))?;
                     let resolver = Arc::new(resolver);
-                    metadata = Arc::new(PostgresMetadata::new(resolver.clone()));
-                    executor = Arc::new(PostgresExecutor::new(resolver));
+                    let connections = Arc::new(mcp_db::postgres::ProfileConnections::default());
+                    metadata = Arc::new(PostgresMetadata::with_connections(
+                        resolver.clone(),
+                        connections.clone(),
+                    ));
+                    executor = Arc::new(PostgresExecutor::with_connections(resolver, connections));
                 }
                 _ => {
                     metadata = Arc::new(UnavailableMetadata);
