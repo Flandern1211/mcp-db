@@ -1,9 +1,22 @@
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tokio_postgres::config::Host;
+use tokio_postgres::NoTls;
 
+use crate::credentials::{CredentialResolver, CredentialSink};
 use crate::error::{Error, Result};
 use crate::state::model::validate_source_id;
-use crate::state::{Environment, Tool};
+use crate::state::{
+    ApprovalPolicy, Driver, Environment, NewProfile, NewSource, Profile, ProfilePurpose,
+    ProvisionedRoute, ProvisionedSource, TokenIdentity, Tool,
+};
 
 pub const DEFAULT_MAX_ACTIVE: u32 = 5;
 pub const DEFAULT_MIN_INTERVAL_MS: i64 = 60_000;
@@ -223,6 +236,390 @@ fn random_suffix() -> String {
         .iter()
         .map(|byte| DATABASE_ALPHABET[*byte as usize % DATABASE_ALPHABET.len()] as char)
         .collect()
+}
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const PROVISION_TIMEOUT: Duration = Duration::from_secs(30);
+
+pub fn credential_ref(database: &str, purpose: ProfilePurpose) -> String {
+    format!("keyring:provisioned/{database}/{}", purpose.as_str())
+}
+
+/// Local registration input for a database that was created successfully.
+pub fn result_source(
+    spec: &ProvisionSpec,
+    parent_source_id: &str,
+    identity: &TokenIdentity,
+) -> Result<ProvisionedSource> {
+    let environment = spec.environment()?;
+    let tools = spec.tools()?;
+    let database = spec.database.clone();
+    let source_id = database.clone();
+
+    let mut profiles = vec![NewProfile {
+        source_id: source_id.clone(),
+        name: ProfilePurpose::Query.as_str().to_string(),
+        purpose: ProfilePurpose::Query,
+        credential_ref: credential_ref(&database, ProfilePurpose::Query),
+        max_connections: None,
+        statement_timeout_ms: None,
+    }];
+    let needs_mutate = tools
+        .iter()
+        .any(|tool| tool.purpose() == Some(ProfilePurpose::Mutate));
+    let needs_schema = tools
+        .iter()
+        .any(|tool| tool.purpose() == Some(ProfilePurpose::Schema));
+    let mut purposes = Vec::new();
+    if needs_mutate || needs_schema {
+        // One read-write role backs both mutate and schema profiles; the profiles stay
+        // distinct so routes and approval policy remain per tool.
+        if needs_mutate {
+            purposes.push(ProfilePurpose::Mutate);
+        }
+        if needs_schema {
+            purposes.push(ProfilePurpose::Schema);
+        }
+        for purpose in &purposes {
+            profiles.push(NewProfile {
+                source_id: source_id.clone(),
+                name: purpose.as_str().to_string(),
+                purpose: *purpose,
+                credential_ref: credential_ref(&database, *purpose),
+                max_connections: None,
+                statement_timeout_ms: None,
+            });
+        }
+    }
+
+    let routes = tools
+        .iter()
+        .map(|tool| {
+            let purpose = tool.purpose().ok_or_else(|| {
+                Error::InvalidInput("provision result tool has no profile purpose".to_string())
+            })?;
+            Ok(ProvisionedRoute {
+                tool: *tool,
+                profile_name: purpose.as_str().to_string(),
+                min_approval_policy: if tool.is_write() {
+                    ApprovalPolicy::Approval
+                } else {
+                    ApprovalPolicy::Direct
+                },
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if routes.len() != tools.len() {
+        return Err(Error::InvalidInput(
+            "provision result tools must map to distinct routes".to_string(),
+        ));
+    }
+
+    Ok(ProvisionedSource {
+        source: NewSource {
+            id: source_id,
+            driver: Driver::Postgres,
+            environment,
+            parent_source_id: Some(parent_source_id.to_string()),
+            created_token_id: Some(identity.token_id.clone()),
+            created_agent: Some(identity.agent.clone()),
+            created_origin: Some("provision".to_string()),
+        },
+        profiles,
+        routes,
+        grants: tools,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionOutcome {
+    pub database: String,
+}
+
+#[async_trait]
+pub trait Provisioner: Send + Sync {
+    /// Creates the database, per-database roles and the encrypted credentials.
+    /// Returning an error after the database exists is reported as unknown by callers.
+    async fn create(&self, profile: &Profile, spec: &ProvisionSpec) -> Result<ProvisionOutcome>;
+}
+
+pub struct UnavailableProvisioner(pub String);
+
+#[async_trait]
+impl Provisioner for UnavailableProvisioner {
+    async fn create(&self, _profile: &Profile, _spec: &ProvisionSpec) -> Result<ProvisionOutcome> {
+        Err(Error::ProvisionUnavailable(self.0.clone()))
+    }
+}
+
+pub struct PostgresProvisioner {
+    resolver: Arc<dyn CredentialResolver>,
+    sink: Arc<dyn CredentialSink>,
+}
+
+impl PostgresProvisioner {
+    pub fn new(resolver: Arc<dyn CredentialResolver>, sink: Arc<dyn CredentialSink>) -> Self {
+        Self { resolver, sink }
+    }
+}
+
+struct ConnectionGuard {
+    handle: JoinHandle<()>,
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+#[async_trait]
+impl Provisioner for PostgresProvisioner {
+    async fn create(&self, profile: &Profile, spec: &ProvisionSpec) -> Result<ProvisionOutcome> {
+        if profile.purpose != ProfilePurpose::Provision {
+            return Err(Error::ProvisionUnavailable(
+                "provisioning requires a provision profile".to_string(),
+            ));
+        }
+        spec.validate()?;
+        let dsn = self
+            .resolver
+            .resolve(&profile.credential_ref)
+            .map_err(|_| {
+                Error::ProvisionUnavailable("provision credential is unavailable".to_string())
+            })?;
+        let admin_config: tokio_postgres::Config = dsn
+            .parse()
+            .map_err(|_| Error::ProvisionUnavailable("provision DSN is invalid".to_string()))?;
+        let (host, port) = match admin_config.get_hosts().first() {
+            Some(Host::Tcp(host)) => {
+                let port = admin_config.get_ports().first().copied().unwrap_or(5432);
+                (host.clone(), port)
+            }
+            _ => {
+                return Err(Error::ProvisionUnavailable(
+                    "provision DSN must use a TCP host".to_string(),
+                ))
+            }
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':'))
+        {
+            return Err(Error::ProvisionUnavailable(
+                "provision DSN host contains unsupported characters".to_string(),
+            ));
+        }
+
+        let tools = spec.tools()?;
+        let needs_rw = tools.iter().any(|tool| tool.is_write());
+        let read_only_password = generate_password();
+        let read_write_password = generate_password();
+
+        // Admin connection: create the database, roles and database-level privileges.
+        // Connect to the maintenance database explicitly instead of the database named
+        // by the provision profile.
+        let mut create_config = admin_config.clone();
+        create_config.dbname("postgres");
+        let (admin, admin_connection) =
+            tokio::time::timeout(CONNECT_TIMEOUT, create_config.connect(NoTls))
+                .await
+                .map_err(|_| {
+                    Error::ProvisionUnavailable("provision connection timed out".to_string())
+                })?
+                .map_err(|_| {
+                    Error::ProvisionUnavailable("provision connection failed".to_string())
+                })?;
+        let _admin_guard = ConnectionGuard {
+            handle: tokio::spawn(async move {
+                let _ = admin_connection.await;
+            }),
+        };
+
+        // CREATE DATABASE is statement-atomic: a server error proves nothing was created.
+        let create_database = format!("CREATE DATABASE \"{}\"", spec.database);
+        match tokio::time::timeout(PROVISION_TIMEOUT, admin.batch_execute(&create_database)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) if error.as_db_error().is_some() => {
+                return Err(Error::ExecutionNotStarted(
+                    "database creation was rejected".to_string(),
+                ))
+            }
+            _ => return Err(Error::ExecutionUnknown),
+        }
+
+        let remaining = self
+            .create_roles_and_credentials(
+                &admin,
+                &admin_config,
+                &spec.database,
+                &spec.read_only_role,
+                &spec.read_write_role,
+                &read_only_password,
+                if needs_rw {
+                    Some(read_write_password.as_str())
+                } else {
+                    None
+                },
+                &host,
+                port,
+                &tools,
+            )
+            .await;
+        match remaining {
+            Ok(()) => Ok(ProvisionOutcome {
+                database: spec.database.clone(),
+            }),
+            // The database exists: never report a clean failure for a partial creation.
+            Err(_) => Err(Error::ExecutionUnknown),
+        }
+    }
+}
+
+impl PostgresProvisioner {
+    #[allow(clippy::too_many_arguments)]
+    async fn create_roles_and_credentials(
+        &self,
+        admin: &tokio_postgres::Client,
+        admin_config: &tokio_postgres::Config,
+        database: &str,
+        read_only_role: &str,
+        read_write_role: &str,
+        read_only_password: &str,
+        read_write_password: Option<&str>,
+        host: &str,
+        port: u16,
+        tools: &[Tool],
+    ) -> Result<()> {
+        let mut statements = vec![
+            format!("CREATE ROLE \"{read_only_role}\" LOGIN PASSWORD '{read_only_password}'"),
+            format!("GRANT CONNECT ON DATABASE \"{database}\" TO \"{read_only_role}\""),
+        ];
+        if let Some(password) = read_write_password {
+            statements.push(format!(
+                "CREATE ROLE \"{read_write_role}\" LOGIN PASSWORD '{password}'"
+            ));
+            statements.push(format!(
+                "GRANT CONNECT ON DATABASE \"{database}\" TO \"{read_write_role}\""
+            ));
+        }
+        statements.push(format!("REVOKE ALL ON DATABASE \"{database}\" FROM PUBLIC"));
+        for statement in statements {
+            run_statement(admin, &statement).await?;
+        }
+
+        // Schema privileges must be applied inside the new database.
+        let mut owner_config = admin_config.clone();
+        owner_config.dbname(database);
+        let (owner, owner_connection) =
+            tokio::time::timeout(CONNECT_TIMEOUT, owner_config.connect(NoTls))
+                .await
+                .map_err(|_| Error::ExecutionUnknown)?
+                .map_err(|_| Error::ExecutionUnknown)?;
+        let _owner_guard = ConnectionGuard {
+            handle: tokio::spawn(async move {
+                let _ = owner_connection.await;
+            }),
+        };
+        run_statement(&owner, "REVOKE CREATE ON SCHEMA public FROM PUBLIC").await?;
+        run_statement(
+            &owner,
+            &format!("GRANT USAGE ON SCHEMA public TO \"{read_only_role}\""),
+        )
+        .await?;
+        if read_write_password.is_some() {
+            run_statement(
+                &owner,
+                &format!("GRANT USAGE, CREATE ON SCHEMA public TO \"{read_write_role}\""),
+            )
+            .await?;
+        }
+        drop(owner);
+
+        if let Some(password) = read_write_password {
+            let dsn = build_dsn(host, port, read_write_role, password, database)?;
+            let (read_write, read_write_connection) =
+                tokio::time::timeout(CONNECT_TIMEOUT, tokio_postgres::connect(&dsn, NoTls))
+                    .await
+                    .map_err(|_| Error::ExecutionUnknown)?
+                    .map_err(|_| Error::ExecutionUnknown)?;
+            let _read_write_guard = ConnectionGuard {
+                handle: tokio::spawn(async move {
+                    let _ = read_write_connection.await;
+                }),
+            };
+            // Tables created by the read-write role stay readable by the read-only role.
+            run_statement(
+                &read_write,
+                &format!(
+                    "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO \"{read_only_role}\""
+                ),
+            )
+            .await?;
+            run_statement(
+                &read_write,
+                &format!(
+                    "ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON SEQUENCES TO \"{read_only_role}\""
+                ),
+            )
+            .await?;
+            drop(read_write);
+        }
+
+        let read_only_dsn = build_dsn(host, port, read_only_role, read_only_password, database)?;
+        self.sink
+            .store(
+                &credential_ref(database, ProfilePurpose::Query),
+                &read_only_dsn,
+            )
+            .map_err(|_| Error::ExecutionUnknown)?;
+        if let Some(password) = read_write_password {
+            let read_write_dsn = build_dsn(host, port, read_write_role, password, database)?;
+            for purpose in [ProfilePurpose::Mutate, ProfilePurpose::Schema] {
+                let needed = tools.iter().any(|tool| tool.purpose() == Some(purpose));
+                if needed {
+                    self.sink
+                        .store(&credential_ref(database, purpose), &read_write_dsn)
+                        .map_err(|_| Error::ExecutionUnknown)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn run_statement(client: &tokio_postgres::Client, statement: &str) -> Result<()> {
+    match tokio::time::timeout(PROVISION_TIMEOUT, client.batch_execute(statement)).await {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(Error::ExecutionUnknown),
+    }
+}
+
+fn build_dsn(host: &str, port: u16, user: &str, password: &str, database: &str) -> Result<String> {
+    if user.is_empty()
+        || !user
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    {
+        return Err(Error::InvalidInput(
+            "provision role name contains unsupported characters".to_string(),
+        ));
+    }
+    let host = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    Ok(format!(
+        "postgres://{user}:{password}@{host}:{port}/{database}"
+    ))
+}
+
+fn generate_password() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 #[cfg(test)]

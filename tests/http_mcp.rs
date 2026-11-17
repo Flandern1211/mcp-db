@@ -12,8 +12,9 @@ use mcp_db::transport::http::app;
 use mcp_db::{
     AppState, ApprovalPolicy, Driver, ElicitationGate, ElicitationOutcome, EncryptedFileResolver,
     Environment, MetadataProvider, MutationOutcome, NewGrant, NewProfile, NewRoute, NewSource,
-    PeerElicitation, PostgresExecutor, PostgresMetadata, Profile, ProfilePurpose, QueryOutcome,
-    SqlExecutor, Store, TokenRateLimiter, Tool, UnavailableExecutor, DEFAULT_MAX_ROWS,
+    PeerElicitation, PostgresExecutor, PostgresMetadata, Profile, ProfilePurpose, ProvisionLimits,
+    ProvisionOutcome, Provisioner, QueryOutcome, SqlExecutor, Store, TokenRateLimiter, Tool,
+    UnavailableExecutor, UnavailableProvisioner, DEFAULT_MAX_ROWS,
 };
 use rmcp::service::RequestContext;
 use rmcp::RoleServer;
@@ -37,6 +38,47 @@ impl Drop for ReleaseOnDrop {
 }
 
 struct FixedElicitation(ElicitationOutcome);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProvisionMode {
+    Success,
+    NotStarted,
+    Unknown,
+}
+
+struct MockProvisioner {
+    calls: AtomicUsize,
+    mode: ProvisionMode,
+}
+
+impl MockProvisioner {
+    fn new(mode: ProvisionMode) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            mode,
+        }
+    }
+}
+
+#[async_trait]
+impl Provisioner for MockProvisioner {
+    async fn create(
+        &self,
+        _profile: &Profile,
+        spec: &mcp_db::ProvisionSpec,
+    ) -> Result<ProvisionOutcome, mcp_db::Error> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.mode {
+            ProvisionMode::Success => Ok(ProvisionOutcome {
+                database: spec.database.clone(),
+            }),
+            ProvisionMode::NotStarted => {
+                Err(mcp_db::Error::ExecutionNotStarted("mock".to_string()))
+            }
+            ProvisionMode::Unknown => Err(mcp_db::Error::ExecutionUnknown),
+        }
+    }
+}
 
 #[async_trait]
 impl ElicitationGate for FixedElicitation {
@@ -303,6 +345,8 @@ fn setup() -> (TempDir, AppState, String, Arc<MockMetadata>) {
         store: Arc::new(Mutex::new(store)),
         metadata: metadata.clone(),
         executor: Arc::new(UnavailableExecutor),
+        provisioner: Arc::new(UnavailableProvisioner("test".to_string())),
+        provision_limits: ProvisionLimits::default(),
         elicitation: Arc::new(PeerElicitation),
         rate_limiter: Arc::new(TokenRateLimiter::default()),
         max_rows: DEFAULT_MAX_ROWS,
@@ -827,6 +871,8 @@ async fn encrypted_credentials_flow_through_mcp_to_postgres() {
         store: Arc::new(Mutex::new(store)),
         metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
         executor: Arc::new(PostgresExecutor::new(resolver)),
+        provisioner: Arc::new(UnavailableProvisioner("test".to_string())),
+        provision_limits: ProvisionLimits::default(),
         elicitation: Arc::new(PeerElicitation),
         rate_limiter: Arc::new(TokenRateLimiter::default()),
         max_rows: DEFAULT_MAX_ROWS,
@@ -972,6 +1018,8 @@ async fn encrypted_credentials_flow_through_mcp_sql_tools() {
         store: Arc::new(Mutex::new(store)),
         metadata: Arc::new(PostgresMetadata::new(resolver.clone())),
         executor: Arc::new(PostgresExecutor::new(resolver)),
+        provisioner: Arc::new(UnavailableProvisioner("test".to_string())),
+        provision_limits: ProvisionLimits::default(),
         elicitation: Arc::new(PeerElicitation),
         rate_limiter: Arc::new(TokenRateLimiter::default()),
         max_rows: 1,
@@ -1389,5 +1437,665 @@ async fn elicitation_decline_and_cancel_do_not_execute() {
             "APPROVAL_DENIED"
         );
         assert_eq!(mock.mutations.load(Ordering::SeqCst), 0);
+    }
+}
+
+fn add_provision_access(state: &AppState, token: &str) {
+    let store = state.store.lock().expect("store lock");
+    let profile = store
+        .create_profile(&NewProfile {
+            source_id: "a".to_string(),
+            name: "provision".to_string(),
+            purpose: ProfilePurpose::Provision,
+            credential_ref: "keyring:provision/test".to_string(),
+            max_connections: None,
+            statement_timeout_ms: None,
+        })
+        .expect("create provision profile");
+    store
+        .create_route(&NewRoute {
+            source_id: "a".to_string(),
+            tool: Tool::CreateDatabase,
+            profile_id: profile.id,
+            min_approval_policy: ApprovalPolicy::Approval,
+        })
+        .expect("create provision route");
+    let token_id = store.authenticate(token).expect("auth").token_id;
+    store
+        .create_grant(&NewGrant {
+            token_id,
+            source_id: "a".to_string(),
+            tool: Tool::CreateDatabase,
+            policy: None,
+        })
+        .expect("create create_database grant");
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as i64
+}
+
+const CREATE_DATABASE: &str = r#"{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"create_database","arguments":{"source":"a"}}}"#;
+
+fn create_database_retry(approval_id: i64) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":22,"method":"tools/call","params":{{"name":"create_database","arguments":{{"source":"a","approval_id":{approval_id}}}}}}}"#
+    )
+}
+
+async fn request_creation(
+    router: axum::Router,
+    token: &str,
+    session: &str,
+) -> (Value, i64, String) {
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            CREATE_DATABASE,
+            Some(token),
+            Some(session),
+        ),
+    )
+    .await;
+    let approval_id = body["result"]["structuredContent"]["approvalId"]
+        .as_i64()
+        .expect("approval id");
+    let database = body["result"]["structuredContent"]["database"]
+        .as_str()
+        .expect("database name")
+        .to_string();
+    (body, approval_id, database)
+}
+
+#[tokio::test]
+async fn create_database_requires_grant_and_an_enabled_provision_route() {
+    let (_dir, state, token, _) = setup();
+    add_metadata_access(&state, &token);
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            CREATE_DATABASE,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "TOOL_NOT_GRANTED"
+    );
+    assert!(state
+        .store
+        .lock()
+        .unwrap()
+        .list_pending_approvals(10)
+        .unwrap()
+        .is_empty());
+
+    add_provision_access(&state, &token);
+    let (body, _, database) = request_creation(router, &token, &session).await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_REQUIRED"
+    );
+    assert!(database.starts_with("mcpdb_np_"));
+    assert_eq!(
+        body["result"]["structuredContent"]["environment"],
+        "nonproduction"
+    );
+    let pending = state
+        .store
+        .lock()
+        .unwrap()
+        .list_pending_approvals(10)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].channel, mcp_db::ApprovalChannel::Admin);
+    assert!(pending[0].draft.high_risk);
+    assert!(pending[0].draft.sql.is_none());
+    let spec = mcp_db::ProvisionSpec::from_json(&pending[0].draft.params_json).expect("spec");
+    assert_eq!(spec.database, database);
+    assert!(spec
+        .result_tools
+        .iter()
+        .all(|tool| tool != "create_database" && tool != "list_sources"));
+}
+
+#[tokio::test]
+async fn approved_creation_registers_one_source_with_result_grants_only() {
+    let (_dir, mut state, token, _) = setup();
+    add_metadata_access(&state, &token);
+    add_provision_access(&state, &token);
+    let provisioner = Arc::new(MockProvisioner::new(ProvisionMode::Success));
+    state.provisioner = provisioner.clone();
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (_, approval_id, database) = request_creation(router.clone(), &token, &session).await;
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 0);
+
+    let approved = state
+        .store
+        .lock()
+        .unwrap()
+        .decide_approval(approval_id, true, "admin", now_ms(), 60_000)
+        .unwrap();
+    assert_eq!(approved, mcp_db::DecisionOutcome::Approved);
+
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            &create_database_retry(approval_id),
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], false);
+    assert_eq!(body["result"]["structuredContent"]["source"], database);
+    assert_eq!(
+        body["result"]["structuredContent"]["approvalId"],
+        approval_id
+    );
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 1);
+
+    {
+        let store = state.store.lock().unwrap();
+        let token_id = store.authenticate(&token).unwrap().token_id;
+        let visible = store.list_visible_sources(&token_id).unwrap();
+        assert!(visible.iter().any(|source| source.id == database));
+        let grants = store.list_grants_for_token(&token_id).unwrap();
+        let created: Vec<_> = grants
+            .iter()
+            .filter(|grant| grant.source_id == database)
+            .map(|grant| grant.tool)
+            .collect();
+        assert!(created.contains(&Tool::QuerySql));
+        assert!(!created.contains(&Tool::CreateDatabase));
+        let other = store.create_token("other-agent").unwrap();
+        assert!(store
+            .list_visible_sources(&other.token_id)
+            .unwrap()
+            .iter()
+            .all(|source| source.id != database));
+        assert_eq!(
+            store.list_grants_for_token(&other.token_id).unwrap().len(),
+            0
+        );
+        let source = store.get_source(&database).unwrap();
+        assert_eq!(source.parent_source_id.as_deref(), Some("a"));
+        assert_eq!(source.environment, Environment::NonProduction);
+    }
+
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            &create_database_retry(approval_id),
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_NOT_PENDING"
+    );
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn quota_and_quarantine_block_before_an_approval_is_created() {
+    let (_dir, mut state, token, _) = setup();
+    add_metadata_access(&state, &token);
+    add_provision_access(&state, &token);
+    state.provision_limits = ProvisionLimits::new(1, 1, vec![Tool::QuerySql]).unwrap();
+    let token_id = state
+        .store
+        .lock()
+        .unwrap()
+        .authenticate(&token)
+        .unwrap()
+        .token_id;
+    let reservation = state
+        .store
+        .lock()
+        .unwrap()
+        .reserve_provision(
+            &token_id,
+            "a",
+            "mcpdb_np_manual",
+            None,
+            &state.provision_limits,
+            now_ms(),
+        )
+        .unwrap();
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            CREATE_DATABASE,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "RESOURCE_LIMIT"
+    );
+    assert!(state
+        .store
+        .lock()
+        .unwrap()
+        .list_pending_approvals(10)
+        .unwrap()
+        .is_empty());
+
+    state
+        .store
+        .lock()
+        .unwrap()
+        .settle_reservation(
+            reservation.id,
+            mcp_db::ReservationStatus::Quarantined,
+            Some("EXECUTION_UNKNOWN"),
+            now_ms(),
+        )
+        .unwrap();
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            CREATE_DATABASE,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "PROVISION_BLOCKED"
+    );
+}
+
+#[tokio::test]
+async fn unknown_provisioning_result_quarantines_and_blocks_retry() {
+    let (_dir, mut state, token, _) = setup();
+    add_metadata_access(&state, &token);
+    add_provision_access(&state, &token);
+    let provisioner = Arc::new(MockProvisioner::new(ProvisionMode::Unknown));
+    state.provisioner = provisioner.clone();
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (_, approval_id, database) = request_creation(router.clone(), &token, &session).await;
+    state
+        .store
+        .lock()
+        .unwrap()
+        .decide_approval(approval_id, true, "admin", now_ms(), 60_000)
+        .unwrap();
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            &create_database_retry(approval_id),
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "EXECUTION_UNKNOWN"
+    );
+    {
+        let store = state.store.lock().unwrap();
+        let reservation = store
+            .reservation_for_approval(approval_id)
+            .unwrap()
+            .expect("reservation");
+        assert_eq!(reservation.status, mcp_db::ReservationStatus::Quarantined);
+        assert!(store.get_source(&database).is_err());
+    }
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            CREATE_DATABASE,
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "PROVISION_BLOCKED"
+    );
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn registration_failure_after_creation_quarantines_the_reservation() {
+    let (_dir, mut state, token, _) = setup();
+    add_metadata_access(&state, &token);
+    add_provision_access(&state, &token);
+    let provisioner = Arc::new(MockProvisioner::new(ProvisionMode::Success));
+    state.provisioner = provisioner.clone();
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (_, approval_id, database) = request_creation(router.clone(), &token, &session).await;
+    {
+        // Occupy the generated database name locally so registration must fail.
+        let store = state.store.lock().unwrap();
+        store
+            .create_source(&NewSource {
+                id: database.clone(),
+                driver: Driver::Postgres,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: None,
+            })
+            .unwrap();
+        store
+            .decide_approval(approval_id, true, "admin", now_ms(), 60_000)
+            .unwrap();
+    }
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            &create_database_retry(approval_id),
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "PROVISION_REGISTRATION_FAILED"
+    );
+    let store = state.store.lock().unwrap();
+    let reservation = store
+        .reservation_for_approval(approval_id)
+        .unwrap()
+        .expect("reservation");
+    assert_eq!(reservation.status, mcp_db::ReservationStatus::Quarantined);
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn not_started_provisioning_releases_the_reservation() {
+    let (_dir, mut state, token, _) = setup();
+    add_metadata_access(&state, &token);
+    add_provision_access(&state, &token);
+    state.provision_limits = ProvisionLimits::new(5, 1, vec![Tool::QuerySql]).unwrap();
+    let provisioner = Arc::new(MockProvisioner::new(ProvisionMode::NotStarted));
+    state.provisioner = provisioner.clone();
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &token).await;
+    let (_, approval_id, _) = request_creation(router.clone(), &token, &session).await;
+    state
+        .store
+        .lock()
+        .unwrap()
+        .decide_approval(approval_id, true, "admin", now_ms(), 60_000)
+        .unwrap();
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            &create_database_retry(approval_id),
+            Some(&token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "EXECUTION_NOT_STARTED"
+    );
+    {
+        let store = state.store.lock().unwrap();
+        let reservation = store
+            .reservation_for_approval(approval_id)
+            .unwrap()
+            .expect("reservation");
+        assert_eq!(reservation.status, mcp_db::ReservationStatus::Released);
+        let token_id = store.authenticate(&token).unwrap().token_id;
+        assert_eq!(
+            store
+                .provision_usage(&token_id, "a", now_ms(), 1)
+                .unwrap()
+                .quarantined,
+            0
+        );
+    }
+    // A released reservation does not block the next request.
+    let (body, _, _) = request_creation(router, &token, &session).await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_REQUIRED"
+    );
+    assert_eq!(provisioner.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires MCPDB_TEST_PG_ADMIN_DSN with CREATEDB and CREATEROLE"]
+async fn create_database_end_to_end_with_real_postgres() {
+    let dsn = env::var("MCPDB_TEST_PG_ADMIN_DSN").expect("MCPDB_TEST_PG_ADMIN_DSN");
+    let dir = TempDir::new().expect("temp dir");
+    let store_path = dir.path().join("credentials.enc");
+    let key_path = dir.path().join("master.key");
+    let key = [5_u8; 32];
+    fs::write(
+        &key_path,
+        key.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    )
+    .expect("write key");
+    let entries = BTreeMap::from([("keyring:provision/test".to_string(), dsn.clone())]);
+    EncryptedFileResolver::seal(&store_path, &key, &entries).expect("seal");
+    let resolver =
+        Arc::new(EncryptedFileResolver::open(&store_path, &key_path).expect("open resolver"));
+
+    let store = Store::open(dir.path().join("state.db")).expect("open store");
+    store
+        .create_source(&NewSource {
+            id: "parent".to_string(),
+            driver: Driver::Postgres,
+            environment: Environment::NonProduction,
+            parent_source_id: None,
+            created_token_id: None,
+            created_agent: None,
+            created_origin: None,
+        })
+        .unwrap();
+    let provision = store
+        .create_profile(&NewProfile {
+            source_id: "parent".to_string(),
+            name: "provision".to_string(),
+            purpose: ProfilePurpose::Provision,
+            credential_ref: "keyring:provision/test".to_string(),
+            max_connections: None,
+            statement_timeout_ms: None,
+        })
+        .unwrap();
+    store
+        .create_route(&NewRoute {
+            source_id: "parent".to_string(),
+            tool: Tool::CreateDatabase,
+            profile_id: provision.id,
+            min_approval_policy: ApprovalPolicy::Approval,
+        })
+        .unwrap();
+    let issued = store.create_token("e2e").expect("token");
+    store
+        .create_grant(&NewGrant {
+            token_id: issued.token_id.clone(),
+            source_id: "parent".to_string(),
+            tool: Tool::CreateDatabase,
+            policy: None,
+        })
+        .unwrap();
+
+    let connections = Arc::new(mcp_db::postgres::ProfileConnections::default());
+    let state = AppState {
+        store: Arc::new(Mutex::new(store)),
+        metadata: Arc::new(PostgresMetadata::with_connections(
+            resolver.clone(),
+            connections.clone(),
+        )),
+        executor: Arc::new(PostgresExecutor::with_connections(
+            resolver.clone(),
+            connections,
+        )),
+        provisioner: Arc::new(mcp_db::PostgresProvisioner::new(resolver.clone(), resolver)),
+        provision_limits: ProvisionLimits::default(),
+        rate_limiter: Arc::new(TokenRateLimiter::default()),
+        elicitation: Arc::new(PeerElicitation),
+        max_rows: DEFAULT_MAX_ROWS,
+        approval_timeout_ms: 120_000,
+        approval_execution_ttl_ms: 60_000,
+        sessions: Default::default(),
+    };
+    let router = app(state.clone());
+    let session = init_session(router.clone(), &issued.token).await;
+    let create = r#"{"jsonrpc":"2.0","id":31,"method":"tools/call","params":{"name":"create_database","arguments":{"source":"parent"}}}"#;
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            create,
+            Some(&issued.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(
+        body["result"]["structuredContent"]["code"],
+        "APPROVAL_REQUIRED"
+    );
+    let approval_id = body["result"]["structuredContent"]["approvalId"]
+        .as_i64()
+        .expect("approval id");
+    let database = body["result"]["structuredContent"]["database"]
+        .as_str()
+        .expect("database name")
+        .to_string();
+    state
+        .store
+        .lock()
+        .unwrap()
+        .decide_approval(approval_id, true, "admin", now_ms(), 60_000)
+        .unwrap();
+    let retry = format!(
+        r#"{{"jsonrpc":"2.0","id":32,"method":"tools/call","params":{{"name":"create_database","arguments":{{"source":"parent","approval_id":{approval_id}}}}}}}"#
+    );
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            &retry,
+            Some(&issued.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    assert_eq!(body["result"]["structuredContent"]["source"], database);
+
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_SOURCES,
+            Some(&issued.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert!(body["result"]["structuredContent"]["sources"]
+        .as_array()
+        .expect("sources")
+        .iter()
+        .any(|source| source["id"] == database));
+
+    let query = format!(
+        r#"{{"jsonrpc":"2.0","id":33,"method":"tools/call","params":{{"name":"query_sql","arguments":{{"source":"{database}","sql":"SELECT 1 AS value"}}}}}}"#
+    );
+    let (_, _, body) = send(
+        router.clone(),
+        request(
+            Method::POST,
+            "/mcp",
+            &query,
+            Some(&issued.token),
+            Some(&session),
+        ),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], false, "{body}");
+    assert_eq!(body["result"]["structuredContent"]["rowCount"], 1);
+
+    let other = state.store.lock().unwrap().create_token("other").unwrap();
+    let other_session = init_session(router.clone(), &other.token).await;
+    let (_, _, body) = send(
+        router,
+        request(
+            Method::POST,
+            "/mcp",
+            LIST_SOURCES,
+            Some(&other.token),
+            Some(&other_session),
+        ),
+    )
+    .await;
+    assert!(body["result"]["structuredContent"]["sources"]
+        .as_array()
+        .expect("sources")
+        .is_empty());
+
+    let (client, connection) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+        .await
+        .expect("cleanup connection");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    // DROP DATABASE cannot run inside the implicit transaction of a multi-statement batch.
+    client
+        .batch_execute(&format!("DROP DATABASE IF EXISTS \"{database}\""))
+        .await
+        .expect("cleanup database");
+    for role in [format!("{database}_ro"), format!("{database}_rw")] {
+        client
+            .batch_execute(&format!("DROP ROLE IF EXISTS \"{role}\""))
+            .await
+            .expect("cleanup role");
     }
 }

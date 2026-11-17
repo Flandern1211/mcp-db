@@ -351,6 +351,23 @@ pub struct ProvisionUsage {
     pub quarantined: i64,
 }
 
+/// A route created together with a provisioned source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedRoute {
+    pub tool: Tool,
+    pub profile_name: String,
+    pub min_approval_policy: ApprovalPolicy,
+}
+
+/// Everything registered atomically after a database was created successfully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionedSource {
+    pub source: NewSource,
+    pub profiles: Vec<NewProfile>,
+    pub routes: Vec<ProvisionedRoute>,
+    pub grants: Vec<Tool>,
+}
+
 pub(crate) fn validate_source_id(value: &str) -> Result<()> {
     validate_identifier(value, 1, 64, "source id")
 }

@@ -222,7 +222,10 @@ fn route_requires_matching_profile_purpose() {
     assert!(matches!(discovery, Err(Error::InvalidInput(_))));
 
     let provision = store
-        .create_profile(&profile("main", "provision", ProfilePurpose::Provision))
+        .create_profile(&NewProfile {
+            credential_ref: "keyring:provision/test".to_string(),
+            ..profile("main", "provision", ProfilePurpose::Provision)
+        })
         .expect("create provision profile");
     let query_on_provision = store.create_route(&NewRoute {
         source_id: "main".to_string(),
@@ -248,6 +251,22 @@ fn credential_refs_must_not_contain_dsns_or_passwords() {
 
     let keyring = store.create_profile(&profile("main", "keyring", ProfilePurpose::Query));
     assert!(keyring.is_ok());
+
+    // The provision admin identity stays out of ordinary profile namespaces.
+    let ordinary_with_admin_ref = store.create_profile(&NewProfile {
+        credential_ref: "keyring:provision/test".to_string(),
+        ..profile("main", "leak", ProfilePurpose::Query)
+    });
+    assert!(matches!(
+        ordinary_with_admin_ref,
+        Err(Error::InvalidInput(_))
+    ));
+    let provision_without_admin_ref =
+        store.create_profile(&profile("main", "provision", ProfilePurpose::Provision));
+    assert!(matches!(
+        provision_without_admin_ref,
+        Err(Error::InvalidInput(_))
+    ));
 }
 
 #[test]

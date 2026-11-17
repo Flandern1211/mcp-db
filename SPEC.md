@@ -128,14 +128,14 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 首版 PostgreSQL 实现约定：
 
 - 建库规格由服务端生成并持久绑定：数据库名形如 `mcpdb_<np|prod>_<10位随机>`，环境继承父 source；agent 只能提供父 source 与可选标签。规格写入审批请求参数摘要，admin 批准后重试只凭审批 id 与 token 消费已存规格，不重新生成名称。
-- 每库独立数据库身份：provision 账号建库后创建 `<db>_ro`（仅 SELECT）与 `<db>_rw`（库 owner）两个 LOGIN 角色，口令随机生成；query/explain 使用 `_ro`，mutate/schema 使用 `_rw`。DSN 写入加密凭证库并在写后热加载；DSN、口令不进入审批摘要、审计或日志。
+- 每库独立数据库身份：provision 账号建库后创建 `<db>_ro`（仅 SELECT）与 `<db>_rw`（可创建库内对象）两个 LOGIN 角色，口令随机生成；query/explain 使用 `_ro`，mutate/schema 使用 `_rw`。数据库 owner 保留给 provision 账号，普通 profile 不复用该身份。DSN 写入加密凭证库并在写后热加载；DSN、口令不进入审批摘要、审计或日志。provision 管理凭证限定在 `keyring:provision/` 命名空间，普通 profile 不得引用。
 - 结果 grants 由模板决定：非生产默认只授予只读 tools，可用 `MCPDB_PROVISION_RESULT_TOOLS` 收紧或扩展；生产新库一律只读。结果 grants 永不含 `create_database`。
 - 配额参数：`MCPDB_PROVISION_MAX_ACTIVE`（默认 5）与 `MCPDB_PROVISION_MIN_INTERVAL_MS`（默认 60000）可收紧数量与频率；数量按未归档子 source 统计，频率窗口计入已预留请求。
 - 未知与部分成功：数据库已创建但角色、凭证或本地登记失败时保留隔离预留，阻塞同 token × 父 source 后续建库，等待 admin 核对结算；服务器明确拒绝的语句视为未创建并释放预留。
 
 ### 3.6 Source 生命周期
 
-归档和恢复仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。
+归档和恢复仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。首版通过本机 CLI 提供审批、归档/恢复和隔离预留结算；Web 管理面见后续管理任务。
 
 ## 4. 需求与验收
 

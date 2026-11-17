@@ -14,6 +14,7 @@ use tokio::net::TcpListener;
 
 use crate::auth::parse_bearer;
 use crate::mcp::{AppState, McpDbServer, PeerElicitation};
+use crate::provision::Provisioner;
 use crate::{Config, Error, MetadataProvider, SqlExecutor, Store, DEFAULT_MAX_ROWS};
 
 pub async fn run(
@@ -21,6 +22,7 @@ pub async fn run(
     store: Arc<Mutex<Store>>,
     metadata: Arc<dyn MetadataProvider>,
     executor: Arc<dyn SqlExecutor>,
+    provisioner: Arc<dyn Provisioner>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(&config.addr).await?;
     println!(
@@ -34,6 +36,8 @@ pub async fn run(
             store,
             metadata,
             executor,
+            provisioner,
+            provision_limits: config.provision_limits.clone(),
             rate_limiter: Arc::new(crate::limits::TokenRateLimiter::new(
                 config.token_requests_per_minute,
                 crate::limits::DEFAULT_TOKEN_RATE_WINDOW,

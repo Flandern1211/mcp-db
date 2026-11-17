@@ -21,14 +21,20 @@ use crate::approval::{
 };
 use crate::executor::SqlExecutor;
 use crate::metadata::MetadataProvider;
+use crate::provision::{self, ProvisionSpec, Provisioner};
 use crate::sql_policy::{validate_for_tool, ValidatedSql};
-use crate::{ApprovalPolicy, AuthorizedCall, Authorizer, Error, Store, TokenIdentity, Tool};
+use crate::{
+    ApprovalPolicy, AuthorizedCall, Authorizer, Error, ReservationStatus, Store, TokenIdentity,
+    Tool,
+};
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Arc<Mutex<Store>>,
     pub metadata: Arc<dyn MetadataProvider>,
     pub executor: Arc<dyn SqlExecutor>,
+    pub provisioner: Arc<dyn Provisioner>,
+    pub provision_limits: crate::provision::ProvisionLimits,
     pub rate_limiter: Arc<crate::limits::TokenRateLimiter>,
     pub elicitation: Arc<dyn ElicitationGate>,
     pub max_rows: usize,
@@ -70,6 +76,16 @@ struct SqlArgs {
 struct ApprovalResponse {
     #[schemars(description = "Approve this exact operation?")]
     approved: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct CreateDatabaseArgs {
+    #[schemars(description = "Parent source id; may be omitted when the token has one source")]
+    source: Option<String>,
+    #[schemars(description = "Optional 1-12 character lowercase label used in the database name")]
+    label: Option<String>,
+    #[schemars(description = "Approval id returned by a previous APPROVAL_REQUIRED response")]
+    approval_id: Option<i64>,
 }
 
 rmcp::elicit_safe!(ApprovalResponse);
@@ -453,6 +469,227 @@ impl McpDbServer {
             "message": "approval could not be completed",
         })))
     }
+
+    fn provision_precheck(
+        &self,
+        token_id: &str,
+        parent_source_id: &str,
+    ) -> std::result::Result<(), CallToolResult> {
+        let limits = &self.state.provision_limits;
+        let usage = {
+            let store = match self.state.store.lock() {
+                Ok(store) => store,
+                Err(_) => return Err(state_unavailable()),
+            };
+            store.provision_usage(
+                token_id,
+                parent_source_id,
+                now_ms(),
+                limits.min_interval_ms(),
+            )
+        };
+        let usage = match usage {
+            Ok(usage) => usage,
+            Err(error) => return Err(tool_error(error)),
+        };
+        if usage.quarantined > 0 {
+            return Err(tool_error(Error::ProvisionBlocked(
+                "an unsettled provisioning reservation must be reconciled by an admin".to_string(),
+            )));
+        }
+        if usage.active >= i64::from(limits.max_active()) {
+            return Err(tool_error(Error::ResourceLimit(
+                "provision active database quota reached".to_string(),
+            )));
+        }
+        if usage.recent > 0 {
+            return Err(tool_error(Error::ResourceLimit(
+                "provision creation rate reached; retry after the interval".to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    async fn run_provision_approval(
+        &self,
+        context: &RequestContext<RoleServer>,
+        approval_id: i64,
+        identity: &TokenIdentity,
+    ) -> Result<CallToolResult, McpError> {
+        let record = {
+            let store = self.lock_store()?;
+            match store.get_approval(approval_id) {
+                Ok(record) => record,
+                Err(Error::NotFound(_)) => return Ok(claim_error(ClaimOutcome::NotFound)),
+                Err(error) => return Ok(tool_error(error)),
+            }
+        };
+        if record.draft.tool != Tool::CreateDatabase {
+            return Ok(tool_error(Error::InvalidInput(
+                "approval does not belong to create_database".to_string(),
+            )));
+        }
+        let spec = match ProvisionSpec::from_json(&record.draft.params_json) {
+            Ok(spec) => spec,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        let claim = {
+            let store = self.lock_store()?;
+            store.claim_provision(
+                approval_id,
+                &identity.token_id,
+                &record.request_digest,
+                &spec.database,
+                &self.state.provision_limits,
+                now_ms(),
+            )
+        };
+        match claim {
+            Ok(ClaimOutcome::Claimed(record)) => {
+                self.execute_provision(context, *record, spec).await
+            }
+            Ok(other) => Ok(claim_error(other)),
+            Err(error) => Ok(tool_error(error)),
+        }
+    }
+
+    async fn execute_provision(
+        &self,
+        context: &RequestContext<RoleServer>,
+        record: ApprovalRecord,
+        spec: ProvisionSpec,
+    ) -> Result<CallToolResult, McpError> {
+        let profile = {
+            let store = self.lock_store()?;
+            store
+                .get_profile(record.draft.profile_id)
+                .map_err(store_error)?
+        };
+        let result = tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => Err(Error::ExecutionUnknown),
+            result = self.state.provisioner.create(&profile, &spec) => result,
+        };
+        let reservation = {
+            let store = self.lock_store()?;
+            store
+                .reservation_for_approval(record.id)
+                .map_err(store_error)?
+        };
+        let Some(reservation) = reservation else {
+            return Ok(CallToolResult::structured_error(json!({
+                "code": "PROVISION_STATE_UNAVAILABLE",
+                "message": "quota reservation is missing for the approved request",
+                "approvalId": record.id,
+            })));
+        };
+        if let Err(error) = result {
+            let unknown = matches!(error, Error::ExecutionUnknown);
+            let reason = if unknown {
+                "EXECUTION_UNKNOWN"
+            } else {
+                "EXECUTION_NOT_STARTED"
+            };
+            let settlement = if unknown {
+                ReservationStatus::Quarantined
+            } else {
+                ReservationStatus::Released
+            };
+            {
+                let store = self.lock_store()?;
+                store
+                    .settle_reservation(reservation.id, settlement, Some(reason), now_ms())
+                    .map_err(store_error)?;
+            }
+            {
+                let store = self.lock_store()?;
+                store
+                    .finish_approval(
+                        record.id,
+                        if unknown {
+                            ApprovalOutcome::Unknown
+                        } else {
+                            ApprovalOutcome::Failed
+                        },
+                        None,
+                        Some(reason),
+                        now_ms(),
+                    )
+                    .map_err(store_error)?;
+            }
+            return Ok(tool_error(error));
+        }
+        let identity = TokenIdentity {
+            token_id: record.draft.token_id.clone(),
+            agent: record.draft.agent.clone(),
+        };
+        let input = match provision::result_source(&spec, &record.draft.source_id, &identity) {
+            Ok(input) => input,
+            Err(error) => {
+                return self.provision_registration_failed(record, reservation.id, &error)
+            }
+        };
+        let registered = {
+            let store = self.lock_store()?;
+            store.register_provisioned_source(&input, reservation.id, now_ms())
+        };
+        let source = match registered {
+            Ok(source) => source,
+            Err(error) => {
+                return self.provision_registration_failed(record, reservation.id, &error)
+            }
+        };
+        {
+            let store = self.lock_store()?;
+            store
+                .finish_approval(record.id, ApprovalOutcome::Succeeded, None, None, now_ms())
+                .map_err(store_error)?;
+        }
+        Ok(CallToolResult::structured(json!({
+            "source": source.id,
+            "database": spec.database,
+            "environment": spec.environment,
+            "resultTools": spec.result_tools,
+            "approvalId": record.id,
+        })))
+    }
+
+    fn provision_registration_failed(
+        &self,
+        record: ApprovalRecord,
+        reservation_id: i64,
+        error: &Error,
+    ) -> Result<CallToolResult, McpError> {
+        {
+            let store = self.lock_store()?;
+            store
+                .settle_reservation(
+                    reservation_id,
+                    ReservationStatus::Quarantined,
+                    Some("REGISTRATION_FAILED"),
+                    now_ms(),
+                )
+                .map_err(store_error)?;
+        }
+        {
+            let store = self.lock_store()?;
+            store
+                .finish_approval(
+                    record.id,
+                    ApprovalOutcome::Unknown,
+                    None,
+                    Some("PROVISION_REGISTRATION_FAILED"),
+                    now_ms(),
+                )
+                .map_err(store_error)?;
+        }
+        Ok(CallToolResult::structured_error(json!({
+            "code": "PROVISION_REGISTRATION_FAILED",
+            "message": "database was created but local registration failed; admin reconciliation is required",
+            "approvalId": record.id,
+            "detail": error.to_string(),
+        })))
+    }
 }
 
 #[tool_router]
@@ -613,6 +850,71 @@ impl McpDbServer {
             .await
     }
 
+    #[tool(description = "Request creation of a new database; always requires admin approval.")]
+    async fn create_database(
+        &self,
+        context: RequestContext<RoleServer>,
+        Parameters(args): Parameters<CreateDatabaseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let identity = request_identity(&context)?;
+        let call =
+            match self.authorize_call(&identity, args.source.as_deref(), Tool::CreateDatabase) {
+                Ok(call) => call,
+                Err(result) => return Ok(result),
+            };
+        if let Some(approval_id) = args.approval_id {
+            return self
+                .run_provision_approval(&context, approval_id, &identity)
+                .await;
+        }
+        if let Err(result) = self.provision_precheck(&identity.token_id, &call.source.id) {
+            return Ok(result);
+        }
+        let spec = match ProvisionSpec::generate(
+            call.source.environment,
+            &self.state.provision_limits,
+            args.label.as_deref(),
+        ) {
+            Ok(spec) => spec,
+            Err(error) => return Ok(tool_error(error)),
+        };
+        let draft = ApprovalDraft {
+            token_id: call.identity.token_id.clone(),
+            agent: call.identity.agent.clone(),
+            source_id: call.source.id.clone(),
+            source_environment: call.source.environment,
+            tool: Tool::CreateDatabase,
+            sql: None,
+            params_json: spec.to_json(),
+            profile_id: call.profile.id,
+            profile_version: call.profile.version,
+            route_id: call.route.id,
+            route_version: call.route.version,
+            grant_policy: call.grant_policy,
+            route_min_policy: call.route.min_approval_policy,
+            high_risk: true,
+        };
+        let record = match self.insert_approval(
+            &draft,
+            ApprovalChannel::Admin,
+            ApprovalStatus::Pending,
+            now_ms(),
+            None,
+        ) {
+            Ok(record) => record,
+            Err(result) => return Ok(result),
+        };
+        Ok(CallToolResult::structured_error(json!({
+            "code": "APPROVAL_REQUIRED",
+            "message": "database creation requires admin approval",
+            "approvalId": record.id,
+            "source": call.source.id,
+            "database": spec.database,
+            "environment": spec.environment,
+            "resultTools": spec.result_tools,
+        })))
+    }
+
     #[tool(description = "Return the database query plan for one read-only statement.")]
     async fn explain_query(
         &self,
@@ -734,8 +1036,9 @@ impl ServerHandler for McpDbServer {
         }
         let cancellation = context.ct.clone();
         let router = Self::tool_router();
-        let result = if tool.is_write() {
-            // Write handlers persist the conservative outcome before returning from cancellation.
+        let result = if tool.is_write() || tool == Tool::CreateDatabase {
+            // Write and provisioning handlers record the conservative outcome before
+            // returning from cancellation.
             router
                 .call(ToolCallContext::new(self, request, context))
                 .await
@@ -823,6 +1126,8 @@ fn tool_error(error: Error) -> CallToolResult {
         Error::MetadataUnavailable => "METADATA_UNAVAILABLE",
         Error::CredentialUnavailable => "CREDENTIAL_UNAVAILABLE",
         Error::ResourceLimit(_) => "RESOURCE_LIMIT",
+        Error::ProvisionBlocked(_) => "PROVISION_BLOCKED",
+        Error::ProvisionUnavailable(_) => "PROVISION_UNAVAILABLE",
         Error::ExecutionNotStarted(_) => "EXECUTION_NOT_STARTED",
         Error::ExecutionUnknown => "EXECUTION_UNKNOWN",
         Error::SqlRejected(_) => "SQL_REJECTED",
