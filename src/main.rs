@@ -3,9 +3,10 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use mcp_db::{
-    check_health, Config, EncryptedFileResolver, MetadataProvider, PostgresExecutor,
-    PostgresMetadata, SqlExecutor, Store, UnavailableExecutor, UnavailableMetadata, DEFAULT_ADDR,
-    HEALTHCHECK_ADDR,
+    check_health, ApprovalPolicy, AuditEvent, Config, Driver, EncryptedFileResolver, Environment,
+    MetadataProvider, NewGrant, NewProfile, NewRoute, NewSource, PostgresExecutor,
+    PostgresMetadata, ProfilePurpose, SqlExecutor, Store, Tool, UnavailableExecutor,
+    UnavailableMetadata, ADMIN_LOGIN_TTL_MS, DEFAULT_ADDR, HEALTHCHECK_ADDR,
 };
 
 fn main() -> ExitCode {
@@ -36,7 +37,14 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
         Some(command)
             if matches!(
                 command,
-                "approvals"
+                "admin-login-token"
+                    | "sources"
+                    | "profiles"
+                    | "routes"
+                    | "tokens"
+                    | "grants"
+                    | "audit"
+                    | "approvals"
                     | "approve"
                     | "deny"
                     | "archive-source"
@@ -102,8 +110,9 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
-        env!("CARGO_PKG_VERSION")
+        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction>\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
+        env!("CARGO_PKG_VERSION"),
+        mcp_db::ADMIN_ADDR
     );
 }
 
@@ -127,6 +136,322 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
         .map_err(|error| format!("state init failed: {error}"))?;
     let now = now_ms();
     match command {
+        "admin-login-token" => {
+            let token = store
+                .create_admin_login_token(now, ADMIN_LOGIN_TTL_MS)
+                .map_err(|error| error.to_string())?;
+            // Plaintext is printed exactly once; only the hash is persisted.
+            println!("{token}");
+            eprintln!("one-time admin login token, valid for 5 minutes");
+            Ok(())
+        }
+        "sources" => match args.next().as_deref() {
+            Some("add") => {
+                let id = args.next().ok_or("sources add requires a source id")?;
+                let environment = Environment::parse(
+                    &args
+                        .next()
+                        .ok_or("sources add requires production|nonproduction")?,
+                )
+                .map_err(|error| error.to_string())?;
+                let source = store
+                    .create_source(&NewSource {
+                        id,
+                        driver: Driver::Postgres,
+                        environment,
+                        parent_source_id: None,
+                        created_token_id: None,
+                        created_agent: None,
+                        created_origin: Some("admin-cli".to_string()),
+                    })
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "created source {} ({})",
+                    source.id,
+                    source.environment.as_str()
+                );
+                record_admin_audit(
+                    &store,
+                    "admin_source_added",
+                    "source",
+                    Some(source.id.as_str()),
+                    None,
+                )?;
+                Ok(())
+            }
+            None => {
+                let sources = store
+                    .list_all_sources()
+                    .map_err(|error| error.to_string())?;
+                if sources.is_empty() {
+                    println!("no sources");
+                }
+                for source in sources {
+                    println!(
+                        "{}  {}  {}",
+                        source.id,
+                        source.environment.as_str(),
+                        source.status.as_str()
+                    );
+                }
+                Ok(())
+            }
+            Some(other) => Err(format!("unknown sources subcommand: {other}")),
+        },
+        "profiles" => match args.next().as_deref() {
+            Some("add") => {
+                let source_id = args.next().ok_or("profiles add requires a source id")?;
+                let name = args.next().ok_or("profiles add requires a profile name")?;
+                let purpose =
+                    ProfilePurpose::parse(&args.next().ok_or("profiles add requires a purpose")?)
+                        .map_err(|error| error.to_string())?;
+                let credential_ref = args
+                    .next()
+                    .ok_or("profiles add requires a keyring credential reference")?;
+                let max_connections = match args.next() {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| "max_connections must be a number".to_string())?,
+                    ),
+                };
+                let statement_timeout_ms = match args.next() {
+                    None => None,
+                    Some(value) => Some(
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| "statement_timeout_ms must be a number".to_string())?,
+                    ),
+                };
+                let profile = store
+                    .create_profile(&NewProfile {
+                        source_id,
+                        name,
+                        purpose,
+                        credential_ref,
+                        max_connections,
+                        statement_timeout_ms,
+                    })
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "profile {}  {}/{}  {}  enabled={}",
+                    profile.id,
+                    profile.source_id,
+                    profile.name,
+                    profile.purpose.as_str(),
+                    profile.enabled
+                );
+                record_admin_audit(
+                    &store,
+                    "admin_profile_added",
+                    "profile",
+                    Some(profile.source_id.as_str()),
+                    None,
+                )?;
+                Ok(())
+            }
+            Some(source_id) => {
+                let profiles = store
+                    .list_profiles(source_id)
+                    .map_err(|error| error.to_string())?;
+                if profiles.is_empty() {
+                    println!("no profiles for source {source_id}");
+                }
+                for profile in profiles {
+                    println!(
+                        "{}  {}  {}  enabled={}  version={}",
+                        profile.id,
+                        profile.name,
+                        profile.purpose.as_str(),
+                        profile.enabled,
+                        profile.version
+                    );
+                }
+                Ok(())
+            }
+            None => Err("profiles requires a source id or 'add'".to_string()),
+        },
+        "routes" => match args.next().as_deref() {
+            Some("add") => {
+                let source_id = args.next().ok_or("routes add requires a source id")?;
+                let tool = Tool::parse(&args.next().ok_or("routes add requires a tool name")?)
+                    .map_err(|error| error.to_string())?;
+                let profile_id = args
+                    .next()
+                    .ok_or("routes add requires a profile id")?
+                    .parse::<i64>()
+                    .map_err(|_| "profile id must be a number".to_string())?;
+                let policy = match args.next() {
+                    None => default_policy(tool),
+                    Some(value) => {
+                        ApprovalPolicy::parse(&value).map_err(|error| error.to_string())?
+                    }
+                };
+                let route = store
+                    .create_route(&NewRoute {
+                        source_id,
+                        tool,
+                        profile_id,
+                        min_approval_policy: policy,
+                    })
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "route {}  {}/{}  profile={}  min_policy={}",
+                    route.id,
+                    route.source_id,
+                    route.tool.as_str(),
+                    route.profile_id,
+                    route.min_approval_policy.as_str()
+                );
+                record_admin_audit(
+                    &store,
+                    "admin_route_added",
+                    "route",
+                    Some(route.source_id.as_str()),
+                    None,
+                )?;
+                Ok(())
+            }
+            Some(other) => Err(format!("unknown routes subcommand: {other}")),
+            None => Err("routes requires the 'add' subcommand".to_string()),
+        },
+        "tokens" => match args.next().as_deref() {
+            Some("issue") => {
+                let agent = args.next().ok_or("tokens issue requires an agent name")?;
+                let issued = store
+                    .create_token(&agent)
+                    .map_err(|error| error.to_string())?;
+                println!("token_id: {}", issued.token_id);
+                println!("token: {}", issued.token);
+                eprintln!("store the token now; it cannot be shown again");
+                record_admin_audit(
+                    &store,
+                    "admin_token_issued",
+                    "token",
+                    None,
+                    Some(issued.token_id.as_str()),
+                )?;
+                Ok(())
+            }
+            Some("revoke") => {
+                let token_id = args.next().ok_or("tokens revoke requires a token id")?;
+                store
+                    .revoke_token(&token_id)
+                    .map_err(|error| error.to_string())?;
+                println!("revoked {token_id}");
+                record_admin_audit(
+                    &store,
+                    "admin_token_revoked",
+                    "token",
+                    None,
+                    Some(token_id.as_str()),
+                )?;
+                Ok(())
+            }
+            Some(other) => Err(format!("unknown tokens subcommand: {other}")),
+            None => Err("tokens requires 'issue' or 'revoke'".to_string()),
+        },
+        "grants" => match args.next().as_deref() {
+            Some("add") => {
+                let token_id = args.next().ok_or("grants add requires a token id")?;
+                let source_id = args.next().ok_or("grants add requires a source id")?;
+                let tool = Tool::parse(&args.next().ok_or("grants add requires a tool name")?)
+                    .map_err(|error| error.to_string())?;
+                let policy = match args.next() {
+                    None => None,
+                    Some(value) => {
+                        Some(ApprovalPolicy::parse(&value).map_err(|error| error.to_string())?)
+                    }
+                };
+                let grant = store
+                    .create_grant(&NewGrant {
+                        token_id,
+                        source_id,
+                        tool,
+                        policy,
+                    })
+                    .map_err(|error| error.to_string())?;
+                println!(
+                    "grant {}  {}/{}  policy={}",
+                    grant.token_id,
+                    grant.source_id,
+                    grant.tool.as_str(),
+                    grant.policy.as_str()
+                );
+                record_admin_audit(
+                    &store,
+                    "admin_grant_added",
+                    "grant",
+                    Some(grant.source_id.as_str()),
+                    Some(grant.token_id.as_str()),
+                )?;
+                Ok(())
+            }
+            Some("revoke") => {
+                let token_id = args.next().ok_or("grants revoke requires a token id")?;
+                let source_id = args.next().ok_or("grants revoke requires a source id")?;
+                let tool = Tool::parse(&args.next().ok_or("grants revoke requires a tool name")?)
+                    .map_err(|error| error.to_string())?;
+                store
+                    .revoke_grant(&token_id, &source_id, tool)
+                    .map_err(|error| error.to_string())?;
+                println!("revoked {} {}/{}", token_id, source_id, tool.as_str());
+                record_admin_audit(
+                    &store,
+                    "admin_grant_revoked",
+                    "grant",
+                    Some(source_id.as_str()),
+                    Some(token_id.as_str()),
+                )?;
+                Ok(())
+            }
+            Some(token_id) => {
+                let grants = store
+                    .list_grants_for_token(token_id)
+                    .map_err(|error| error.to_string())?;
+                if grants.is_empty() {
+                    println!("no grants for token {token_id}");
+                }
+                for grant in grants {
+                    println!(
+                        "{}  {}  {}",
+                        grant.source_id,
+                        grant.tool.as_str(),
+                        grant.policy.as_str()
+                    );
+                }
+                Ok(())
+            }
+            None => Err("grants requires a token id or 'add'/'revoke'".to_string()),
+        },
+        "audit" => {
+            let limit = match args.next() {
+                None => 50,
+                Some(value) => value
+                    .parse::<usize>()
+                    .map_err(|_| "audit limit must be a number".to_string())?,
+            };
+            let events = store
+                .list_recent_audit(limit)
+                .map_err(|error| error.to_string())?;
+            if events.is_empty() {
+                println!("no audit events");
+            }
+            for event in events {
+                println!(
+                    "{}  {}  actor={}  tool={}  source={}  {}  {}",
+                    event.ts,
+                    event.event,
+                    event.actor,
+                    event.tool,
+                    event.source_id.as_deref().unwrap_or("-"),
+                    event.decision,
+                    event.reason_code.as_deref().unwrap_or("-")
+                );
+            }
+            Ok(())
+        }
         "approvals" => {
             let limit = match args.next() {
                 None => 20,
@@ -218,9 +543,55 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
     }
 }
 
+/// Records one admin CLI change. Only identifiers are written; tokens, hashes,
+/// DSNs and passwords never enter the audit row.
+fn record_admin_audit(
+    store: &Store,
+    event: &str,
+    tool: &str,
+    source_id: Option<&str>,
+    token_id: Option<&str>,
+) -> Result<(), String> {
+    let event = AuditEvent {
+        ts: now_ms(),
+        event: event.to_string(),
+        approval_id: None,
+        token_id: token_id.map(str::to_string),
+        agent: None,
+        source_id: source_id.map(str::to_string),
+        tool: tool.to_string(),
+        profile_id: None,
+        profile_version: None,
+        route_id: None,
+        route_version: None,
+        request_digest: None,
+        channel: None,
+        decision: "allowed".to_string(),
+        actor: "admin-cli".to_string(),
+        high_risk: false,
+        reason_code: None,
+        reason: None,
+        duration_ms: None,
+        row_count: None,
+        error_code: None,
+    };
+    store
+        .record_audit_event(&event)
+        .map_err(|error| error.to_string())
+}
+
+fn default_policy(tool: Tool) -> ApprovalPolicy {
+    if tool.is_write() || tool == Tool::CreateDatabase {
+        ApprovalPolicy::Approval
+    } else {
+        ApprovalPolicy::Direct
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mcp_db::auth::hash_token;
 
     #[test]
     fn unknown_argument_is_rejected() {
@@ -232,5 +603,49 @@ mod tests {
     fn version_and_help_succeed() {
         assert!(run(["--version".to_string()].into_iter()).is_ok());
         assert!(run(["--help".to_string()].into_iter()).is_ok());
+    }
+
+    #[test]
+    fn admin_cli_changes_are_audited_without_secrets() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = Store::open(dir.path().join("state.db")).expect("open store");
+        let issued = store.create_token("agent-a").expect("token");
+        let token_id = issued.token_id.as_str();
+        for (event, tool, source_id, token) in [
+            ("admin_source_added", "source", Some("a"), None),
+            ("admin_profile_added", "profile", Some("a"), None),
+            ("admin_route_added", "route", Some("a"), None),
+            ("admin_token_issued", "token", None, Some(token_id)),
+            ("admin_token_revoked", "token", None, Some(token_id)),
+            ("admin_grant_added", "grant", Some("a"), Some(token_id)),
+            ("admin_grant_revoked", "grant", Some("a"), Some(token_id)),
+        ] {
+            record_admin_audit(&store, event, tool, source_id, token).expect("audit event");
+        }
+
+        let events = store.list_recent_audit(10).expect("recent audit");
+        assert_eq!(events.len(), 7);
+        let names = events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>();
+        for expected in [
+            "admin_source_added",
+            "admin_profile_added",
+            "admin_route_added",
+            "admin_token_issued",
+            "admin_token_revoked",
+            "admin_grant_added",
+            "admin_grant_revoked",
+        ] {
+            assert!(names.contains(&expected), "missing {expected}");
+        }
+        for event in &events {
+            assert_eq!(event.actor, "admin-cli");
+            assert_eq!(event.decision, "allowed");
+        }
+        let rendered = format!("{events:?}");
+        assert!(!rendered.contains(&issued.token));
+        assert!(!rendered.contains(&hash_token(&issued.token)));
     }
 }

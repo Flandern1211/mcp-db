@@ -8,6 +8,9 @@
 - T-08 建库闭环：服务端生成库名与 `_ro`/`_rw` 身份并由 provision 账号保留库所有权；新库 DSN 写入加密凭证库后热加载，provision 管理凭证限定在 `keyring:provision/` 命名空间，普通 profile 不得引用。
 - 建库配额默认每 token × 父 source 5 个活动库、60 秒最多成功 1 个，可用 `MCPDB_PROVISION_*` 收紧；审批前检查，执行前原子预留；未知/部分成功隔离并阻塞后续创建，admin 结算后恢复，重启把执行中预留转为隔离。
 - 结果 grants 按管理员模板生成，生产新库强制只读且永不含 `create_database`；归档/恢复与审批通过本机 CLI 操作，归档不删除物理数据库。
+- T-09 本机管理面：新增独立管理监听 `MCPDB_ADMIN_ADDR`（默认 `127.0.0.1:8788`），Web 提供登录、审批、审计、归档/恢复与隔离预留结算；Docker 必须把管理端口发布到宿主回环地址，admin 与 MCP 端口分离。
+- Web 登录使用 CLI 生成的 5 分钟一次性令牌（只存 SHA-256 hash），会话 1 小时且重启失效；cookie HttpOnly + SameSite=Strict，写请求校验 CSRF 与 Origin，Host 必须回环，agent Bearer 不能访问管理面。
+- CLI 补齐 source/profile/route/token/grant 管理与审计查询；每次管理变更写入 `admin_*` 审计，不含令牌明文、hash、DSN 或口令。
 
 ## 2026-11-16
 

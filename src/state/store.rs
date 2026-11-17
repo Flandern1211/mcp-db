@@ -17,7 +17,7 @@ use crate::state::model::{
     SourceStatus, TokenIdentity, Tool,
 };
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -208,6 +208,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS quota_reservations_approval
   ON quota_reservations(approval_id) WHERE approval_id IS NOT NULL;
 "#;
 
+/// One-time admin login tokens. Only the SHA-256 hash is stored; the plaintext is
+/// printed once by `mcp-db admin-login-token`.
+const MIGRATION_4: &str = r#"
+CREATE TABLE IF NOT EXISTS admin_login_tokens (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  token_hash TEXT NOT NULL UNIQUE,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS admin_login_tokens_expiry
+  ON admin_login_tokens(expires_at);
+"#;
+
 pub struct Store {
     conn: Connection,
 }
@@ -271,6 +285,13 @@ impl Store {
             transaction.execute_batch(MIGRATION_3)?;
             transaction.execute(
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
+                [now_ms()],
+            )?;
+        }
+        if version < 4 {
+            transaction.execute_batch(MIGRATION_4)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
                 [now_ms()],
             )?;
         }
@@ -354,6 +375,39 @@ impl Store {
             Ok(())
         } else {
             Err(Error::NotFound(format!("token {token_id}")))
+        }
+    }
+
+    /// Issues a new one-time admin login token and returns its plaintext exactly once.
+    pub fn create_admin_login_token(&self, now: i64, ttl_ms: i64) -> Result<String> {
+        // Expired one-time tokens have no further use; drop them so the table cannot
+        // grow without bound.
+        self.conn.execute(
+            "DELETE FROM admin_login_tokens WHERE expires_at <= ?",
+            [now],
+        )?;
+        let token = auth::generate_admin_login_token();
+        let hash = auth::hash_token(&token);
+        self.conn.execute(
+            "INSERT INTO admin_login_tokens (token_hash, created_at, expires_at) VALUES (?, ?, ?)",
+            params![hash, now, now.saturating_add(ttl_ms)],
+        )?;
+        Ok(token)
+    }
+
+    /// Consumes a login token exactly once. Any unknown, used or expired token is
+    /// rejected with the same error so callers cannot distinguish the cases.
+    pub fn consume_admin_login_token(&self, raw_token: &str, now: i64) -> Result<()> {
+        let hash = auth::hash_token(raw_token.trim());
+        let changed = self.conn.execute(
+            "UPDATE admin_login_tokens SET used_at = ?
+              WHERE token_hash = ? AND used_at IS NULL AND expires_at > ?",
+            params![now, hash, now],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Unauthenticated)
         }
     }
 
@@ -832,6 +886,21 @@ impl Store {
             .collect()
     }
 
+    /// Removes one grant so the next call is denied without re-issuing the token.
+    pub fn revoke_grant(&self, token_id: &str, source_id: &str, tool: Tool) -> Result<()> {
+        let changed = self.conn.execute(
+            "DELETE FROM tool_grants WHERE token_id = ? AND source_id = ? AND tool = ?",
+            params![token_id, source_id, tool.as_str()],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!(
+                "grant {source_id}/{}",
+                tool.as_str()
+            )));
+        }
+        Ok(())
+    }
+
     /// Sources with at least one grant and not archived. Used for discovery only.
     pub fn list_visible_sources(&self, token_id: &str) -> Result<Vec<Source>> {
         let mut statement = self.conn.prepare(
@@ -842,6 +911,15 @@ impl Store {
         )?;
         let ids = statement
             .query_map([token_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        ids.into_iter().map(|id| self.get_source(&id)).collect()
+    }
+
+    /// Every source, including archived ones. Used by the admin UI and CLI.
+    pub fn list_all_sources(&self) -> Result<Vec<Source>> {
+        let mut statement = self.conn.prepare("SELECT id FROM sources ORDER BY id")?;
+        let ids = statement
+            .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         ids.into_iter().map(|id| self.get_source(&id)).collect()
     }
@@ -1508,6 +1586,44 @@ impl Store {
             [approval_id],
             |row| row.get(0),
         )?)
+    }
+
+    /// Newest audit events first; ties break on insertion order (newest id first).
+    pub fn list_recent_audit(&self, limit: usize) -> Result<Vec<AuditEvent>> {
+        let mut statement = self.conn.prepare(
+            "SELECT ts, event, approval_id, token_id, agent, source_id, tool, profile_id,
+                    profile_version, route_id, route_version, request_digest, channel, decision,
+                    actor, high_risk, reason_code, reason, duration_ms, row_count, error_code
+               FROM audit_events ORDER BY ts DESC, id DESC LIMIT ?",
+        )?;
+        let rows = statement
+            .query_map([limit as i64], |row| {
+                Ok(AuditEvent {
+                    ts: row.get(0)?,
+                    event: row.get(1)?,
+                    approval_id: row.get(2)?,
+                    token_id: row.get(3)?,
+                    agent: row.get(4)?,
+                    source_id: row.get(5)?,
+                    tool: row.get(6)?,
+                    profile_id: row.get(7)?,
+                    profile_version: row.get(8)?,
+                    route_id: row.get(9)?,
+                    route_version: row.get(10)?,
+                    request_digest: row.get(11)?,
+                    channel: row.get(12)?,
+                    decision: row.get(13)?,
+                    actor: row.get(14)?,
+                    high_risk: row.get::<_, i64>(15)? != 0,
+                    reason_code: row.get(16)?,
+                    reason: row.get(17)?,
+                    duration_ms: row.get(18)?,
+                    row_count: row.get(19)?,
+                    error_code: row.get(20)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn get_token_identity(&self, token_id: &str) -> Result<TokenIdentity> {

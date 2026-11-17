@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use crate::auth::parse_bearer;
 use crate::mcp::{AppState, McpDbServer, PeerElicitation};
 use crate::provision::Provisioner;
+use crate::transport::admin::{admin_app, AdminState};
 use crate::{Config, Error, MetadataProvider, SqlExecutor, Store, DEFAULT_MAX_ROWS};
 
 pub async fn run(
@@ -25,12 +26,22 @@ pub async fn run(
     provisioner: Arc<dyn Provisioner>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(&config.addr).await?;
+    let admin_listener = TcpListener::bind(&config.admin_addr).await?;
     println!(
         "mcp-db {} listening on http://{}",
         env!("CARGO_PKG_VERSION"),
         config.addr
     );
-    axum::serve(
+    println!(
+        "mcp-db admin listening on http://{}/admin",
+        config.admin_addr
+    );
+    let admin_state = AdminState::new(
+        store.clone(),
+        config.provision_limits.clone(),
+        config.approval_execution_ttl_ms,
+    );
+    let server = axum::serve(
         listener,
         app(AppState {
             store,
@@ -48,8 +59,10 @@ pub async fn run(
             approval_execution_ttl_ms: config.approval_execution_ttl_ms,
             sessions: Default::default(),
         }),
-    )
-    .await
+    );
+    let admin_server = axum::serve(admin_listener, admin_app(admin_state));
+    tokio::try_join!(server, admin_server)?;
+    Ok(())
 }
 
 pub fn app(state: AppState) -> Router {

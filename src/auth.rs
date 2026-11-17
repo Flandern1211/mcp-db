@@ -14,6 +14,20 @@ pub fn generate_token_id() -> String {
     format!("tok_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// One-time admin login token. The plaintext is only ever shown once by the CLI.
+pub fn generate_admin_login_token() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("mcpdb_admin_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Random URL-safe secret used for admin session ids and CSRF values.
+pub fn generate_secret() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
 pub fn hash_token(token: &str) -> String {
     format!("{:x}", Sha256::digest(token.as_bytes()))
 }
@@ -41,6 +55,16 @@ mod tests {
         assert_eq!(hash_token(&first), hash_token(&first));
         assert_ne!(hash_token(&first), hash_token(&second));
         assert_eq!(hash_token(&first).len(), 64);
+    }
+
+    #[test]
+    fn admin_tokens_use_a_separate_prefix() {
+        let first = generate_admin_login_token();
+        let second = generate_admin_login_token();
+        assert!(first.starts_with("mcpdb_admin_"));
+        assert_ne!(first, second);
+        assert_eq!(hash_token(&first).len(), 64);
+        assert_ne!(generate_secret(), generate_secret());
     }
 
     #[test]
