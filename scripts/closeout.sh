@@ -45,6 +45,9 @@ done < <(git -C "$ROOT" worktree list --porcelain | awk '/^worktree /{print subs
 
 echo
 echo "-- branches"
+if ! git -C "$ROOT" rev-parse --verify --quiet "$INTEGRATION" >/dev/null; then
+  fail "integration branch '$INTEGRATION' not found"
+fi
 while IFS= read -r branch; do
   [ "$branch" = "$INTEGRATION" ] && continue
   count=$(git -C "$ROOT" rev-list --count "$INTEGRATION..$branch" 2>/dev/null || echo 0)
@@ -55,7 +58,7 @@ done < <(git -C "$ROOT" for-each-ref --format='%(refname:short)' refs/heads/)
 
 echo
 echo "-- containers"
-if command -v docker >/dev/null 2>&1; then
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   leftovers=$(docker ps -a --filter 'name=mcpdb-' --format '{{.Names}} ({{.Status}})' 2>/dev/null || true)
   if [ -n "$leftovers" ]; then
     while IFS= read -r line; do
@@ -65,7 +68,7 @@ if command -v docker >/dev/null 2>&1; then
     ok "no mcpdb-* containers"
   fi
 else
-  warn "docker not available; container check skipped"
+  warn "docker daemon not reachable; container check skipped"
 fi
 
 echo
