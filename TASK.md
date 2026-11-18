@@ -21,6 +21,7 @@
 | T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 未开始 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | — | — | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
 | T-12 | 实现凭证解析与 PostgreSQL 元数据 provider | 完整 | 🟢 已完成 | T-02 | AC2-01、AC2-09、AC2-11、AC2-12（凭证与元数据基础） | `c790f64`、`49883ea` | 无 | [tasks/2026-11-16-t-12-credentials-postgres-metadata.md](tasks/2026-11-16-t-12-credentials-postgres-metadata.md) |
 | T-13 | 完善本机 admin 页面 UI 与前端体验 | 完整 | 进行中 | T-09 | AC2-10（本机管理面体验） | — | — | [tasks/2026-11-18-t-13-admin-ui.md](tasks/2026-11-18-t-13-admin-ui.md) |
+| T-14 | 固化复盘规则、工程入口与收口检查 | 完整 | 🟡 待验收 | 无 | 流程基线：完成门禁、失败关闭、验收独立性、命令固化、收口检查 | `f30d9b4`、`ddc35aa` | 2 非阻塞 | [tasks/2026-11-18-t-14-process-hardening.md](tasks/2026-11-18-t-14-process-hardening.md) |
 
 ## 状态定义
 
