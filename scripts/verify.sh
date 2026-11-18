@@ -45,6 +45,7 @@ require_docker() {
   }
   docker info >/dev/null 2>&1 || {
     echo "verify: docker daemon is not reachable" >&2
+    echo "hint: check Docker Desktop; on Windows also check WSL networking (networkingMode=mirrored in %USERPROFILE%\\.wslconfig), then 'wsl --shutdown' and restart Docker." >&2
     exit 2
   }
 }
@@ -78,6 +79,11 @@ FULL_BODY="$FAST_BODY
 step build cargo build --release --locked"
 
 require_docker
+
+# Host disk guard: fail early instead of filling the drive during a long build.
+if [ -f "$ROOT/scripts/disk-guard.sh" ]; then
+  bash "$ROOT/scripts/disk-guard.sh" --check
+fi
 
 case "$MODE" in
   fmt) run_group fmt 'step fmt cargo fmt --check' ;;
