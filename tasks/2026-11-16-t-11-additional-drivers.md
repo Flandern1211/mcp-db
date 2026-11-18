@@ -61,12 +61,12 @@
 
 只读边界证据：query profile 以 `SQLITE_OPEN_READ_ONLY` 打开并设置 `PRAGMA query_only=ON`；连接交给工具前读取 `PRAGMA query_only` 必须为 1，并对已有表执行 `DELETE ... WHERE 0`、对 main schema 执行 `CREATE TABLE` 探针，只有 SQLite 返回只读/权限错误才放行。测试同时用独立只读连接直接尝试 DML/DDL，确认失败类型与夹具不变。
 
-本增量只新增 SQLite；MySQL/MariaDB、SQL Server 未实现，未修改 `TASK.md`/`CHANGELOG.md`，未提交。
+本增量只新增 SQLite；MySQL/MariaDB、SQL Server 未实现。
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：未开始。已接受风险：无。
+- 提交与 `TASK.md`：SQLite 增量 `6aa69f6`，合入 `bfc1b38`；T-11 保持进行中，未关闭项 2（MySQL/MariaDB、SQL Server）。独立复跑：`cargo test --locked` 123 passed/11 ignored，fmt/clippy 通过；`scripts/pgtest.sh` 9 passed 且临时库已删除。已接受风险：无。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未测试 | 增量驱动 AC | 任务未开始，依赖首版收口 | 非 PostgreSQL 驱动不可用 | 首版发布后按驱动逐个完成 spike 与真实边界验证 | 否 |
+| 🔴 未测试 | MySQL/MariaDB、SQL Server 增量 | 本增量只实现 SQLite；两种驱动的连接、方言策略、只读负向矩阵和真实实例验证尚未开始 | 非 PostgreSQL 之外仅 SQLite 可用；其他驱动明确拒绝 | 按驱动逐个实现并跑真实边界矩阵；关闭条件：各自 DML/DDL 拒绝、夹具不变、查询恢复 | 否 |
