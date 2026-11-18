@@ -18,7 +18,7 @@
 | T-08 | 实现 PostgreSQL 建库、配额与 source 生命周期 | 完整 | 🟢 已完成 | T-04～T-07 | AC2-17～AC2-21 | `d30cba5`、`31e9651` | 无 | [tasks/2026-11-13-t-08-provisioning-lifecycle.md](tasks/2026-11-13-t-08-provisioning-lifecycle.md) |
 | T-09 | 实现首版本机 CLI 与 Web 管理面 | 完整 | 🟢 已完成 | T-02、T-06、T-08 | AC2-10（首版本机）、AC2-21、AC2-22 | `2405712` | 无 | [tasks/2026-11-13-t-09-local-admin.md](tasks/2026-11-13-t-09-local-admin.md) |
 | T-10 | 完成首版 AC2 跨边界验收与发布收口 | 完整 | 🟢 已完成 | T-03～T-09 | AC2-01～AC2-23（首版 PostgreSQL 范围） | `c3d6fd4` | 无 | [tasks/2026-11-13-t-10-ac2-acceptance.md](tasks/2026-11-13-t-10-ac2-acceptance.md) |
-| T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 进行中 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | `6aa69f6` | 2 后续增量 | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
+| T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 进行中 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | `6aa69f6` | 1 后续增量 | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
 | T-12 | 实现凭证解析与 PostgreSQL 元数据 provider | 完整 | 🟢 已完成 | T-02 | AC2-01、AC2-09、AC2-11、AC2-12（凭证与元数据基础） | `c790f64`、`49883ea` | 无 | [tasks/2026-11-16-t-12-credentials-postgres-metadata.md](tasks/2026-11-16-t-12-credentials-postgres-metadata.md) |
 | T-13 | 完善本机 admin 页面 UI 与前端体验 | 完整 | 进行中 | T-09 | AC2-10（本机管理面体验） | — | — | [tasks/2026-11-18-t-13-admin-ui.md](tasks/2026-11-18-t-13-admin-ui.md) |
 | T-14 | 固化复盘规则、工程入口与收口检查 | 完整 | 🟢 已完成 | 无 | 流程基线：完成门禁、失败关闭、验收独立性、命令固化、收口检查 | `f30d9b4`、`f25869a`、`abb3e61` | 无 | [tasks/2026-11-18-t-14-process-hardening.md](tasks/2026-11-18-t-14-process-hardening.md) |
