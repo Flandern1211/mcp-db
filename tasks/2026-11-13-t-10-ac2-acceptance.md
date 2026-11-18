@@ -52,8 +52,9 @@
 | 自动化套件 | 门禁 1、10；AC2-01～23 | `cargo test --locked`；clippy；`cargo build --release --locked` | Docker Linux rust 1.89 | 114 passed, 11 ignored；clippy 严格；release 通过 | 无 |
 | 真实 PostgreSQL | 门禁 4、5、6、7 | 5 个测试目标 `--ignored` 顺序执行 | 隔离 PG16：rw/ro/provision 账号 + users/readonly_fixture | 9 passed：只读边界、容量/超时、建库/双角色/登记、MCP 查询与 SQL tools、真实建库 E2E | 无 |
 | 容器首用 | 门禁 1、2、3、4 | `docker build`；`-p 127.0.0.1:28787:8787 -p 127.0.0.1:28788:8788`；CLI sources/profiles/routes/tokens/grants；MCP initialize + query_sql | Docker Desktop Linux VM + 挂载卷 | user 10001、health healthy；CLI 全流程成功；`list_sources` 返回 app，query 返回 2 行；未授权 source 返回 `SOURCE_NOT_GRANTED` | 见缺口：Docker Desktop detached 首启竞态 |
-| 管理面 | 门禁 3、10 | `admin-login-token`；curl 登录/重放/agent token；dashboard | 同上 | 登录页 200、登录 303、dashboard 200、agent Bearer 401、令牌重放 401；页面含待批/审计且无凭证 | 浏览器人工验收待用户 |
-| 审批与重启 | 门禁 6、8 | 高危 `DELETE FROM users` → `APPROVAL_REQUIRED`；重启容器 | 同上 + PG | 高危不执行且数据不变；重启后 pending 变 `RESTART_PENDING`、grants/审计保留、查询恢复 | 真实 elicitation 客户端未执行（T-06 既有非阻塞项） |
+| 管理面 | 门禁 3、10 | `admin-login-token`；curl 登录/重放/agent token；dashboard | 同上 | 登录页 200、登录 303、dashboard 200、agent Bearer 401、令牌重放 401；页面含待批/审计且无凭证 | 无 |
+| 管理面人工（真实浏览器） | 门禁 3、21 | Ego Lite（Chromium）打开 `http://127.0.0.1:28788/admin`：一次性令牌登录 → 查看 Pending approvals/Sources/Quarantined reservations/Recent audit → 点击 Archive → 点击 Restore | 本机真实浏览器 + 容器 | 登录成功进入 dashboard；UI Archive 后 CLI 显示 archived 且 MCP 返回 `SOURCE_ARCHIVED`；UI Restore 后恢复 active、查询成功；审计出现 `archived`/`restored`（actor `admin-web`） | 无（由主 agent 代替用户完成） |
+| 审批与重启 | 门禁 6、8 | 高危 `DELETE FROM users` → `APPROVAL_REQUIRED`；重启容器 | 同上 + PG | 高危不执行且数据不变；重启后 pending 变 `RESTART_PENDING`、grants/审计保留、查询恢复 | 真实 elicitation 客户端未执行（用户已接受风险） |
 | 迁移 | 门禁 9 | `cargo test --locked --test legacy_migration` | 临时目录 legacy 夹具 | 10 passed：矩阵、无建库能力、sanitized TOML、0600 备份、两处崩溃恢复、拒绝路径 | 无 |
 | 文档与一致性 | 门禁 1、9 | 检查 `docs/PRD.md`、`SPEC.md`、`TASK.md`、任务文件交叉引用 | 仓库 | 首版范围、远程/驱动未覆盖项、迁移限制一致 | 无 |
 
@@ -62,10 +63,9 @@
 
 ## 5. 交付
 
-- 提交与 `TASK.md`：`c3d6fd4`，合入 `a415383`；🟡 待验收，未关闭项 3 非阻塞。已接受风险：无。
+- 提交与 `TASK.md`：`c3d6fd4`，合入 `a415383`；🟡 待验收，Docker 首启竞态修复中。
+- 已接受风险：真实 MCP 客户端 elicitation 未测；确认人/日期：用户 2026-11-18 选择“只接受 elicitation”；范围：门禁 6 的 elicitation 分支，不影响 admin 审批、状态机与外部执行结果。仍未执行，验证事实不因接受而改变。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未验收 | 管理页浏览器体验 | 自动化只能验证状态码与内容，最终体验需人确认 | 门禁 3 的用户侧确认缺失 | 启动容器后执行 `docker exec mcpdb-t10-smoke mcp-db admin-login-token`，浏览器打开 `http://127.0.0.1:28788/admin` 完成登录、审批、审计查看；关闭条件：用户确认 | 否 |
-| 🔴 未测试 | 真实 MCP 客户端 elicitation | 只有 fake gate 与 admin 队列证据，无真实客户端 accept/decline 会话 | 门禁 6 的 elicitation 分支未在真实客户端验证；不影响 admin 审批与状态机 | 在支持 elicitation 的客户端执行 accept/decline/cancel 并记录；关闭条件：三条真实交互证据 | 否 |
-| 🔴 未测试 | Docker Desktop detached 首启 | 默认 entrypoint 直接 `-d` 启动时读取挂载凭证失败，`sleep 2` 后正常；Linux 目标环境未复现 | Docker Desktop Windows 用户可能首次启动失败 | 后续在凭证初始化加入短重试或文档说明；关闭条件：default entrypoint 连续 3 次 detached 首启成功 | 否 |
+| 🔴 未测试 | Docker Desktop detached 首启 | 默认 entrypoint 直接 `-d` 启动时读取挂载凭证失败，`sleep 2` 后正常；已加入凭证读取短重试，待验证 | Docker Desktop Windows 用户可能首次启动失败 | 重建镜像后以默认 entrypoint 连续 3 次 detached 首启；关闭条件：3 次均 healthy | 否 |
