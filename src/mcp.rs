@@ -22,10 +22,10 @@ use crate::approval::{
 use crate::executor::SqlExecutor;
 use crate::metadata::MetadataProvider;
 use crate::provision::{self, ProvisionSpec, Provisioner};
-use crate::sql_policy::{validate_for_tool, ValidatedSql};
+use crate::sql_policy::{validate_for_driver_tool, ValidatedSql};
 use crate::{
-    ApprovalPolicy, AuthorizedCall, Authorizer, Error, ReservationStatus, Store, TokenIdentity,
-    Tool,
+    ApprovalPolicy, AuthorizedCall, Authorizer, Driver, Error, ReservationStatus, Store,
+    TokenIdentity, Tool,
 };
 
 #[derive(Clone)]
@@ -529,6 +529,18 @@ impl McpDbServer {
                 "approval does not belong to create_database".to_string(),
             )));
         }
+        let driver = {
+            let store = self.lock_store()?;
+            match store.get_source(&record.draft.source_id) {
+                Ok(source) => source.driver,
+                Err(error) => return Ok(tool_error(error)),
+            }
+        };
+        if driver != Driver::Postgres {
+            return Ok(tool_error(Error::ProvisionUnavailable(
+                "this driver has no database creation capability".to_string(),
+            )));
+        }
         let spec = match ProvisionSpec::from_json(&record.draft.params_json) {
             Ok(spec) => spec,
             Err(error) => return Ok(tool_error(error)),
@@ -784,10 +796,11 @@ impl McpDbServer {
             Ok(call) => call,
             Err(result) => return Ok(result),
         };
-        let validated = match validate_for_tool(&args.sql, Tool::QuerySql) {
-            Ok(validated) => validated,
-            Err(error) => return Ok(tool_error(error)),
-        };
+        let validated =
+            match validate_for_driver_tool(&args.sql, Tool::QuerySql, call.source.driver) {
+                Ok(validated) => validated,
+                Err(error) => return Ok(tool_error(error)),
+            };
         let outcome = match self
             .state
             .executor
@@ -823,10 +836,11 @@ impl McpDbServer {
             Ok(call) => call,
             Err(result) => return Ok(result),
         };
-        let validated = match validate_for_tool(&args.sql, Tool::MutateSql) {
-            Ok(validated) => validated,
-            Err(error) => return Ok(tool_error(error)),
-        };
+        let validated =
+            match validate_for_driver_tool(&args.sql, Tool::MutateSql, call.source.driver) {
+                Ok(validated) => validated,
+                Err(error) => return Ok(tool_error(error)),
+            };
         self.execute_write(&context, call, validated, args.params, args.approval_id)
             .await
     }
@@ -842,10 +856,11 @@ impl McpDbServer {
             Ok(call) => call,
             Err(result) => return Ok(result),
         };
-        let validated = match validate_for_tool(&args.sql, Tool::ExecuteDdl) {
-            Ok(validated) => validated,
-            Err(error) => return Ok(tool_error(error)),
-        };
+        let validated =
+            match validate_for_driver_tool(&args.sql, Tool::ExecuteDdl, call.source.driver) {
+                Ok(validated) => validated,
+                Err(error) => return Ok(tool_error(error)),
+            };
         self.execute_write(&context, call, validated, args.params, args.approval_id)
             .await
     }
@@ -862,6 +877,11 @@ impl McpDbServer {
                 Ok(call) => call,
                 Err(result) => return Ok(result),
             };
+        if call.source.driver != Driver::Postgres {
+            return Ok(tool_error(Error::ProvisionUnavailable(
+                "this driver has no database creation capability".to_string(),
+            )));
+        }
         if let Some(approval_id) = args.approval_id {
             return self
                 .run_provision_approval(&context, approval_id, &identity)
@@ -927,10 +947,11 @@ impl McpDbServer {
             Ok(call) => call,
             Err(result) => return Ok(result),
         };
-        let validated = match validate_for_tool(&args.sql, Tool::ExplainQuery) {
-            Ok(validated) => validated,
-            Err(error) => return Ok(tool_error(error)),
-        };
+        let validated =
+            match validate_for_driver_tool(&args.sql, Tool::ExplainQuery, call.source.driver) {
+                Ok(validated) => validated,
+                Err(error) => return Ok(tool_error(error)),
+            };
         let plan = match self
             .state
             .executor

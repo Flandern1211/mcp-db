@@ -167,7 +167,7 @@ fn models_persist_across_restart() {
         store.list_grants_for_token(&issued.token_id).unwrap().len(),
         2
     );
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn legacy_approvals_and_audit_survive_upgrade() {
     drop(connection);
 
     let store = Store::open(&path).expect("upgrade store");
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     assert!(store.authenticate("legacy-token").is_err());
     drop(store);
 
