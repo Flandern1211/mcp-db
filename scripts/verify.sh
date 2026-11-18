@@ -10,11 +10,11 @@
 #   full    fast + release build + docker build
 #   real    isolated PostgreSQL integration tests (scripts/pgtest.sh)
 #
-# All Rust steps run in the pinned image; the host toolchain is never used.
-# Each worktree gets its own target volume so parallel tasks do not share
-# build locks or cross-branch artifacts.
+# All Rust steps run in one pinned container per invocation; the host toolchain
+# is never used. Each worktree gets its own target volume so parallel tasks do
+# not share build locks or cross-branch artifacts.
 #
-# Override with MCPDB_RUST_IMAGE, MCPDB_RUST_TOOLCHAIN, MCPDB_STEP_TIMEOUT,
+# Override with MCPDB_RUST_IMAGE, MCPDB_RUST_TOOLCHAIN, MCPDB_TIMEOUT,
 # MCPDB_CARGO_REGISTRY_VOL, MCPDB_CARGO_TARGET_VOL.
 
 set -euo pipefail
@@ -27,11 +27,11 @@ IMAGE=${MCPDB_RUST_IMAGE:-rust:1.89-slim-bookworm}
 TOOLCHAIN=${MCPDB_RUST_TOOLCHAIN:-1.89.0}
 REGISTRY_VOL=${MCPDB_CARGO_REGISTRY_VOL:-mcpdb-cargo-registry}
 TARGET_VOL=${MCPDB_CARGO_TARGET_VOL:-mcpdb-cargo-target-$HASH}
-STEP_TIMEOUT=${MCPDB_STEP_TIMEOUT:-900}
+TIMEOUT=${MCPDB_TIMEOUT:-${MCPDB_STEP_TIMEOUT:-1800}}
 MODE=${1:-fast}
 
 usage() {
-  sed -n '3,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '3,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 require_docker() {
@@ -49,41 +49,44 @@ require_docker() {
   }
 }
 
-run_step() {
-  local name=$1
-  local cmd=$2
+run_group() {
+  local label=$1
+  local body=$2
   local start=$SECONDS
-  printf '\n== %s ==\n' "$name"
-  if ! timeout "$STEP_TIMEOUT" docker run --rm \
+  printf '\n== %s ==\n' "$label"
+  if ! timeout "$TIMEOUT" docker run --rm \
     -e RUSTUP_TOOLCHAIN="$TOOLCHAIN" \
     -v "$ROOT_WIN:/work" \
     -v "$REGISTRY_VOL:/usr/local/cargo/registry" \
     -v "$TARGET_VOL:/work/target" \
     -w /work "$IMAGE" \
-    sh -c "cargo $cmd"; then
-    printf 'FAILED %s (%ss)\n' "$name" "$((SECONDS - start))"
+    sh -c "set -e
+step() { n=\$1; shift; echo \"== \$n ==\"; s=\$(date +%s); \"\$@\"; echo \"OK \$n (\$(( \$(date +%s) - s ))s)\"; }
+rustup component add rustfmt clippy >/dev/null 2>&1 || true
+$body"; then
+    printf 'FAILED %s (%ss)\n' "$label" "$((SECONDS - start))"
     exit 1
   fi
-  printf 'OK %s (%ss)\n' "$name" "$((SECONDS - start))"
+  printf 'OK %s (%ss)\n' "$label" "$((SECONDS - start))"
 }
 
-run_fast() {
-  run_step fmt 'fmt --check'
-  run_step clippy 'clippy --locked --all-targets --all-features -- -D warnings'
-  run_step test 'test --locked'
-}
+FAST_BODY='step fmt cargo fmt --check
+step clippy cargo clippy --locked --all-targets --all-features -- -D warnings
+step test cargo test --locked'
+
+FULL_BODY="$FAST_BODY
+step build cargo build --release --locked"
 
 require_docker
 
 case "$MODE" in
-  fmt) run_step fmt 'fmt --check' ;;
-  clippy) run_step clippy 'clippy --locked --all-targets --all-features -- -D warnings' ;;
-  test) run_step test 'test --locked' ;;
-  build) run_step build 'build --release --locked' ;;
-  fast) run_fast ;;
+  fmt) run_group fmt 'step fmt cargo fmt --check' ;;
+  clippy) run_group clippy 'step clippy cargo clippy --locked --all-targets --all-features -- -D warnings' ;;
+  test) run_group test 'step test cargo test --locked' ;;
+  build) run_group build 'step build cargo build --release --locked' ;;
+  fast) run_group fast "$FAST_BODY" ;;
   full)
-    run_fast
-    run_step build 'build --release --locked'
+    run_group full "$FULL_BODY"
     printf '\n== docker build ==\n'
     docker build -t mcp-db:dev "$ROOT_WIN"
     echo 'OK docker build'
