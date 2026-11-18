@@ -4,10 +4,11 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use mcp_db::{
-    check_health, ApprovalPolicy, AuditEvent, Config, Driver, EncryptedFileResolver, Environment,
-    MetadataProvider, NewGrant, NewProfile, NewRoute, NewSource, PostgresExecutor,
-    PostgresMetadata, ProfilePurpose, SqlExecutor, Store, Tool, UnavailableExecutor,
-    UnavailableMetadata, ADMIN_LOGIN_TTL_MS, DEFAULT_ADDR, HEALTHCHECK_ADDR,
+    check_health, ApprovalPolicy, AuditEvent, Config, Driver, DriverExecutors,
+    EncryptedFileResolver, Environment, MetadataProvider, NewGrant, NewProfile, NewRoute,
+    NewSource, PostgresExecutor, PostgresMetadata, ProfilePurpose, SqlExecutor, SqliteExecutor,
+    SqliteMetadata, Store, Tool, UnavailableExecutor, UnavailableMetadata, ADMIN_LOGIN_TTL_MS,
+    DEFAULT_ADDR, HEALTHCHECK_ADDR,
 };
 
 fn main() -> ExitCode {
@@ -75,14 +76,27 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                         .map_err(|error| format!("credential init failed: {error}"))?;
                     let resolver = Arc::new(resolver);
                     let connections = Arc::new(mcp_db::postgres::ProfileConnections::default());
-                    metadata = Arc::new(PostgresMetadata::with_connections(
-                        resolver.clone(),
-                        connections.clone(),
+                    let postgres_metadata: Arc<dyn MetadataProvider> = Arc::new(
+                        PostgresMetadata::with_connections(resolver.clone(), connections.clone()),
+                    );
+                    let postgres_executor: Arc<dyn SqlExecutor> = Arc::new(
+                        PostgresExecutor::with_connections(resolver.clone(), connections.clone()),
+                    );
+                    let sqlite_metadata: Arc<dyn MetadataProvider> = Arc::new(
+                        SqliteMetadata::with_connections(resolver.clone(), connections.clone()),
+                    );
+                    let sqlite_executor: Arc<dyn SqlExecutor> = Arc::new(
+                        SqliteExecutor::with_connections(resolver.clone(), connections),
+                    );
+                    let routers = Arc::new(DriverExecutors::new(
+                        store.clone(),
+                        postgres_executor,
+                        postgres_metadata,
+                        sqlite_executor,
+                        sqlite_metadata,
                     ));
-                    executor = Arc::new(PostgresExecutor::with_connections(
-                        resolver.clone(),
-                        connections,
-                    ));
+                    metadata = routers.clone();
+                    executor = routers;
                     provisioner = Arc::new(mcp_db::provision::PostgresProvisioner::new(
                         resolver.clone(),
                         resolver,
@@ -181,7 +195,7 @@ fn run_recover(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction>\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
+        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
         env!("CARGO_PKG_VERSION"),
         mcp_db::ADMIN_ADDR
     );
@@ -225,10 +239,14 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                         .ok_or("sources add requires production|nonproduction")?,
                 )
                 .map_err(|error| error.to_string())?;
+                let driver = match args.next() {
+                    None => Driver::Postgres,
+                    Some(value) => Driver::parse(&value).map_err(|error| error.to_string())?,
+                };
                 let source = store
                     .create_source(&NewSource {
                         id,
-                        driver: Driver::Postgres,
+                        driver,
                         environment,
                         parent_source_id: None,
                         created_token_id: None,
@@ -237,8 +255,9 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                     })
                     .map_err(|error| error.to_string())?;
                 println!(
-                    "created source {} ({})",
+                    "created source {} ({}, {})",
                     source.id,
+                    source.driver.as_str(),
                     source.environment.as_str()
                 );
                 record_admin_audit(

@@ -16,7 +16,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 - 首版正式交付形态为 OCI 容器镜像（Docker 服务）。MCP 端口默认只发布到宿主回环地址或受控网络。
 - 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的一次性登录令牌；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
 - 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次，服务端只存其 SHA-256 hash；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 写请求校验 CSRF 与 `Origin`，Host 必须为回环地址。
-- 首版普通数据库能力仅支持 PostgreSQL；MySQL/MariaDB、SQLite、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
+- 首版正式发布范围只覆盖 PostgreSQL 普通能力；SQLite 是 T-11 的首个增量驱动，已实现并完成本地真实文件边界验证，尚未随首版发布。MySQL/MariaDB、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
 - source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
 - agent 使用管理面签发的 Bearer token；明文只在签发时返回一次，服务端只保存哈希和识别信息。
 - token 创建时按 **source → tool 集合** 授权。不再维护独立的全局 tool 白名单与 source 模式，也不再使用 `readonly/readwrite/approval` 作为运行时权限枚举。
@@ -40,6 +40,17 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 - 不做 NoSQL、stdio transport、IM 审批或分布式多实例部署；按需启动不等于无状态或 serverless。
 - 不替代数据库备份、恢复、原生资源治理和审计。
 
+### 1.3 驱动支持矩阵
+
+状态表示能力是否已实现并通过对应边界验证，不表示已经随版发布。未列入“已支持”的驱动在状态层和执行层都拒绝，不退回通用 SQL。
+
+| 驱动 | 状态 | 元数据/explain | 只读查询 | 数据写入与库内 DDL | 建库 |
+| --- | --- | --- | --- | --- | --- |
+| PostgreSQL | 首版已支持 | 支持 | 支持，原生只读会话与账号边界 | 支持 | 支持，仅 provision 审批路径 |
+| SQLite | T-11 增量已实现，未发布 | 支持，schema 统一 `main` | 支持，文件只读打开加 `query_only` | 支持，mutate/schema profile | 不支持，`create_database` 明确失败 |
+| MySQL/MariaDB | 未支持 | 拒绝 | 拒绝 | 拒绝 | 不支持 |
+| SQL Server | 未支持 | 拒绝 | 拒绝 | 拒绝 | 不支持 |
+
 ## 2. 部署与运行生命周期
 
 - 首版以 OCI 容器运行在个人电脑、开发机、内网管理机或数据库所在主机，只需能访问 PostgreSQL 并被 MCP 客户端和管理者访问。
@@ -61,7 +72,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 
 ### 3.2 Connection profiles
 
-每个 source 可配置任意数量的命名 profiles；每个 profile 有用途类别、凭证引用、连接限制和启用状态。数量不限于两个，同类别可有多个 profile。每个 tool 绑定一个明确 profile；找不到可用映射时拒绝，不能自动升级到权限更大的身份。首版只要求 PostgreSQL 的 profile 路由和只读边界验收；其他驱动在对应扩展任务完成前不得启用。
+每个 source 可配置任意数量的命名 profiles；每个 profile 有用途类别、凭证引用、连接限制和启用状态。数量不限于两个，同类别可有多个 profile。每个 tool 绑定一个明确 profile；找不到可用映射时拒绝，不能自动升级到权限更大的身份。PostgreSQL 是首版发布基线；SQLite 在 T-11 完成 query profile 负向文件边界验证后启用；MySQL/MariaDB、SQL Server 在对应扩展任务完成前不得启用。
 
 | 用途类别 | 用途 | 典型 tool |
 | --- | --- | --- |
@@ -83,6 +94,14 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 - 每个 query profile 的实际连接在交给工具前设置 PostgreSQL 原生只读默认值，直测空谓词 DML 和回滚保护下的 DDL，只有数据库明确拒绝后才放行。查询及 explain 另外在显式只读事务内运行；连接关闭即回滚。数据库账号仍须遵守最小权限，不能由应用只读设置替代账号权限治理。
 - token 普通工具调用使用滑动 60s 窗口，默认 60 次，可用 `MCPDB_TOKEN_REQUESTS_PER_MINUTE` 设置为 1～100000；同一 token 所有会话共享，达到上限返回 `RATE_LIMITED` 并审计。初始化、tools/list 和协议通知不计入工具调用额度；重启清空普通限流窗口，不影响持久建库配额。
 - MCP 取消会关闭进行中的连接；已发出写入取消保守记录未知，不自动重试。连接额度拒绝发生在外部语句发送前，记录明确未执行，而不是未知。
+
+### 3.2.2 SQLite 资源与只读机制
+
+- source 的 `driver` 为 `sqlite`；profile 的 `credential_ref` 仍是 `keyring:...`，解析结果只作为数据库文件路径使用，不按 DSN 或 URI 解析。空路径和 `:memory:` 明确拒绝；文件不存在时打开失败，不自动创建。
+- query profile 以 `SQLITE_OPEN_READ_ONLY` 打开文件并设置 `PRAGMA query_only=ON`。连接交给工具前读取 `PRAGMA query_only` 必须为 1，并对已有表实际执行零行 DML、对 main schema 执行 `CREATE TABLE` 探针（空库用 `BEGIN IMMEDIATE`）；只有 SQLite 返回只读或权限错误才放行，否则 profile 不可用。
+- mutate 与 schema profile 以读写方式打开同一文件。SQLite 没有建库能力，`create_database` 对 sqlite source 在审批与执行前明确失败；provision profile 仍不能进入普通 SQL 与元数据路径。
+- 每次调用先经 profile 连接额度准入，调用结束关闭连接；连接上限和默认值与 PostgreSQL 相同。语句超时用 SQLite progress handler 按 deadline 中断并映射为资源限制；`max_rows` 的 `rowCount`/`returnedRows`/`truncated` 语义与 PostgreSQL 一致。
+- 元数据只读打开，表和视图来自 `sqlite_master`（排除 `sqlite_*`），列、主键、索引和关系来自 `pragma_*` 表函数，schema 统一为 `main`。explain 只接受生成的 `EXPLAIN QUERY PLAN`。
 
 ### 3.3 调用判定与审批
 
@@ -110,6 +129,8 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 | 禁止 | 所有通用 SQL tools 禁止 `CREATE/DROP DATABASE`、账号/角色管理和 `GRANT/REVOKE`；包含方言等价形式，MySQL 的 `CREATE/DROP SCHEMA` 按数据库级操作处理 |
 
 单条 SQL 按方言解析，未知、多语句、解析失败或不能确认间接效果一律拒绝，不能退回关键词猜测。SQL 解析承担 tool 范围与审批策略边界，数据库最小权限承担执行身份的最终能力边界。
+
+SQLite 使用独立方言解析，不接受 PostgreSQL 解析结果。下列语句即使语法可解析也在外部执行前拒绝：多语句、`ATTACH`/`DETACH`、`PRAGMA`、`VACUUM`、`REINDEX`、`ANALYZE`、`load_extension`、触发器、虚拟表，以及 SQLite 不支持的 `TRUNCATE`。query、mutate、库内 DDL 的类别边界与 PostgreSQL 相同；`EXPLAIN QUERY PLAN` 只由服务端基于已验证查询生成，原始 `EXPLAIN` 输入不接受。MySQL/MariaDB 与 SQL Server 的方言和工具范围仍未实现。
 
 `explain_query` 仅允许只读查询的非执行型计划，不接受 `ANALYZE` 等实际执行变体或写语句。不能用执行计划入口绕过 `query_sql`/`mutate_sql` grants。`WHERE` 存在不代表影响小，例如 `WHERE 1=1` 仍可改全表，普通写入不能因此宣称安全。
 
@@ -217,7 +238,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 | 表/概念 | 语义 |
 | --- | --- |
-| `sources` | driver、environment、active/archived 状态、父 source、创建 token/agent、创建来源、限制、时间戳 |
+| `sources` | driver（`postgres`、`sqlite`；MySQL/MariaDB 与 SQL Server 未支持）、environment、active/archived 状态、父 source、创建 token/agent、创建来源、限制、时间戳 |
 | `connection_profiles` | source、命名 profile、用途、凭证引用、连接限制、启用状态与版本；无固定两个的数量约束 |
 | `source_tool_routes` | source、tool、profile、最低审批策略、版本；高危/建库强制规则不可下调 |
 | `tokens` | agent、hash、状态、创建与撤销时间；不再有全局 tool 白名单 |
@@ -247,7 +268,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 | 事项 | 必须确定的内容 | 时点 |
 | --- | --- | --- |
-| 驱动与 SQL 解析 | 首版 PostgreSQL 的最低支持版本、建库/解析支持范围、query 只读验证、profiles 的最低原生权限；其他驱动在扩展任务前不得启用 | 对应实现任务拆分前 |
+| 驱动与 SQL 解析 | PostgreSQL 首版范围已确定；SQLite 增量方言、文件只读与连接限制已由 T-11 定义；MySQL/MariaDB、SQL Server 在扩展任务前不得启用 | 对应实现任务拆分前 |
 | 迁移与会话刷新 | Bun/TypeScript v1 TOML + 状态库的 journal/cutover/恢复、旧敏感配置隔离、固定 grants/策略转换、旧 binary 与 tool 退役、新 source 发现机制 | 权限实现前 |
 | 配额和限流配置 | profile 池大小/超时、token 普通请求速率的默认值、重启恢复和未知状态核对 | 限制实现前 |
 | 建库失败与凭证 | PostgreSQL 建库/账号配置补偿、凭证安全存储、admin 人工处置入口 | 建库实现前 |

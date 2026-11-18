@@ -1,9 +1,9 @@
 use sqlparser::ast::{ObjectType, Query, SetExpr, Statement};
-use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 
 use crate::error::{Error, Result};
-use crate::state::Tool;
+use crate::state::{Driver, Tool};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlClass {
@@ -26,23 +26,39 @@ impl SqlClass {
 pub struct ValidatedSql {
     pub sql: String,
     pub class: SqlClass,
+    pub driver: Driver,
     pub high_risk: bool,
 }
 
 impl ValidatedSql {
     pub fn explain_sql(&self) -> String {
-        format!("EXPLAIN (FORMAT JSON) {}", self.sql)
+        match self.driver {
+            Driver::Postgres => format!("EXPLAIN (FORMAT JSON) {}", self.sql),
+            Driver::Sqlite => format!("EXPLAIN QUERY PLAN {}", self.sql),
+        }
     }
 }
 
 /// Parse one PostgreSQL statement and apply the first-release tool whitelist.
 pub fn validate(sql: &str) -> Result<ValidatedSql> {
+    validate_for_driver(sql, Driver::Postgres)
+}
+
+/// Parse one statement in the source driver's dialect. Unknown or driver-specific
+/// administrative statements fail closed instead of falling back to generic SQL.
+pub fn validate_for_driver(sql: &str, driver: Driver) -> Result<ValidatedSql> {
     let sql = sql.trim();
     if sql.is_empty() {
         return Err(Error::SqlRejected("empty SQL".to_string()));
     }
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-        .map_err(|error| Error::SqlRejected(format!("parse failed: {error}")))?;
+    if driver == Driver::Sqlite && contains_load_extension(sql) {
+        return Err(unsupported("load_extension"));
+    }
+    let statements = match driver {
+        Driver::Postgres => Parser::parse_sql(&PostgreSqlDialect {}, sql),
+        Driver::Sqlite => Parser::parse_sql(&SQLiteDialect {}, sql),
+    }
+    .map_err(|error| Error::SqlRejected(format!("parse failed: {error}")))?;
     if statements.len() != 1 {
         return Err(Error::SqlRejected(
             "exactly one statement is required".to_string(),
@@ -53,7 +69,39 @@ pub fn validate(sql: &str) -> Result<ValidatedSql> {
         .next()
         .ok_or_else(|| Error::SqlRejected("empty SQL".to_string()))?;
 
-    let (class, high_risk) = match statement {
+    let (class, high_risk) = classify(statement, driver)?;
+
+    Ok(ValidatedSql {
+        sql: sql.trim_end_matches(';').trim_end().to_string(),
+        class,
+        driver,
+        high_risk,
+    })
+}
+
+fn classify(statement: Statement, driver: Driver) -> Result<(SqlClass, bool)> {
+    if driver == Driver::Sqlite {
+        // These statements are either SQLite-only administration or not SQLite at
+        // all. Reject them before the shared classification can accept a near miss.
+        match &statement {
+            Statement::AttachDatabase { .. }
+            | Statement::AttachDuckDBDatabase { .. }
+            | Statement::DetachDuckDBDatabase { .. } => return Err(unsupported("ATTACH/DETACH")),
+            Statement::Pragma { .. } => return Err(unsupported("PRAGMA")),
+            Statement::Vacuum(_) => return Err(unsupported("VACUUM")),
+            Statement::Analyze(_) => return Err(unsupported("ANALYZE")),
+            Statement::Truncate(_) => return Err(unsupported("TRUNCATE (not a SQLite statement)")),
+            Statement::CreateTrigger(_) | Statement::CreateVirtualTable { .. } => {
+                return Err(unsupported("trigger or virtual table"))
+            }
+            _ => {}
+        }
+    }
+    shared_classification(statement)
+}
+
+fn shared_classification(statement: Statement) -> Result<(SqlClass, bool)> {
+    let classified = match statement {
         Statement::Query(query) => {
             validate_read_query(&query)?;
             (SqlClass::Query, false)
@@ -77,16 +125,21 @@ pub fn validate(sql: &str) -> Result<ValidatedSql> {
             )))
         }
     };
+    Ok(classified)
+}
 
-    Ok(ValidatedSql {
-        sql: sql.trim_end_matches(';').trim_end().to_string(),
-        class,
-        high_risk,
-    })
+fn contains_load_extension(sql: &str) -> bool {
+    sql.to_ascii_lowercase()
+        .replace([' ', '\t', '\n', '\r'], "")
+        .contains("load_extension")
 }
 
 pub fn validate_for_tool(sql: &str, tool: Tool) -> Result<ValidatedSql> {
-    let validated = validate(sql)?;
+    validate_for_driver_tool(sql, tool, Driver::Postgres)
+}
+
+pub fn validate_for_driver_tool(sql: &str, tool: Tool, driver: Driver) -> Result<ValidatedSql> {
+    let validated = validate_for_driver(sql, driver)?;
     let expected = match tool {
         Tool::QuerySql | Tool::ExplainQuery => SqlClass::Query,
         Tool::MutateSql => SqlClass::Mutate,

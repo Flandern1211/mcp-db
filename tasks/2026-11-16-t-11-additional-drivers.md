@@ -48,6 +48,21 @@
 
 外部写调用数：逐驱动记录。证据位置：本任务文件与受控集成记录。
 
+### 4.1 2026-11-18 SQLite 增量证据
+
+| 层级 | AC | 命令或步骤 | 环境 | 结果 | 未验证 |
+| --- | --- | --- | --- | --- | --- |
+| 真实文件边界 | AC2-02、AC2-08、AC2-11 | `cargo test --locked -j 1 --test sqlite_driver`：临时 SQLite 文件，query profile 正常 SELECT；同一连接直接 INSERT/UPDATE/DELETE/CREATE/DROP/ALTER/CREATE INDEX 全部被 SQLite 以只读/权限错误拒绝，行与 schema 快照不变；mutate/schema profile 可写 | Docker `rust:1.89-slim-bookworm`，本地临时文件 | 8 passed, 0 failed, 0 ignored | MySQL/MariaDB、SQL Server |
+| 方言策略 | AC2-15 | 同一测试：多语句、ATTACH/DETACH、PRAGMA、VACUUM、REINDEX、ANALYZE、load_extension、触发器、虚拟表、TRUNCATE、CREATE DATABASE、原始 EXPLAIN 全部在外部执行前拒绝；query/mutate/DDL 分类保持分离 | 同上 | 通过 | 其他驱动方言 |
+| 资源限制 | AC2-08 | 同一测试：max_rows 截断为 rowCount=2/returnedRows=1/truncated=true；50ms 超时的递归 CTE 返回 ResourceLimit，随后同一 profile 查询成功 | 同上 | 通过 | — |
+| 元数据/explain | AC2-02 | 同一测试：`sqlite_master` 列出表/视图且排除 `sqlite_*`，schema 统一 `main`；`pragma_table_info`、`pragma_index_list`、`pragma_foreign_key_list` 输出与 PostgreSQL provider 同形；explain 生成 `EXPLAIN QUERY PLAN` | 同上 | 通过 | — |
+| 状态迁移 | AC2-11、AC2-22 | `cargo test --locked --lib state::store::migration_tests`：v4 状态带 source/profile/grant/approval/audit 行升级到 v5，旧行保留，`PRAGMA foreign_key_check` 无违规；sqlite source 可写入并在重启后保持；`Driver::parse("mysql"/"mssql")` 仍拒绝 | 临时状态库 | 通过 | — |
+| 全量回归 | 既有 AC | `cargo fmt && cargo test --locked -j 1 && cargo clippy --locked -j 1 --all-targets --all-features -- -D warnings`（另验证 `cargo fmt --check`） | Docker `rust:1.89-slim-bookworm` | fmt 通过；123 passed, 11 ignored, 0 failed；clippy 0 warnings | 11 个 ignored 为需显式 `MCPDB_TEST_PG_*` 的真实 PostgreSQL 集成用例 |
+
+只读边界证据：query profile 以 `SQLITE_OPEN_READ_ONLY` 打开并设置 `PRAGMA query_only=ON`；连接交给工具前读取 `PRAGMA query_only` 必须为 1，并对已有表执行 `DELETE ... WHERE 0`、对 main schema 执行 `CREATE TABLE` 探针，只有 SQLite 返回只读/权限错误才放行。测试同时用独立只读连接直接尝试 DML/DDL，确认失败类型与夹具不变。
+
+本增量只新增 SQLite；MySQL/MariaDB、SQL Server 未实现，未修改 `TASK.md`/`CHANGELOG.md`，未提交。
+
 ## 5. 交付
 
 - 提交与 `TASK.md`：未开始。已接受风险：无。
