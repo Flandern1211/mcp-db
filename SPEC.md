@@ -1,7 +1,7 @@
 # mcp-db 规格
 
 - 状态：当前基线
-- 更新时间：2026-11-16
+- 更新时间：2026-11-18
 - 产品意图、目标用户、场景与成功指标：[docs/PRD.md](docs/PRD.md)
 - 变更记录：[CHANGELOG.md](CHANGELOG.md)
 - 实现状态：以 [TASK.md](TASK.md) 为准；本文件中的目标能力不等于已经实现
@@ -15,7 +15,8 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 - 单实例、多数据源的 Streamable HTTP MCP 服务；不要求与数据库同机，不要求全年常驻。
 - 首版正式交付形态为 OCI 容器镜像（Docker 服务）。MCP 端口默认只发布到宿主回环地址或受控网络。
 - 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的一次性登录令牌；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
-- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次，服务端只存其 SHA-256 hash；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 写请求校验 CSRF 与 `Origin`，Host 必须为回环地址。
+- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次，服务端只存其 SHA-256 hash；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 请求校验 Host 为回环地址；Origin 存在且非 `null` 时必须与请求 scheme、host、port 严格同源，跨端口拒绝；`null` 不获得同源信任，登录 POST 需要页面发放的随机 CSRF challenge，后续写请求需要会话绑定 CSRF，未持有对应 challenge 的 `null` 请求拒绝。
+- 管理页是内嵌静态中文 SPA（概览 / 访问令牌 / 待批请求 / 审计日志 / 数据源），由 admin listener 同源提供，不使用 CDN、外部字体或前端框架；数据经 `/admin/api/*` JSON 接口读写。所有 admin 响应设置 no-store、nosniff、no-referrer 和 `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'` 的 CSP，不使用内联脚本。令牌明文只在签发响应返回一次；管理页不编辑明文 DSN。
 - 首版普通数据库能力仅支持 PostgreSQL；MySQL/MariaDB、SQLite、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
 - source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
 - agent 使用管理面签发的 Bearer token；明文只在签发时返回一次，服务端只保存哈希和识别信息。
@@ -136,7 +137,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 ### 3.6 Source 生命周期
 
-归档和恢复仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。首版通过本机 CLI 提供审批、归档/恢复和隔离预留结算；Web 管理面见后续管理任务。
+归档和恢复仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。首版本机管理面通过 CLI 与 Web 管理页提供审批、source 创建/归档/恢复、profile/route、token/grant、审计查询和隔离预留结算；Web 管理页在 source 详情展示 profiles 与 routes，profile 只填写 credential_ref，不编辑或回显 DSN。待批请求必须展示完整 SQL（建库请求展示服务端生成的建库规格）、参数、profile/route 标识与版本后才能决定，不允许盲批。环境分类变更仅对已归档 source 开放，标记生产前须先撤销写 grants。
 
 ## 4. 需求与验收
 
@@ -183,7 +184,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 
 ### 5.1 组件与工具
 
-单进程 Rust 服务；HTTP 端点 `/mcp`、管理页 `/admin` 与管理接口 `/admin/*`。MCP 监听与管理监听分离，首版管理监听只绑定或发布到宿主回环地址。默认状态库 `./.mcp-db/state.db`。首版正式交付形态为 OCI 容器镜像；具体 crate、Rust 版本和镜像版本以配置与锁文件为准。
+单进程 Rust 服务；HTTP 端点 `/mcp`、管理页 `/admin`（静态资源 `/admin/assets/*`）与管理 JSON 接口 `/admin/api/*`。MCP 监听与管理监听分离，首版管理监听只绑定或发布到宿主回环地址。默认状态库 `./.mcp-db/state.db`。首版正式交付形态为 OCI 容器镜像；具体 crate、Rust 版本和镜像版本以配置与锁文件为准。
 
 下表是 Rust 模块职责边界，路径为职责示意，不提前锁定具体 crate 或文件布局。
 
@@ -251,7 +252,6 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 | 迁移与会话刷新 | Bun/TypeScript v1 TOML + 状态库的 journal/cutover/恢复、旧敏感配置隔离、固定 grants/策略转换、旧 binary 与 tool 退役、新 source 发现机制 | 权限实现前 |
 | 配额和限流配置 | profile 池大小/超时、token 普通请求速率的默认值、重启恢复和未知状态核对 | 限制实现前 |
 | 建库失败与凭证 | PostgreSQL 建库/账号配置补偿、凭证安全存储、admin 人工处置入口 | 建库实现前 |
-| 本机管理面 | 一次性登录令牌、admin 会话 cookie、CSRF、一次性令牌有效期和 Web 信息架构 | 管理页实现前 |
 | 远程部署验收 | TLS 终止、受信代理、Origin/CSRF、停启及未知请求取证；首版不启用 | 远程接入实现前 |
 
 工作区、长期存储监控和自动回收另行迭代；不为预留空间提前添加无行为的 workspace/quota 占位字段。

@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::approval::{
     ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalRecord, ApprovalStatus, AuditEvent,
@@ -14,7 +15,7 @@ use crate::state::model::{
     validate_credential_ref, validate_profile_name, validate_source_id, ApprovalPolicy, Driver,
     Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
     ProfilePurpose, ProvisionUsage, QuotaReservation, ReservationStatus, Route, Source,
-    SourceStatus, TokenIdentity, Tool,
+    SourceStatus, TokenIdentity, TokenRecord, Tool,
 };
 
 const SCHEMA_VERSION: i64 = 4;
@@ -360,6 +361,27 @@ impl Store {
             params![token_id, agent, token_hash, now_ms()],
         )?;
         Ok(token_id)
+    }
+
+    /// Administrative token listing. Only identifying metadata is returned; the stored
+    /// hash and the one-time plaintext are never exposed.
+    pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, agent, status, created_at, revoked_at
+               FROM tokens ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(TokenRecord {
+                    id: row.get(0)?,
+                    agent: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn authenticate(&self, raw_token: &str) -> Result<TokenIdentity> {
@@ -858,6 +880,37 @@ impl Store {
             min_approval_policy: ApprovalPolicy::parse(&policy)?,
             version,
         })
+    }
+
+    pub fn list_routes(&self, source_id: &str) -> Result<Vec<Route>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, source_id, tool, profile_id, min_approval_policy, version
+               FROM source_tool_routes WHERE source_id = ? ORDER BY tool",
+        )?;
+        let rows = statement
+            .query_map([source_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(id, source_id, tool_text, profile_id, policy, version)| {
+                Ok(Route {
+                    id,
+                    source_id,
+                    tool: Tool::parse(&tool_text)?,
+                    profile_id,
+                    min_approval_policy: ApprovalPolicy::parse(&policy)?,
+                    version,
+                })
+            })
+            .collect()
     }
 
     pub fn create_grant(&self, grant: &NewGrant) -> Result<Grant> {
@@ -1658,6 +1711,20 @@ impl Store {
         )?)
     }
 
+    pub fn count_audit_events_all(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))?)
+    }
+
+    pub fn count_pending_approvals(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM approval_requests WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Newest audit events first; ties break on insertion order (newest id first).
     pub fn list_recent_audit(&self, limit: usize) -> Result<Vec<AuditEvent>> {
         let mut statement = self.conn.prepare(
@@ -1667,33 +1734,59 @@ impl Store {
                FROM audit_events ORDER BY ts DESC, id DESC LIMIT ?",
         )?;
         let rows = statement
-            .query_map([limit as i64], |row| {
-                Ok(AuditEvent {
-                    ts: row.get(0)?,
-                    event: row.get(1)?,
-                    approval_id: row.get(2)?,
-                    token_id: row.get(3)?,
-                    agent: row.get(4)?,
-                    source_id: row.get(5)?,
-                    tool: row.get(6)?,
-                    profile_id: row.get(7)?,
-                    profile_version: row.get(8)?,
-                    route_id: row.get(9)?,
-                    route_version: row.get(10)?,
-                    request_digest: row.get(11)?,
-                    channel: row.get(12)?,
-                    decision: row.get(13)?,
-                    actor: row.get(14)?,
-                    high_risk: row.get::<_, i64>(15)? != 0,
-                    reason_code: row.get(16)?,
-                    reason: row.get(17)?,
-                    duration_ms: row.get(18)?,
-                    row_count: row.get(19)?,
-                    error_code: row.get(20)?,
-                })
-            })?
+            .query_map([limit as i64], audit_event_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Filtered audit page used by the local admin UI.
+    pub fn query_audit(
+        &self,
+        agent: Option<&str>,
+        source_id: Option<&str>,
+        decision: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<AuditEvent>, i64)> {
+        let mut filters = Vec::new();
+        let mut values = Vec::<Value>::new();
+        if let Some(agent) = agent {
+            filters.push("agent = ?");
+            values.push(Value::Text(agent.to_string()));
+        }
+        if let Some(source_id) = source_id {
+            filters.push("source_id = ?");
+            values.push(Value::Text(source_id.to_string()));
+        }
+        if let Some(decision) = decision {
+            filters.push("decision = ?");
+            values.push(Value::Text(decision.to_string()));
+        }
+        let where_clause = if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filters.join(" AND "))
+        };
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM audit_events{where_clause}"),
+            params_from_iter(values.iter()),
+            |row| row.get(0),
+        )?;
+        let mut page_values = values;
+        page_values.push(Value::Integer(limit as i64));
+        page_values.push(Value::Integer(offset as i64));
+        let sql = format!(
+            "SELECT ts, event, approval_id, token_id, agent, source_id, tool, profile_id,
+                    profile_version, route_id, route_version, request_digest, channel, decision,
+                    actor, high_risk, reason_code, reason, duration_ms, row_count, error_code
+               FROM audit_events{where_clause}
+              ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(page_values.iter()), audit_event_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
     }
 
     pub fn get_token_identity(&self, token_id: &str) -> Result<TokenIdentity> {
@@ -2164,6 +2257,32 @@ fn source_event(
         row_count: None,
         error_code: None,
     }
+}
+
+fn audit_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
+    Ok(AuditEvent {
+        ts: row.get(0)?,
+        event: row.get(1)?,
+        approval_id: row.get(2)?,
+        token_id: row.get(3)?,
+        agent: row.get(4)?,
+        source_id: row.get(5)?,
+        tool: row.get(6)?,
+        profile_id: row.get(7)?,
+        profile_version: row.get(8)?,
+        route_id: row.get(9)?,
+        route_version: row.get(10)?,
+        request_digest: row.get(11)?,
+        channel: row.get(12)?,
+        decision: row.get(13)?,
+        actor: row.get(14)?,
+        high_risk: row.get::<_, i64>(15)? != 0,
+        reason_code: row.get(16)?,
+        reason: row.get(17)?,
+        duration_ms: row.get(18)?,
+        row_count: row.get(19)?,
+        error_code: row.get(20)?,
+    })
 }
 
 fn insert_audit(conn: &Connection, event: &AuditEvent) -> Result<()> {

@@ -42,7 +42,7 @@ pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
 pub use state::{
     ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
     NewSource, Profile, ProfilePurpose, QuotaReservation, ReservationStatus, Route, Source,
-    SourceStatus, Store, TokenIdentity, Tool,
+    SourceStatus, Store, TokenIdentity, TokenRecord, Tool,
 };
 pub use transport::admin::{admin_app, AdminSession, AdminState, ADMIN_LOGIN_TTL_MS};
 

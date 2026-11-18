@@ -219,6 +219,16 @@ pub struct TokenIdentity {
     pub agent: String,
 }
 
+/// Administrative view of a token. The token hash and plaintext are never included.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenRecord {
+    pub id: String,
+    pub agent: String,
+    pub status: String,
+    pub created_at: i64,
+    pub revoked_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSource {
     pub id: String,
