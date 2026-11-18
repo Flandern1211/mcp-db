@@ -27,6 +27,23 @@
 
 日常门禁统一经由 `scripts/verify.sh`（`fast`/`full`/`real`）执行，真实数据库集成经由 `scripts/pgtest.sh`。日常门禁不要在会话中手写 `docker run ... cargo ...` 长命令：脚本负责固定镜像、工具链、缓存卷和单步超时。一次性排查可以手写，但要在任务文件记录命令和原因；同一命令第二次被手写时，应固化进脚本。
 
+| 命令 | 用途 |
+| --- | --- |
+| `scripts/disk-guard.sh` | 只读报告主机磁盘、Docker 占用、`mcpdb-*` 镜像/卷和 worktree target。 |
+| `scripts/disk-guard.sh --check` | 磁盘低于 `MCPDB_MIN_FREE_GB`（默认 5）时非零退出；`verify.sh` 已调用。 |
+| `scripts/disk-guard.sh --prune` | 只删除停止的 `mcpdb-*` 容器；不删镜像、卷、缓存或源码。 |
+| `scripts/disk-guard.sh --prune-cache` | 清理 Docker 构建缓存；缓存由同一 daemon 上所有项目共享，需单独确认。 |
+
+### 2.1 诊断顺序
+
+行为修复先给复现证据（日志、请求/响应或最小命令）和假设，再改代码；一次镜像构建只验证一个已确认假设。连续重建超过一次时，必须在任务文件写明原因和每次排除的假设。禁止只凭“改一版试试”推进。
+
+### 2.2 资源预算
+
+- 构建前运行 `scripts/disk-guard.sh --check`；`verify.sh` 已内置。可用空间低于 `MCPDB_MIN_FREE_GB`（默认 5GB）时停止构建；低于 10GB 只做必要验证。
+- 只保留当前验证需要的 `mcp-db:*` 标签；任务收口时用 `scripts/disk-guard.sh --prune` 清停止的 `mcpdb-*` 容器，构建缓存用 `--prune-cache` 单独确认，是否执行由使用者决定。
+- 禁止自动删除卷、带标签镜像、worktree、状态库或用户容器；这些操作按 `AGENTS.md` 第 4 节第 6 条先列清单并取得同意。
+
 legacy Bun/TypeScript v1 保留为迁移夹具和兼容测试对象，不作为正式开发入口：
 
 | 命令 | 用途 |
