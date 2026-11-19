@@ -12,7 +12,9 @@ pub mod metadata;
 pub mod migration;
 pub mod postgres;
 pub mod provision;
+pub mod routing;
 pub mod sql_policy;
+pub mod sqlite;
 pub mod state;
 pub mod transport;
 
@@ -40,7 +42,12 @@ pub use provision::{
     PostgresProvisioner, ProvisionLimits, ProvisionOutcome, ProvisionSpec, Provisioner,
     UnavailableProvisioner,
 };
-pub use sql_policy::{validate, validate_for_tool, SqlClass, ValidatedSql};
+pub use routing::DriverExecutors;
+pub use sql_policy::{
+    validate, validate_for_driver, validate_for_driver_tool, validate_for_tool, SqlClass,
+    ValidatedSql,
+};
+pub use sqlite::{SqliteExecutor, SqliteMetadata};
 pub use state::{
     ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
     NewSource, Profile, ProfilePurpose, QuotaReservation, ReservationStatus, Route, Source,

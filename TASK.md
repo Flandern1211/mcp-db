@@ -13,14 +13,17 @@
 | T-03 | 迁移旧配置与状态库 | 完整 | 🟢 已完成 | T-02 | AC2-23 | `23c427e` | 无 | [tasks/2026-11-13-t-03-legacy-migration.md](tasks/2026-11-13-t-03-legacy-migration.md) |
 | T-04 | 实现精确 grants、profile 路由与发现 | 完整 | 🟢 已完成 | T-02、T-12 | AC2-12～AC2-14 | `7c8374c`、`2c7fddf`、`c995885`、`eb9b87c`、`57bae34` | 无 | [tasks/2026-11-13-t-04-grants-routing-discovery.md](tasks/2026-11-13-t-04-grants-routing-discovery.md) |
 | T-05 | 实现 PostgreSQL SQL 策略与分类 tools（含 explain） | 完整 | 🟢 已完成 | T-04 | AC2-03、AC2-06、AC2-07、AC2-15 | `72f0e2c`、`3ff90fa`、`57e89ef`、`c2e6f5d`、`bd98c76`、`6a0f097` | 无 | [tasks/2026-11-13-t-05-sql-tools.md](tasks/2026-11-13-t-05-sql-tools.md) |
-| T-06 | 实现审批状态机与审计绑定 | 完整 | 🟡 待验收 | T-02、T-04、T-05 | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 | `47a531a` | 1 非阻塞 | [tasks/2026-11-13-t-06-approval-audit.md](tasks/2026-11-13-t-06-approval-audit.md) |
+| T-06 | 实现审批状态机与审计绑定 | 完整 | 🟢 已完成 | T-02、T-04、T-05 | AC2-04、AC2-05、AC2-09、AC2-16、AC2-22 | `47a531a` | 无 | [tasks/2026-11-13-t-06-approval-audit.md](tasks/2026-11-13-t-06-approval-audit.md) |
 | T-07 | 实现 PostgreSQL profile 限制与只读边界 | 完整 | 🟢 已完成 | T-04、T-05 | AC2-02、AC2-08、AC2-11 | `dc0482c` | 无 | [tasks/2026-11-13-t-07-profile-limits.md](tasks/2026-11-13-t-07-profile-limits.md) |
 | T-08 | 实现 PostgreSQL 建库、配额与 source 生命周期 | 完整 | 🟢 已完成 | T-04～T-07 | AC2-17～AC2-21 | `d30cba5`、`31e9651` | 无 | [tasks/2026-11-13-t-08-provisioning-lifecycle.md](tasks/2026-11-13-t-08-provisioning-lifecycle.md) |
 | T-09 | 实现首版本机 CLI 与 Web 管理面 | 完整 | 🟢 已完成 | T-02、T-06、T-08 | AC2-10（首版本机）、AC2-21、AC2-22 | `2405712` | 无 | [tasks/2026-11-13-t-09-local-admin.md](tasks/2026-11-13-t-09-local-admin.md) |
-| T-10 | 完成首版 AC2 跨边界验收与发布收口 | 完整 | 🟡 待验收 | T-03～T-09 | AC2-01～AC2-23（首版 PostgreSQL 范围） | `c3d6fd4` | 1 非阻塞 | [tasks/2026-11-13-t-10-ac2-acceptance.md](tasks/2026-11-13-t-10-ac2-acceptance.md) |
-| T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 未开始 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | — | — | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
+| T-10 | 完成首版 AC2 跨边界验收与发布收口 | 完整 | 🟢 已完成 | T-03～T-09 | AC2-01～AC2-23（首版 PostgreSQL 范围） | `c3d6fd4` | 无 | [tasks/2026-11-13-t-10-ac2-acceptance.md](tasks/2026-11-13-t-10-ac2-acceptance.md) |
+| T-11 | 扩展 MySQL/MariaDB、SQLite 与 SQL Server | 完整 | 进行中 | T-10 | AC2-02、AC2-08、AC2-11 增量驱动范围 | `6aa69f6` | 1 后续增量 | [tasks/2026-11-16-t-11-additional-drivers.md](tasks/2026-11-16-t-11-additional-drivers.md) |
 | T-12 | 实现凭证解析与 PostgreSQL 元数据 provider | 完整 | 🟢 已完成 | T-02 | AC2-01、AC2-09、AC2-11、AC2-12（凭证与元数据基础） | `c790f64`、`49883ea` | 无 | [tasks/2026-11-16-t-12-credentials-postgres-metadata.md](tasks/2026-11-16-t-12-credentials-postgres-metadata.md) |
-| T-13 | 完善本机 admin 页面 UI 与前端体验 | 完整 | 进行中 | T-09 | AC2-10（本机管理面体验） | — | — | [tasks/2026-11-18-t-13-admin-ui.md](tasks/2026-11-18-t-13-admin-ui.md) |
+| T-13 | 完善本机 admin 页面 UI 与前端体验 | 完整 | 🟢 已完成 | T-09 | AC2-10（本机管理面体验） | `aa35d4b`、`5c79874` | 无 | [tasks/2026-11-18-t-13-admin-ui.md](tasks/2026-11-18-t-13-admin-ui.md) |
+| T-14 | 固化复盘规则、工程入口与收口检查 | 完整 | 🟢 已完成 | 无 | 流程基线：完成门禁、失败关闭、验收独立性、命令固化、收口检查 | `f30d9b4`、`f25869a`、`abb3e61` | 无 | [tasks/2026-11-18-t-14-process-hardening.md](tasks/2026-11-18-t-14-process-hardening.md) |
+| T-15 | 补强 UI 基线、诊断顺序、资源预算与删除授权 | 完整 | 🟡 待验收 | T-14 | 流程基线：UI 基线、诊断顺序、资源预算、文件归属、声明证据、删除授权 | `83aa82e` | 1 非阻塞（待用户复核） | [tasks/2026-11-18-t-15-process-guardrails.md](tasks/2026-11-18-t-15-process-guardrails.md) |
+| T-16 | 令牌授权工具按路由可用性置灰 | 轻档 | 🟡 待验收 | T-13 | AC2-10（本机管理面体验） | `436ca4b`、`8f0db87` | 1 非阻塞（profile 停用文案未实机复现） | 本表（提交 `436ca4b` 正文；合并后 `scripts/verify.sh fast` 通过） |
 
 ## 状态定义
 

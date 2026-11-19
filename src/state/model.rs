@@ -3,18 +3,21 @@ use crate::error::{Error, Result};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Driver {
     Postgres,
+    Sqlite,
 }
 
 impl Driver {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Postgres => "postgres",
+            Self::Sqlite => "sqlite",
         }
     }
 
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "postgres" => Ok(Self::Postgres),
+            "sqlite" => Ok(Self::Sqlite),
             _ => Err(Error::InvalidInput(format!("unsupported driver: {value}"))),
         }
     }

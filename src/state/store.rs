@@ -18,7 +18,7 @@ use crate::state::model::{
     RouteUpdate, Source, SourceStatus, TokenIdentity, TokenRecord, Tool,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -223,9 +223,37 @@ CREATE INDEX IF NOT EXISTS admin_login_tokens_expiry
   ON admin_login_tokens(expires_at);
 "#;
 
+/// SQLite cannot change a CHECK constraint in place. `Store::open_admin` runs this
+/// with foreign keys disabled, then revalidates every reference before committing.
+const MIGRATION_5: &str = r#"
+CREATE TABLE sources_v5 (
+  id TEXT PRIMARY KEY,
+  driver TEXT NOT NULL CHECK (driver IN ('postgres', 'sqlite')),
+  environment TEXT NOT NULL CHECK (environment IN ('production', 'nonproduction')),
+  status TEXT NOT NULL CHECK (status IN ('active', 'archived')),
+  parent_source_id TEXT REFERENCES sources(id),
+  created_token_id TEXT REFERENCES tokens(id),
+  created_agent TEXT,
+  created_origin TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  archived_at INTEGER
+);
+INSERT INTO sources_v5
+  (id, driver, environment, status, parent_source_id, created_token_id,
+   created_agent, created_origin, created_at, updated_at, archived_at)
+SELECT
+  id, driver, environment, status, parent_source_id, created_token_id,
+  created_agent, created_origin, created_at, updated_at, archived_at
+FROM sources;
+DROP TABLE sources;
+ALTER TABLE sources_v5 RENAME TO sources;
+CREATE INDEX sources_status ON sources(status, environment);
+"#;
+
 /// Long-lived admin keys. They never expire; only a hash is stored and a key
 /// can be revoked at any time. `last_used_at` is for operator visibility.
-const MIGRATION_5: &str = r#"
+const MIGRATION_6: &str = r#"
 CREATE TABLE IF NOT EXISTS admin_keys (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   key_hash TEXT NOT NULL UNIQUE,
@@ -303,6 +331,7 @@ impl Store {
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
                 [now_ms()],
             )?;
+            version = 3;
         }
         if version < 4 {
             transaction.execute_batch(MIGRATION_4)?;
@@ -310,15 +339,58 @@ impl Store {
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
                 [now_ms()],
             )?;
-        }
-        if version < 5 {
-            transaction.execute_batch(MIGRATION_5)?;
-            transaction.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
-                [now_ms()],
-            )?;
+            version = 4;
         }
         transaction.commit()?;
+
+        let sources_sql: String = conn.query_row(
+            "SELECT COALESCE(
+               (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'),
+               '')",
+            [],
+            |row| row.get(0),
+        )?;
+        // A v5 state created by the T-13 branch has admin_keys but not the SQLite
+        // driver in the sources CHECK. Repair it instead of trusting the number.
+        let needs_source_rebuild = !sources_sql.contains("'sqlite'");
+
+        if version < 5 || needs_source_rebuild {
+            // The sources CHECK cannot be altered in place. Foreign keys must be
+            // disabled outside a transaction; the rebuilt table is validated with
+            // `pragma_foreign_key_check` before the v5 transaction commits.
+            conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+            let transaction = conn.transaction()?;
+            transaction.execute_batch(MIGRATION_5)?;
+            let violations: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if violations > 0 {
+                return Err(Error::InvalidInput(
+                    "state migration would break foreign keys".to_string(),
+                ));
+            }
+            if version < 5 {
+                transaction.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+                    [now_ms()],
+                )?;
+                version = 5;
+            }
+            transaction.commit()?;
+            conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        }
+
+        if version < 6 {
+            let transaction = conn.transaction()?;
+            transaction.execute_batch(MIGRATION_6)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)",
+                [now_ms()],
+            )?;
+            transaction.commit()?;
+        }
 
         Ok(Self { conn })
     }
@@ -2771,4 +2843,158 @@ fn active_approval_count_for(conn: &Connection, column: &str, id: i64) -> Result
         }
     };
     Ok(conn.query_row(sql, [id], |row| row.get(0))?)
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    #[test]
+    fn v4_state_upgrades_without_losing_legacy_rows_or_foreign_keys() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("state.db");
+        {
+            let connection = Connection::open(&path).expect("create v4 state");
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (
+                       version INTEGER PRIMARY KEY,
+                       applied_at INTEGER NOT NULL
+                     );",
+                )
+                .expect("schema_migrations");
+            for migration in [MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply legacy migration");
+            }
+            connection
+                .execute_batch(
+                    "INSERT INTO schema_migrations (version, applied_at)
+                       VALUES (1, 1), (2, 2), (3, 3), (4, 4);
+                     INSERT INTO tokens (id, agent, token_hash, status, created_at)
+                       VALUES ('tok-1', 'legacy-agent', 'hash-1', 'active', 1);
+                     INSERT INTO sources
+                       (id, driver, environment, status, created_at, updated_at)
+                       VALUES ('legacy', 'postgres', 'nonproduction', 'active', 1, 1);
+                     INSERT INTO connection_profiles
+                       (source_id, name, purpose, credential_ref, created_at, updated_at)
+                       VALUES ('legacy', 'query', 'query', 'keyring:legacy/query', 1, 1);
+                     INSERT INTO tool_grants
+                       (token_id, source_id, tool, policy, created_at)
+                       VALUES ('tok-1', 'legacy', 'query_sql', 'direct', 1);
+                     INSERT INTO approvals
+                       (agent, source, tool, sql, params_json, status, channel,
+                        created_at, expires_at, decided_at)
+                       VALUES ('legacy-agent', 'legacy', 'query_sql', 'SELECT 1',
+                               '[]', 'approved', 'admin', 1, 2, 1);
+                     INSERT INTO audit
+                       (ts, agent, source, tool, sql, params_json, duration_ms,
+                        row_count, decision, channel, reason)
+                       VALUES ('2026-01-01T00:00:00Z', 'legacy-agent', 'legacy',
+                               'query_sql', 'SELECT 1', '[]', 5, 1, 'allowed',
+                               'mcp-client', NULL);",
+                )
+                .expect("load legacy rows");
+        }
+
+        let store = Store::open(&path).expect("upgrade to v6");
+        assert_eq!(store.schema_version().expect("version"), 6);
+        assert_eq!(
+            store.get_source("legacy").expect("legacy source").driver,
+            Driver::Postgres
+        );
+        assert_eq!(store.count_grants_for_source("legacy").expect("grants"), 1);
+
+        let sqlite = store
+            .create_source(&NewSource {
+                id: "sqlite-main".to_string(),
+                driver: Driver::Sqlite,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: Some("test".to_string()),
+            })
+            .expect("sqlite source after upgrade");
+        assert_eq!(sqlite.driver, Driver::Sqlite);
+        store
+            .create_grant(&NewGrant {
+                token_id: "tok-1".to_string(),
+                source_id: "sqlite-main".to_string(),
+                tool: Tool::QuerySql,
+                policy: None,
+            })
+            .expect("grant after upgrade");
+        drop(store);
+
+        let connection = Connection::open(&path).expect("inspect upgraded state");
+        for (table, expected) in [("approvals", 1), ("audit", 1), ("sources", 2)] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("row count");
+            assert_eq!(count, expected, "{table} rows changed");
+        }
+        let mut statement = connection
+            .prepare("PRAGMA foreign_key_check")
+            .expect("prepare foreign key check");
+        let violations = statement
+            .query_map([], |_| Ok(()))
+            .expect("foreign key check")
+            .count();
+        assert_eq!(violations, 0, "foreign keys broken after migration");
+    }
+
+    #[test]
+    fn t13_v5_state_without_sqlite_driver_is_repaired() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("state.db");
+        {
+            let connection = Connection::open(&path).expect("create v5 state");
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (
+                       version INTEGER PRIMARY KEY,
+                       applied_at INTEGER NOT NULL
+                     );",
+                )
+                .expect("schema_migrations");
+            for migration in [MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply legacy migration");
+            }
+            // The T-13 branch shipped admin_keys as v5 while the sources CHECK
+            // still only accepted postgres.
+            connection
+                .execute_batch(MIGRATION_6)
+                .expect("admin_keys table");
+            connection
+                .execute_batch(
+                    "INSERT INTO schema_migrations (version, applied_at)
+                       VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);",
+                )
+                .expect("mark v5");
+        }
+
+        let store = Store::open(&path).expect("repair v5");
+        assert_eq!(store.schema_version().expect("version"), 6);
+        let sqlite = store
+            .create_source(&NewSource {
+                id: "sqlite-main".to_string(),
+                driver: Driver::Sqlite,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: Some("test".to_string()),
+            })
+            .expect("sqlite source after v5 repair");
+        assert_eq!(sqlite.driver, Driver::Sqlite);
+        store
+            .create_admin_key("laptop", 1_000)
+            .expect("admin keys preserved");
+    }
 }
