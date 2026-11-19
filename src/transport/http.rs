@@ -24,6 +24,8 @@ pub async fn run(
     metadata: Arc<dyn MetadataProvider>,
     executor: Arc<dyn SqlExecutor>,
     provisioner: Arc<dyn Provisioner>,
+    credentials: Option<Arc<dyn crate::credentials::CredentialSink>>,
+    resolver: Option<Arc<dyn crate::credentials::CredentialResolver>>,
 ) -> io::Result<()> {
     let listener = TcpListener::bind(&config.addr).await?;
     let admin_listener = TcpListener::bind(&config.admin_addr).await?;
@@ -40,6 +42,9 @@ pub async fn run(
         store.clone(),
         config.provision_limits.clone(),
         config.approval_execution_ttl_ms,
+        credentials,
+        resolver,
+        Some(Arc::new(crate::connection_test::PostgresConnectionTester)),
     );
     let server = axum::serve(
         listener,

@@ -1,5 +1,13 @@
 # 变更记录
 
+## 2026-11-19
+
+- T-13 管理台改为内嵌中文 SPA（概览 / 访问令牌 / 待批请求 / 审计日志 / 数据源），同源 `/admin/api/*` 提供 source、profile、route、token、grant、approval、audit 的读写接口；不上 CDN、不使用前端框架。
+- 连接配置与工具路由支持管理页新增、修改、删除；用途与 tool 不可变，修改递增 `version`，旧审批执行前因版本变化被拒绝；仍被路由或未完成审批引用的对象不允许删除。
+- 管理页可直接录入 PostgreSQL 连接串，服务端立即加密写入凭证库，页面只显示“已加密配置”；“测试连接”仅执行只读查询并返回数据库、账号、服务端版本和耗时。
+- 新增永久管理员密钥：`admin-key create/list/revoke`，只存 SHA-256 hash、可随时吊销并记录 `last_used_at`；登录同时接受一次性令牌或管理员密钥，agent Bearer 仍不能访问管理面。
+- 基线同步更新 `SPEC.md` 与 `docs/PRD.md` 的管理面、AC2-10 和 profile/route 管理约定。
+
 ## 2026-11-18
 
 - T-03 legacy v1 迁移：`migrate-legacy` 先快照再 staging 导入，通过持久 journal 完成状态库与 TOML 的 cutover；`recover-legacy-migration` 只能前滚已提交切换或回滚提交点前状态。

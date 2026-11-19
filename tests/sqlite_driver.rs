@@ -373,7 +373,7 @@ fn sqlite_source_and_driver_survive_restart_and_discovery() {
     let dir = TempDir::new().expect("temp dir");
     let path = dir.path().join("state.db");
     let store = Store::open(&path).expect("open state");
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
 
     let issued = store.create_token("agent-sqlite").expect("token");
     let source = store

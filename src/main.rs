@@ -42,6 +42,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             if matches!(
                 command,
                 "admin-login-token"
+                    | "admin-key"
                     | "sources"
                     | "profiles"
                     | "routes"
@@ -70,11 +71,15 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let metadata: Arc<dyn MetadataProvider>;
             let executor: Arc<dyn SqlExecutor>;
             let provisioner: Arc<dyn mcp_db::provision::Provisioner>;
+            let credentials: Option<Arc<dyn mcp_db::credentials::CredentialSink>>;
+            let admin_resolver: Option<Arc<dyn mcp_db::credentials::CredentialResolver>>;
             match (&config.credential_store, &config.master_key_file) {
                 (Some(store_path), Some(key_path)) => {
                     let resolver = EncryptedFileResolver::open(store_path, key_path)
                         .map_err(|error| format!("credential init failed: {error}"))?;
                     let resolver = Arc::new(resolver);
+                    credentials = Some(resolver.clone());
+                    admin_resolver = Some(resolver.clone());
                     let connections = Arc::new(mcp_db::postgres::ProfileConnections::default());
                     let postgres_metadata: Arc<dyn MetadataProvider> = Arc::new(
                         PostgresMetadata::with_connections(resolver.clone(), connections.clone()),
@@ -108,6 +113,8 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     provisioner = Arc::new(mcp_db::provision::UnavailableProvisioner(
                         "credential store is not configured".to_string(),
                     ));
+                    credentials = None;
+                    admin_resolver = None;
                 }
             }
             let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -121,6 +128,8 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
                     metadata,
                     executor,
                     provisioner,
+                    credentials,
+                    admin_resolver,
                 ))
                 .map_err(|error| format!("server error: {error}"))
         }
@@ -195,7 +204,7 @@ fn run_recover(mut args: impl Iterator<Item = String>) -> Result<(), String> {
 
 fn print_help() {
     println!(
-        "mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
+"mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db admin-key create <label> Create a permanent admin key (shown once, revocable)\n  mcp-db admin-key list           List admin keys (never shows the secret)\n  mcp-db admin-key revoke <id>    Revoke an admin key immediately\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
         env!("CARGO_PKG_VERSION"),
         mcp_db::ADMIN_ADDR
     );
@@ -230,6 +239,66 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
             eprintln!("one-time admin login token, valid for 5 minutes");
             Ok(())
         }
+        "admin-key" => match args.next().as_deref() {
+            Some("create") => {
+                let label = args
+                    .next()
+                    .ok_or("admin-key create requires a label, e.g. laptop")?;
+                let key = store
+                    .create_admin_key(&label, now)
+                    .map_err(|error| error.to_string())?;
+                record_admin_audit(&store, "admin_key_created", "admin_key", Some(&label), None)?;
+                // Plaintext is printed exactly once; only the hash is persisted.
+                println!("{key}");
+                eprintln!(
+                    "permanent admin key created; it never expires. Revoke with: mcp-db admin-key revoke <id>"
+                );
+                Ok(())
+            }
+            Some("list") | None => {
+                let keys = store.list_admin_keys().map_err(|error| error.to_string())?;
+                if keys.is_empty() {
+                    println!("no admin keys");
+                    return Ok(());
+                }
+                for key in keys {
+                    println!(
+                        "{}\t{}\tcreated_at={}\tlast_used_at={}\t{}",
+                        key.id,
+                        key.label,
+                        key.created_at,
+                        key.last_used_at
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        if key.revoked_at.is_some() {
+                            "revoked"
+                        } else {
+                            "active"
+                        }
+                    );
+                }
+                Ok(())
+            }
+            Some("revoke") => {
+                let id = parse_id("admin-key revoke", args.next())?;
+                store
+                    .revoke_admin_key(id, now)
+                    .map_err(|error| error.to_string())?;
+                let id_text = id.to_string();
+                record_admin_audit(
+                    &store,
+                    "admin_key_revoked",
+                    "admin_key",
+                    Some(&id_text),
+                    None,
+                )?;
+                println!("revoked admin key {id}");
+                Ok(())
+            }
+            Some(other) => Err(format!(
+                "unknown admin-key subcommand: {other} (use create, list or revoke)"
+            )),
+        },
         "sources" => match args.next().as_deref() {
             Some("add") => {
                 let id = args.next().ok_or("sources add requires a source id")?;

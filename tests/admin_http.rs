@@ -12,9 +12,12 @@ use mcp_db::{
     UnavailableExecutor, UnavailableMetadata, UnavailableProvisioner, ADMIN_LOGIN_TTL_MS,
     DEFAULT_MAX_ROWS,
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+const HOST: &str = "127.0.0.1:8788";
+const ORIGIN: &str = "http://127.0.0.1:8788";
 
 struct Fixture {
     _dir: TempDir,
@@ -51,6 +54,9 @@ fn setup() -> Fixture {
         store.clone(),
         ProvisionLimits::default(),
         60_000,
+        None,
+        None,
+        None,
     ));
     Fixture {
         _dir: dir,
@@ -70,22 +76,29 @@ fn login_token(fixture: &Fixture, now: i64) -> String {
 fn admin_request(
     method: Method,
     uri: &str,
-    body: &str,
+    body: Option<&Value>,
     cookies: Option<&str>,
     origin: Option<&str>,
+    csrf: Option<&str>,
 ) -> Request<Body> {
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
-        .header(header::HOST, "127.0.0.1:8788")
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        .header(header::HOST, HOST);
+    if body.is_some() {
+        builder = builder.header(header::CONTENT_TYPE, "application/json");
+    }
     if let Some(cookies) = cookies {
         builder = builder.header(header::COOKIE, cookies);
     }
     if let Some(origin) = origin {
         builder = builder.header(header::ORIGIN, origin);
     }
-    builder.body(Body::from(body.to_string())).expect("request")
+    if let Some(csrf) = csrf {
+        builder = builder.header("x-mcpdb-csrf", csrf);
+    }
+    let body = body.map(|value| value.to_string()).unwrap_or_default();
+    builder.body(Body::from(body)).expect("request")
 }
 
 async fn send_text(router: Router, request: Request<Body>) -> (StatusCode, HeaderMap, String) {
@@ -105,6 +118,25 @@ async fn send_text(router: Router, request: Request<Body>) -> (StatusCode, Heade
     )
 }
 
+fn parse_body(text: &str) -> Value {
+    if text.trim().is_empty() {
+        return Value::Null;
+    }
+    for line in text.split(['\n', '\r']) {
+        if let Some(data) = line.strip_prefix("data:") {
+            if let Ok(value) = serde_json::from_str(data.trim()) {
+                return value;
+            }
+        }
+    }
+    serde_json::from_str(text.trim()).unwrap_or(Value::Null)
+}
+
+async fn send_json(router: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
+    let (status, headers, text) = send_text(router, request).await;
+    (status, headers, parse_body(&text))
+}
+
 fn set_cookie_values(headers: &HeaderMap) -> Vec<String> {
     headers
         .get_all(header::SET_COOKIE)
@@ -113,224 +145,70 @@ fn set_cookie_values(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-/// Logs in and returns `(cookie header for requests, csrf form value)`.
+fn session_cookie(headers: &HeaderMap) -> String {
+    let cookies = set_cookie_values(headers);
+    assert_eq!(cookies.len(), 1, "one session cookie: {cookies:?}");
+    let cookie = &cookies[0];
+    assert!(cookie.contains("mcpdb_admin="), "session cookie: {cookie}");
+    assert!(cookie.contains("HttpOnly"), "session cookie: {cookie}");
+    assert!(
+        cookie.contains("SameSite=Strict"),
+        "session cookie: {cookie}"
+    );
+    assert!(cookie.contains("Path=/admin"), "session cookie: {cookie}");
+    cookie.split(';').next().expect("cookie pair").to_string()
+}
+
+async fn fetch_challenge(fixture: &Fixture) -> String {
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/login-challenge",
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = body["challenge"].as_str().expect("challenge").to_string();
+    assert!(!challenge.is_empty());
+    challenge
+}
+
+/// Logs in over the normal same-origin path and returns `(cookie, session csrf)`.
 async fn login(fixture: &Fixture) -> (String, String) {
     let token = login_token(fixture, now_ms());
-    let (status, headers, _) = send_text(
+    let challenge = fetch_challenge(fixture).await;
+    let (status, headers, body) = send_json(
         fixture.admin.clone(),
         admin_request(
             Method::POST,
-            "/admin/login",
-            &format!("token={token}"),
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
             None,
-            None,
+            Some(ORIGIN),
+            Some(&challenge),
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "login should redirect");
-    let cookies = set_cookie_values(&headers);
-    assert_eq!(cookies.len(), 2, "session and csrf cookies: {cookies:?}");
-    assert!(cookies.iter().any(|cookie| cookie.contains("HttpOnly")));
-    let mut header = String::new();
-    let mut csrf = String::new();
-    for cookie in &cookies {
-        let pair = cookie.split(';').next().expect("cookie pair").to_string();
-        let (name, value) = pair.split_once('=').expect("cookie value");
-        if name == "mcpdb_admin" {
-            header.push_str(&pair);
-        } else if name == "mcpdb_csrf" {
-            csrf = value.to_string();
-            if !header.is_empty() {
-                header.push_str("; ");
-            }
-            header.push_str(&pair);
-        }
-    }
-    assert!(!csrf.is_empty(), "csrf cookie");
-    (header, csrf)
+    assert_eq!(status, StatusCode::OK, "login: {body}");
+    let cookie = session_cookie(&headers);
+    let csrf = body["csrf"].as_str().expect("session csrf").to_string();
+    assert!(!csrf.is_empty());
+    (cookie, csrf)
 }
 
-#[tokio::test]
-async fn login_token_is_single_use_and_expires() {
-    let fixture = setup();
-    let token = login_token(&fixture, now_ms());
-
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/login",
-            &format!("token={token}"),
-            None,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/login",
-            &format!("token={token}"),
-            None,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "token is single use");
-
-    let expired = login_token(&fixture, now_ms() - ADMIN_LOGIN_TTL_MS * 2);
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/login",
-            &format!("token={expired}"),
-            None,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "token must expire");
-}
-
-#[tokio::test]
-async fn csrf_is_required_and_checked() {
-    let fixture = setup();
-
-    // Without a session, browser navigation redirects but writes are unauthorized.
-    let (status, headers, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(Method::GET, "/admin", "", None, None),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FOUND);
-    assert_eq!(
-        headers
-            .get(header::LOCATION)
-            .and_then(|value| value.to_str().ok()),
-        Some("/admin/login")
-    );
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/approvals/1/approve",
-            "csrf=x",
-            None,
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let (cookie, csrf) = login(&fixture).await;
-
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/approvals/1/approve",
-            "",
-            Some(&cookie),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "missing csrf");
-
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/approvals/1/approve",
-            "csrf=wrong",
-            Some(&cookie),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "wrong csrf");
-
-    // A valid csrf passes the guard and reaches the store (approval does not exist).
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/approvals/1/approve",
-            &format!("csrf={csrf}"),
-            Some(&cookie),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn wrong_origin_is_rejected_before_consuming_the_token() {
-    let fixture = setup();
-    let token = login_token(&fixture, now_ms());
-
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/login",
-            &format!("token={token}"),
-            None,
-            Some("http://evil.example"),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-
-    // The rejected request must not have burned the token.
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            "/admin/login",
-            &format!("token={token}"),
-            None,
-            Some("http://127.0.0.1:8788"),
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-}
-
-#[tokio::test]
-async fn agent_bearer_token_cannot_open_admin() {
-    let fixture = setup();
-    let agent = {
-        let store = fixture.store.lock().expect("store lock");
-        store.create_token("agent-a").expect("agent token").token
-    };
-    let (cookie, _) = login(&fixture).await;
-
-    for cookie in [None, Some(cookie.as_str())] {
-        let mut builder = Request::builder()
-            .method(Method::GET)
-            .uri("/admin")
-            .header(header::HOST, "127.0.0.1:8788")
-            .header(header::AUTHORIZATION, format!("Bearer {agent}"));
-        if let Some(cookie) = cookie {
-            builder = builder.header(header::COOKIE, cookie);
-        }
-        let (status, _, _) = send_text(
-            fixture.admin.clone(),
-            builder.body(Body::empty()).expect("request"),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "agent token must never authenticate the admin UI"
-        );
-    }
+fn write_request(
+    method: Method,
+    uri: &str,
+    body: Option<&Value>,
+    cookie: &str,
+    csrf: &str,
+) -> Request<Body> {
+    admin_request(method, uri, body, Some(cookie), Some(ORIGIN), Some(csrf))
 }
 
 fn create_pending_approval(fixture: &Fixture) -> i64 {
@@ -379,8 +257,8 @@ fn create_pending_approval(fixture: &Fixture) -> i64 {
         source_id: "a".to_string(),
         source_environment: Environment::NonProduction,
         tool: Tool::MutateSql,
-        sql: Some("UPDATE users SET name = 'x' WHERE id = 1".to_string()),
-        params_json: "[]".to_string(),
+        sql: Some("UPDATE users SET name = $1 WHERE id = $2".to_string()),
+        params_json: r#"["secret-business-value",42]"#.to_string(),
         profile_id: profile.id,
         profile_version: profile.version,
         route_id: route.id,
@@ -406,62 +284,7 @@ fn create_pending_approval(fixture: &Fixture) -> i64 {
         .id
 }
 
-#[tokio::test]
-async fn approval_decision_runs_once() {
-    let fixture = setup();
-    let id = create_pending_approval(&fixture);
-    let (cookie, csrf) = login(&fixture).await;
-    let body = format!("csrf={csrf}");
-
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            &format!("/admin/approvals/{id}/approve"),
-            &body,
-            Some(&cookie),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-
-    let decided_at = {
-        let store = fixture.store.lock().expect("store lock");
-        let record = store.get_approval(id).expect("approval");
-        assert_eq!(record.status, ApprovalStatus::Approved);
-        assert_eq!(record.decided_by.as_deref(), Some("admin-web"));
-        record.decided_at
-    };
-
-    // Replaying the same URL must not apply the decision again.
-    let (status, _, _) = send_text(
-        fixture.admin.clone(),
-        admin_request(
-            Method::POST,
-            &format!("/admin/approvals/{id}/approve"),
-            &body,
-            Some(&cookie),
-            None,
-        ),
-    )
-    .await;
-    assert_eq!(status, StatusCode::CONFLICT);
-
-    let store = fixture.store.lock().expect("store lock");
-    let record = store.get_approval(id).expect("approval");
-    assert_eq!(record.status, ApprovalStatus::Approved);
-    assert_eq!(record.decided_at, decided_at);
-    let approvals = store
-        .list_recent_audit(100)
-        .expect("audit")
-        .into_iter()
-        .filter(|event| event.approval_id == Some(id) && event.event == "approved")
-        .count();
-    assert_eq!(approvals, 1, "decision audited exactly once");
-}
-
-fn grant_read_access(fixture: &Fixture) -> String {
+fn create_read_access(fixture: &Fixture) -> String {
     let store = fixture.store.lock().expect("store lock");
     let token = store.create_token("agent-a").expect("token");
     store
@@ -520,25 +343,6 @@ fn mcp_request(body: &str, token: &str, session: Option<&str>) -> Request<Body> 
     builder.body(Body::from(body.to_string())).expect("request")
 }
 
-async fn send_json(router: Router, request: Request<Body>) -> (StatusCode, HeaderMap, Value) {
-    let (status, headers, text) = send_text(router, request).await;
-    (status, headers, parse_body(&text))
-}
-
-fn parse_body(text: &str) -> Value {
-    if text.trim().is_empty() {
-        return Value::Null;
-    }
-    for line in text.lines() {
-        if let Some(data) = line.strip_prefix("data:") {
-            if let Ok(value) = serde_json::from_str(data.trim()) {
-                return value;
-            }
-        }
-    }
-    serde_json::from_str(text.trim()).unwrap_or(Value::Null)
-}
-
 async fn init_mcp_session(router: Router, token: &str) -> String {
     let initialize = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"1.0"}}}"#;
     let (status, headers, _) =
@@ -556,48 +360,932 @@ async fn init_mcp_session(router: Router, token: &str) -> String {
     session
 }
 
-#[tokio::test]
-async fn archived_source_disappears_from_mcp_list_sources() {
-    let fixture = setup();
-    let token = grant_read_access(&fixture);
-    let mcp = mcp_db::transport::http::app(fixture.state.clone());
-    let session = init_mcp_session(mcp.clone(), &token).await;
+async fn mcp_sources(router: Router, token: &str, session: &str) -> Vec<Value> {
     let list_sources = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sources","arguments":{}}}"#;
-
-    let (status, _, body) = send_json(
-        mcp.clone(),
-        mcp_request(list_sources, &token, Some(&session)),
-    )
-    .await;
+    let (status, _, text) =
+        send_text(router, mcp_request(list_sources, token, Some(session))).await;
     assert_eq!(status, StatusCode::OK);
-    let sources = body["result"]["structuredContent"]["sources"]
+    let body = parse_body(&text);
+    body["result"]["structuredContent"]["sources"]
         .as_array()
-        .expect("sources");
-    assert_eq!(sources.len(), 1);
+        .unwrap_or_else(|| panic!("unexpected list_sources response: {text}"))
+        .clone()
+}
 
-    let (cookie, csrf) = login(&fixture).await;
-    let (status, _, _) = send_text(
+#[tokio::test]
+async fn login_token_is_single_use_and_expires() {
+    let fixture = setup();
+    let token = login_token(&fixture, now_ms());
+    let challenge = fetch_challenge(&fixture).await;
+
+    let (status, _, _) = send_json(
         fixture.admin.clone(),
         admin_request(
             Method::POST,
-            "/admin/sources/a/archive",
-            &format!("csrf={csrf}"),
-            Some(&cookie),
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some("null"),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid null-origin login with challenge"
+    );
+
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some(ORIGIN),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "token is single use");
+
+    let expired = login_token(&fixture, now_ms() - ADMIN_LOGIN_TTL_MS * 2);
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": expired })),
+            None,
+            Some(ORIGIN),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "token must expire");
+}
+
+#[tokio::test]
+async fn permanent_admin_key_can_log_in_repeatedly_until_revoked() {
+    let fixture = setup();
+    let key = {
+        let store = fixture.store.lock().expect("store lock");
+        store.create_admin_key("test", now_ms()).expect("admin key")
+    };
+
+    for _ in 0..2 {
+        let challenge = fetch_challenge(&fixture).await;
+        let (status, _, body) = send_json(
+            fixture.admin.clone(),
+            admin_request(
+                Method::POST,
+                "/admin/api/login",
+                Some(&json!({ "token": key })),
+                None,
+                Some(ORIGIN),
+                Some(&challenge),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "permanent key login: {body}");
+    }
+
+    let id = {
+        let store = fixture.store.lock().expect("store lock");
+        store.list_admin_keys().expect("list keys")[0].id
+    };
+    {
+        let store = fixture.store.lock().expect("store lock");
+        store.revoke_admin_key(id, now_ms()).expect("revoke");
+    }
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": key })),
+            None,
+            Some(ORIGIN),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked key is rejected");
+}
+
+#[tokio::test]
+async fn null_origin_login_requires_a_page_challenge() {
+    let fixture = setup();
+    let token = login_token(&fixture, now_ms());
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some("null"),
             None,
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "null origin needs a challenge"
+    );
 
-    let (status, _, body) = send_json(mcp, mcp_request(list_sources, &token, Some(&session))).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some("null"),
+            Some("forged-challenge"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "wrong challenge");
+
+    // A rejected null request must not burn the login token.
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some("null"),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "challenge proves the page context");
+}
+
+#[tokio::test]
+async fn cross_origin_and_cross_port_are_rejected() {
+    let fixture = setup();
+    let token = login_token(&fixture, now_ms());
+
+    for origin in [
+        "http://evil.example",
+        "http://127.0.0.1:9999",
+        "https://127.0.0.1:8788",
+        "http://127.0.0.1:8788.evil.example",
+    ] {
+        let challenge = fetch_challenge(&fixture).await;
+        let (status, _, _) = send_json(
+            fixture.admin.clone(),
+            admin_request(
+                Method::POST,
+                "/admin/api/login",
+                Some(&json!({ "token": token })),
+                None,
+                Some(origin),
+                Some(&challenge),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "origin {origin}");
+    }
+
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some(ORIGIN),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "rejected requests did not consume token"
+    );
+}
+
+#[tokio::test]
+async fn agent_bearer_token_cannot_open_admin() {
+    let fixture = setup();
+    let agent = {
+        let store = fixture.store.lock().expect("store lock");
+        store.create_token("agent-a").expect("agent token").token
+    };
+    let (cookie, _) = login(&fixture).await;
+
+    for cookie in [None, Some(cookie.as_str())] {
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri("/admin/api/session")
+            .header(header::HOST, HOST)
+            .header(header::ORIGIN, ORIGIN)
+            .header(header::AUTHORIZATION, format!("Bearer {agent}"));
+        if let Some(cookie) = cookie {
+            builder = builder.header(header::COOKIE, cookie);
+        }
+        let (status, _, _) = send_text(
+            fixture.admin.clone(),
+            builder.body(Body::empty()).expect("request"),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "agent token must never authenticate the admin UI"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_cookie_and_security_headers_cover_all_responses() {
+    let fixture = setup();
+
+    let (status, _, page) = send_text(
+        fixture.admin.clone(),
+        admin_request(Method::GET, "/admin/login", None, None, None, None),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    let sources = body["result"]["structuredContent"]["sources"]
-        .as_array()
-        .expect("sources");
+    assert!(page.contains("mcp-db 管理台"));
+    assert!(page.contains("/admin/assets/app.js"));
+    assert!(page.contains("mcpdb-login-challenge"));
+    assert!(!page.contains("__MCPDB_LOGIN_CHALLENGE__"));
+    assert!(page.contains("<script src=\"/admin/assets/app.js\" defer></script>"));
+    assert!(!page.contains("<script>"));
+
+    let (status, headers, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(Method::GET, "/admin", None, None, None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FOUND, "no session redirects to login");
+
+    for (path, expected_type) in [
+        ("/admin/assets/app.css", Some("text/css")),
+        ("/admin/assets/app.js", Some("javascript")),
+    ] {
+        let (status, headers, _) = send_text(
+            fixture.admin.clone(),
+            admin_request(Method::GET, path, None, None, None, None),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            content_type.contains(expected_type.unwrap()),
+            "{path}: {content_type}"
+        );
+        assert_security_headers(&headers);
+    }
+    assert_security_headers(&headers);
+
+    let (status, headers, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(Method::GET, "/admin/does-not-exist", None, None, None, None),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_security_headers(&headers);
+
+    let (_, headers, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(Method::GET, "/admin/api/session", None, None, None, None),
+    )
+    .await;
+    assert_security_headers(&headers);
+}
+
+fn assert_security_headers(headers: &HeaderMap) {
+    let header_value = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+    };
+    let csp = header_value(header::CONTENT_SECURITY_POLICY);
+    for directive in [
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "connect-src 'self'",
+        "form-action 'self'",
+        "base-uri 'none'",
+        "frame-ancestors 'none'",
+    ] {
+        assert!(csp.contains(directive), "CSP missing {directive}: {csp}");
+    }
+    assert_eq!(header_value(header::X_CONTENT_TYPE_OPTIONS), "nosniff");
+    assert_eq!(header_value(header::REFERRER_POLICY), "no-referrer");
+    assert!(header_value(header::CACHE_CONTROL).contains("no-store"));
+}
+
+#[tokio::test]
+async fn csrf_is_required_and_checked_for_writes() {
+    let fixture = setup();
+
+    let (status, _, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "agent-a" })),
+            None,
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "session required");
+
+    let (cookie, csrf) = login(&fixture).await;
+
+    let (status, _, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "agent-a" })),
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "missing csrf");
+
+    let (status, _, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "agent-a" })),
+            Some(&cookie),
+            Some(ORIGIN),
+            Some("wrong"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "wrong csrf");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "agent-a" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert!(body["plaintext"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("mcpdb_"));
+
+    // Reads need the session but no CSRF header.
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/tokens",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["tokens"].as_array().expect("tokens").len(), 1);
+}
+
+#[tokio::test]
+async fn null_origin_writes_still_require_the_session_csrf() {
+    let fixture = setup();
+    let token = login_token(&fixture, now_ms());
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, headers, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": token })),
+            None,
+            Some("null"),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cookie = session_cookie(&headers);
+    let csrf = body["csrf"].as_str().expect("csrf").to_string();
+
+    let (status, _, _) = send_text(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "agent-null" })),
+            Some(&cookie),
+            Some("null"),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "null alone is not trust");
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "agent-null" })),
+            Some(&cookie),
+            Some("null"),
+            Some(&csrf),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "session csrf authorizes the write"
+    );
+}
+
+#[tokio::test]
+async fn source_profile_route_and_environment_apis() {
+    let fixture = setup();
+    let (cookie, csrf) = login(&fixture).await;
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources",
+            Some(&json!({ "id": "a", "environment": "nonproduction" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/profiles",
+            Some(&json!({
+                "name": "query_ro",
+                "purpose": "query",
+                "credential_ref": "keyring:mcp-db/a/query",
+                "max_connections": 3,
+                "statement_timeout_ms": 5000
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let profile_id = body["profile"]["id"].as_i64().expect("profile id");
+    assert_eq!(body["profile"]["credential_ref"], "keyring:mcp-db/a/query");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/routes",
+            Some(&json!({
+                "tool": "list_tables",
+                "profile_id": profile_id,
+                "min_approval_policy": "direct"
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["route"]["profile_name"], "query_ro");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/sources/a",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["profiles"].as_array().expect("profiles").len(), 1);
+    assert_eq!(body["routes"].as_array().expect("routes").len(), 1);
+    assert_eq!(body["source"]["profile_count"], 1);
+    assert!(!body.to_string().contains("postgres://"));
+
+    // A source must be archived before its environment can be reclassified.
+    let (status, _, _) = send_text(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/environment",
+            Some(&json!({ "environment": "production" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/archive",
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/environment",
+            Some(&json!({ "environment": "production" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["source"]["environment"], "production");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/restore",
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "restore needs a grant");
+    assert!(body["error"].as_str().unwrap_or_default().contains("grant"));
+}
+
+#[tokio::test]
+async fn production_write_grants_and_wrong_purpose_routes_are_rejected() {
+    let fixture = setup();
+    let (cookie, csrf) = login(&fixture).await;
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources",
+            Some(&json!({ "id": "prod", "environment": "production" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "writer" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let token_id = body["token"]["id"].as_str().expect("token id").to_string();
+
+    for tool in ["mutate_sql", "execute_ddl"] {
+        let (status, _, body) = send_json(
+            fixture.admin.clone(),
+            write_request(
+                Method::POST,
+                &format!("/admin/api/tokens/{token_id}/grants"),
+                Some(&json!({ "source_id": "prod", "tool": tool, "policy": "approval" })),
+                &cookie,
+                &csrf,
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{tool}: {body}");
+    }
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            &format!("/admin/api/tokens/{token_id}/grants"),
+            Some(&json!({ "source_id": "prod", "tool": "query_sql", "policy": "direct" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/prod/profiles",
+            Some(&json!({
+                "name": "mutate",
+                "purpose": "mutate",
+                "credential_ref": "keyring:mcp-db/prod/mutate"
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let profile_id = body["profile"]["id"].as_i64().expect("profile id");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/prod/routes",
+            Some(&json!({
+                "tool": "list_tables",
+                "profile_id": profile_id,
+                "min_approval_policy": "direct"
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "wrong purpose route: {body}"
+    );
+}
+
+#[tokio::test]
+async fn archived_source_disappears_from_mcp_list_sources() {
+    let fixture = setup();
+    let token = create_read_access(&fixture);
+    let mcp = mcp_db::transport::http::app(fixture.state.clone());
+    let session = init_mcp_session(mcp.clone(), &token).await;
+    assert_eq!(mcp_sources(mcp.clone(), &token, &session).await.len(), 1);
+
+    let (cookie, csrf) = login(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/a/archive",
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let sources = mcp_sources(mcp, &token, &session).await;
     assert!(
         sources.is_empty(),
         "archived source must disappear: {sources:?}"
     );
+}
+
+#[tokio::test]
+async fn revoking_a_grant_takes_effect_for_the_next_mcp_call() {
+    let fixture = setup();
+    let token = create_read_access(&fixture);
+    let mcp = mcp_db::transport::http::app(fixture.state.clone());
+    let session = init_mcp_session(mcp.clone(), &token).await;
+    assert_eq!(mcp_sources(mcp.clone(), &token, &session).await.len(), 1);
+
+    let token_id = {
+        let store = fixture.store.lock().expect("store lock");
+        store.list_tokens().expect("tokens")[0].id.clone()
+    };
+    let (cookie, csrf) = login(&fixture).await;
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/tokens/{token_id}/grants?source=a&tool=list_tables"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let sources = mcp_sources(mcp, &token, &session).await;
+    assert!(
+        sources.is_empty(),
+        "revoked grant must take effect: {sources:?}"
+    );
+}
+
+#[tokio::test]
+async fn approval_detail_and_duplicate_decision() {
+    let fixture = setup();
+    let id = create_pending_approval(&fixture);
+    let (cookie, csrf) = login(&fixture).await;
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/approvals",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let approvals = body["approvals"].as_array().expect("approvals");
+    assert_eq!(approvals.len(), 1);
+    let record = &approvals[0];
+    assert_eq!(record["sql"], "UPDATE users SET name = $1 WHERE id = $2");
+    assert_eq!(record["params_json"], r#"["secret-business-value",42]"#);
+    assert!(record["profile_version"].as_i64().unwrap_or_default() >= 1);
+    assert!(record["route_version"].as_i64().unwrap_or_default() >= 1);
+    assert!(record["request_digest"].as_str().unwrap_or_default().len() == 64);
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            &format!("/admin/api/approvals/{id}/approve"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let decided_at = {
+        let store = fixture.store.lock().expect("store lock");
+        let record = store.get_approval(id).expect("approval");
+        assert_eq!(record.status, ApprovalStatus::Approved);
+        assert_eq!(record.decided_by.as_deref(), Some("admin-web"));
+        record.decided_at
+    };
+
+    let (status, _, _) = send_text(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            &format!("/admin/api/approvals/{id}/approve"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "decision is one-shot");
+
+    let store = fixture.store.lock().expect("store lock");
+    let record = store.get_approval(id).expect("approval");
+    assert_eq!(record.status, ApprovalStatus::Approved);
+    assert_eq!(record.decided_at, decided_at);
+    let approved_events = store
+        .query_audit(None, None, Some("allowed"), 100, 0)
+        .expect("audit")
+        .0
+        .into_iter()
+        .filter(|event| event.approval_id == Some(id) && event.event == "approved")
+        .count();
+    assert_eq!(approved_events, 1, "decision audited exactly once");
+}
+
+#[tokio::test]
+async fn audit_filters_paginates_and_never_contains_token_plaintext() {
+    let fixture = setup();
+    let (cookie, csrf) = login(&fixture).await;
+
+    let (_, _, created) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/tokens",
+            Some(&json!({ "agent": "audited" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    let plaintext = created["plaintext"]
+        .as_str()
+        .expect("plaintext")
+        .to_string();
+    assert!(plaintext.starts_with("mcpdb_"));
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/audit?limit=1&offset=0",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["items"].as_array().expect("items").len(), 1);
+    assert!(body["total"].as_i64().unwrap_or_default() >= 1);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/audit?decision=allowed&limit=50",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body["items"].as_array().expect("items").is_empty());
+    for item in body["items"].as_array().expect("items") {
+        assert_eq!(item["decision"], "allowed");
+    }
+    let rendered = body.to_string();
+    assert!(!rendered.contains(&plaintext));
+    assert!(!rendered.contains("token_hash"));
+    assert!(!rendered.contains("mcpdb-admin"));
+}
+
+#[tokio::test]
+async fn overview_reports_real_counts() {
+    let fixture = setup();
+    create_read_access(&fixture);
+    let (cookie, _) = login(&fixture).await;
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/overview",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sources"]["total"], 1);
+    assert_eq!(body["sources"]["active"], 1);
+    assert_eq!(body["sources"]["archived"], 0);
+    assert_eq!(body["tokens"]["active"], 1);
+    assert_eq!(body["tokens"]["revoked"], 0);
+    assert!(body["audit_total"].as_i64().unwrap_or_default() >= 1);
 }
 
 #[tokio::test]
@@ -641,18 +1329,36 @@ async fn web_settles_quarantined_reservation() {
     };
 
     let (cookie, csrf) = login(&fixture).await;
-    let (status, _, _) = send_text(
+    let (status, _, body) = send_json(
         fixture.admin.clone(),
         admin_request(
-            Method::POST,
-            &format!("/admin/reservations/{reservation_id}/release"),
-            &format!("csrf={csrf}"),
+            Method::GET,
+            "/admin/api/reservations?status=quarantined",
+            None,
             Some(&cookie),
+            Some(ORIGIN),
             None,
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["reservations"].as_array().expect("reservations").len(),
+        1
+    );
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            &format!("/admin/api/reservations/{reservation_id}/release"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
     let store = fixture.store.lock().expect("store lock");
     let reservation = store.get_reservation(reservation_id).expect("reservation");
@@ -661,48 +1367,132 @@ async fn web_settles_quarantined_reservation() {
 }
 
 #[tokio::test]
-async fn dashboard_shows_audit_without_credentials() {
+async fn profiles_and_routes_support_update_delete_and_versioning() {
     let fixture = setup();
-    let id = create_pending_approval(&fixture);
     let (cookie, csrf) = login(&fixture).await;
-    let (status, _, _) = send_text(
+
+    let (status, _, body) = send_json(
         fixture.admin.clone(),
-        admin_request(
+        write_request(
             Method::POST,
-            &format!("/admin/approvals/{id}/approve"),
-            &format!("csrf={csrf}"),
-            Some(&cookie),
-            None,
+            "/admin/api/sources",
+            Some(&json!({ "id": "crud", "environment": "nonproduction" })),
+            &cookie,
+            &csrf,
         ),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 
-    let (status, headers, page) = send_text(
+    let (status, _, body) = send_json(
         fixture.admin.clone(),
-        admin_request(Method::GET, "/admin", "", Some(&cookie), None),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/crud/profiles",
+            Some(&json!({
+                "name": "query_ro",
+                "purpose": "query",
+                "credential_ref": "keyring:mcp-db/crud/query",
+                "max_connections": 2,
+                "statement_timeout_ms": 1000
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let profile_id = body["profile"]["id"].as_i64().expect("profile id");
+    assert_eq!(body["profile"]["version"], 1);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::PUT,
+            &format!("/admin/api/sources/crud/profiles/{profile_id}"),
+            Some(&json!({
+                "name": "query_ro",
+                "enabled": false,
+                "max_connections": 3,
+                "statement_timeout_ms": 2000
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["profile"]["version"], 2);
+    assert_eq!(body["profile"]["enabled"], false);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/crud/routes",
+            Some(&json!({
+                "tool": "list_tables",
+                "profile_id": profile_id
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let route_id = body["route"]["id"].as_i64().expect("route id");
+    assert_eq!(body["route"]["version"], 1);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::PUT,
+            &format!("/admin/api/sources/crud/routes/{route_id}"),
+            Some(&json!({ "profile_id": profile_id, "min_approval_policy": "direct" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"]["version"], 2);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/sources/crud/profiles/{profile_id}"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "referenced profile: {body}");
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/sources/crud/routes/{route_id}"),
+            None,
+            &cookie,
+            &csrf,
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("text/html; charset=utf-8")
-    );
-    assert!(page.contains("Recent audit"));
-    assert!(page.contains("approved"));
-    assert!(page.contains("admin-web"));
-    assert!(page.contains("Sources"));
-    assert!(page.contains("a"));
-    assert!(
-        page.contains(&format!("value=\"{csrf}\"")),
-        "csrf form field"
-    );
-    for secret in ["keyring:", "password", "mcpdb_admin_", "mcpdb_"] {
-        assert!(
-            !page.contains(secret),
-            "admin page must not expose {secret}"
-        );
-    }
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/sources/crud/profiles/{profile_id}"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

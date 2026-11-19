@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 
 use crate::approval::{
     ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalRecord, ApprovalStatus, AuditEvent,
@@ -11,13 +12,13 @@ use crate::approval::{
 use crate::auth;
 use crate::error::{Error, Result};
 use crate::state::model::{
-    validate_credential_ref, validate_profile_name, validate_source_id, ApprovalPolicy, Driver,
-    Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
-    ProfilePurpose, ProvisionUsage, QuotaReservation, ReservationStatus, Route, Source,
-    SourceStatus, TokenIdentity, Tool,
+    validate_credential_ref, validate_profile_name, validate_source_id, AdminKey, ApprovalPolicy,
+    Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
+    ProfilePurpose, ProfileUpdate, ProvisionUsage, QuotaReservation, ReservationStatus, Route,
+    RouteUpdate, Source, SourceStatus, TokenIdentity, TokenRecord, Tool,
 };
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -250,6 +251,21 @@ ALTER TABLE sources_v5 RENAME TO sources;
 CREATE INDEX sources_status ON sources(status, environment);
 "#;
 
+/// Long-lived admin keys. They never expire; only a hash is stored and a key
+/// can be revoked at any time. `last_used_at` is for operator visibility.
+const MIGRATION_6: &str = r#"
+CREATE TABLE IF NOT EXISTS admin_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_hash TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS admin_keys_active
+  ON admin_keys(revoked_at);
+"#;
+
 pub struct Store {
     conn: Connection,
 }
@@ -315,6 +331,7 @@ impl Store {
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (3, ?)",
                 [now_ms()],
             )?;
+            version = 3;
         }
         if version < 4 {
             transaction.execute_batch(MIGRATION_4)?;
@@ -322,10 +339,22 @@ impl Store {
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
                 [now_ms()],
             )?;
+            version = 4;
         }
         transaction.commit()?;
 
-        if version < 5 {
+        let sources_sql: String = conn.query_row(
+            "SELECT COALESCE(
+               (SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'sources'),
+               '')",
+            [],
+            |row| row.get(0),
+        )?;
+        // A v5 state created by the T-13 branch has admin_keys but not the SQLite
+        // driver in the sources CHECK. Repair it instead of trusting the number.
+        let needs_source_rebuild = !sources_sql.contains("'sqlite'");
+
+        if version < 5 || needs_source_rebuild {
             // The sources CHECK cannot be altered in place. Foreign keys must be
             // disabled outside a transaction; the rebuilt table is validated with
             // `pragma_foreign_key_check` before the v5 transaction commits.
@@ -342,12 +371,25 @@ impl Store {
                     "state migration would break foreign keys".to_string(),
                 ));
             }
+            if version < 5 {
+                transaction.execute(
+                    "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+                    [now_ms()],
+                )?;
+                version = 5;
+            }
+            transaction.commit()?;
+            conn.execute_batch("PRAGMA foreign_keys = ON")?;
+        }
+
+        if version < 6 {
+            let transaction = conn.transaction()?;
+            transaction.execute_batch(MIGRATION_6)?;
             transaction.execute(
-                "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (6, ?)",
                 [now_ms()],
             )?;
             transaction.commit()?;
-            conn.execute_batch("PRAGMA foreign_keys = ON")?;
         }
 
         Ok(Self { conn })
@@ -413,6 +455,27 @@ impl Store {
             params![token_id, agent, token_hash, now_ms()],
         )?;
         Ok(token_id)
+    }
+
+    /// Administrative token listing. Only identifying metadata is returned; the stored
+    /// hash and the one-time plaintext are never exposed.
+    pub fn list_tokens(&self) -> Result<Vec<TokenRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, agent, status, created_at, revoked_at
+               FROM tokens ORDER BY created_at DESC, id DESC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(TokenRecord {
+                    id: row.get(0)?,
+                    agent: row.get(1)?,
+                    status: row.get(2)?,
+                    created_at: row.get(3)?,
+                    revoked_at: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn authenticate(&self, raw_token: &str) -> Result<TokenIdentity> {
@@ -495,6 +558,71 @@ impl Store {
         } else {
             Err(Error::Unauthenticated)
         }
+    }
+
+    /// Creates a long-lived admin key and returns its plaintext exactly once.
+    /// The key never expires; only a SHA-256 hash is persisted.
+    pub fn create_admin_key(&self, label: &str, now: i64) -> Result<String> {
+        let label = label.trim();
+        if label.is_empty() || label.chars().count() > 64 || label.chars().any(|c| c.is_control()) {
+            return Err(Error::InvalidInput(
+                "admin key label must be 1-64 printable characters".to_string(),
+            ));
+        }
+        let key = auth::generate_admin_key();
+        let hash = auth::hash_token(&key);
+        self.conn.execute(
+            "INSERT INTO admin_keys (key_hash, label, created_at) VALUES (?, ?, ?)",
+            params![hash, label, now],
+        )?;
+        Ok(key)
+    }
+
+    /// Verifies a long-lived admin key and records its last use. Revoked or
+    /// unknown keys return the same error.
+    pub fn authenticate_admin_key(&self, raw_key: &str, now: i64) -> Result<()> {
+        let hash = auth::hash_token(raw_key.trim());
+        let changed = self.conn.execute(
+            "UPDATE admin_keys SET last_used_at = ?
+              WHERE key_hash = ? AND revoked_at IS NULL",
+            params![now, hash],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Unauthenticated)
+        }
+    }
+
+    pub fn revoke_admin_key(&self, id: i64, now: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE admin_keys SET revoked_at = ?
+              WHERE id = ? AND revoked_at IS NULL",
+            params![now, id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::NotFound(format!("admin key {id}")))
+        }
+    }
+
+    pub fn list_admin_keys(&self) -> Result<Vec<AdminKey>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, label, created_at, last_used_at, revoked_at
+               FROM admin_keys ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(AdminKey {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                created_at: row.get(2)?,
+                last_used_at: row.get(3)?,
+                revoked_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     pub fn create_source(&self, source: &NewSource) -> Result<Source> {
@@ -825,6 +953,107 @@ impl Store {
         })
     }
 
+    /// Updates mutable profile fields and bumps `version`. Purpose is immutable.
+    pub fn update_profile(
+        &self,
+        source_id: &str,
+        id: i64,
+        update: &ProfileUpdate,
+    ) -> Result<Profile> {
+        let source = self.get_source(source_id)?;
+        if source.status != SourceStatus::Active {
+            return Err(Error::InvalidInput(
+                "归档数据源上的连接配置不能修改".to_string(),
+            ));
+        }
+        let current = self.get_profile(id)?;
+        if current.source_id != source_id {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        validate_profile_name(&update.name)?;
+        if update.name != current.name {
+            let duplicate: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM connection_profiles
+                  WHERE source_id = ? AND name = ? AND id <> ?",
+                params![source_id, update.name, id],
+                |row| row.get(0),
+            )?;
+            if duplicate > 0 {
+                return Err(Error::Conflict(format!(
+                    "数据源 {source_id} 上已存在同名连接配置：{}",
+                    update.name
+                )));
+            }
+        }
+        let credential_ref = update
+            .credential_ref
+            .clone()
+            .unwrap_or_else(|| current.credential_ref.clone());
+        validate_credential_ref(&credential_ref)?;
+        let provision_namespace = credential_ref.starts_with("keyring:provision/");
+        if (current.purpose == ProfilePurpose::Provision) != provision_namespace {
+            return Err(Error::InvalidInput(
+                "provision profiles must use keyring:provision/ and other profiles must not"
+                    .to_string(),
+            ));
+        }
+        crate::postgres::validate_limits(update.max_connections, update.statement_timeout_ms)?;
+        let changed = self.conn.execute(
+            "UPDATE connection_profiles
+                SET name = ?, credential_ref = ?, enabled = ?,
+                    max_connections = ?, statement_timeout_ms = ?,
+                    version = version + 1, updated_at = ?
+              WHERE id = ? AND source_id = ?",
+            params![
+                update.name,
+                credential_ref,
+                if update.enabled { 1 } else { 0 },
+                update.max_connections.map(i64::from),
+                update.statement_timeout_ms.map(|value| value as i64),
+                now_ms(),
+                id,
+                source_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        self.get_profile(id)
+    }
+
+    /// Deletes an unused profile. Referenced profiles must be detached first so a
+    /// route or an in-flight approval can never point at a missing connection.
+    pub fn delete_profile(&self, source_id: &str, id: i64) -> Result<()> {
+        let profile = self.get_profile(id)?;
+        if profile.source_id != source_id {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        let routes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM source_tool_routes WHERE profile_id = ?",
+            [id],
+            |row| row.get(0),
+        )?;
+        if routes > 0 {
+            return Err(Error::Conflict(format!(
+                "连接配置 {id} 仍被 {routes} 个工具路由引用，请先删除或改绑这些路由"
+            )));
+        }
+        let approvals = active_approval_count_for(&self.conn, "profile_id", id)?;
+        if approvals > 0 {
+            return Err(Error::Conflict(format!(
+                "连接配置 {id} 还有 {approvals} 个待批/已批请求，请先处理"
+            )));
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM connection_profiles WHERE id = ? AND source_id = ?",
+            params![id, source_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        Ok(())
+    }
+
     pub fn list_profiles(&self, source_id: &str) -> Result<Vec<Profile>> {
         let mut statement = self
             .conn
@@ -911,6 +1140,143 @@ impl Store {
             min_approval_policy: ApprovalPolicy::parse(&policy)?,
             version,
         })
+    }
+
+    pub fn list_routes(&self, source_id: &str) -> Result<Vec<Route>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, source_id, tool, profile_id, min_approval_policy, version
+               FROM source_tool_routes WHERE source_id = ? ORDER BY tool",
+        )?;
+        let rows = statement
+            .query_map([source_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(id, source_id, tool_text, profile_id, policy, version)| {
+                Ok(Route {
+                    id,
+                    source_id,
+                    tool: Tool::parse(&tool_text)?,
+                    profile_id,
+                    min_approval_policy: ApprovalPolicy::parse(&policy)?,
+                    version,
+                })
+            })
+            .collect()
+    }
+
+    pub fn get_route_by_id(&self, id: i64) -> Result<Route> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, source_id, tool, profile_id, min_approval_policy, version
+                   FROM source_tool_routes WHERE id = ?",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, source_id, tool_text, profile_id, policy, version)) = row else {
+            return Err(Error::NotFound(format!("route {id}")));
+        };
+        Ok(Route {
+            id,
+            source_id,
+            tool: Tool::parse(&tool_text)?,
+            profile_id,
+            min_approval_policy: ApprovalPolicy::parse(&policy)?,
+            version,
+        })
+    }
+
+    /// Updates a route's profile and minimum policy, bumping `version`. The tool
+    /// itself is immutable so an approval can never be redirected to another tool.
+    pub fn update_route(&self, source_id: &str, id: i64, update: &RouteUpdate) -> Result<Route> {
+        let current = self.get_route_by_id(id)?;
+        if current.source_id != source_id {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        let source = self.get_source(source_id)?;
+        if source.status != SourceStatus::Active {
+            return Err(Error::InvalidInput(
+                "归档数据源上的工具路由不能修改".to_string(),
+            ));
+        }
+        let profile = self.get_profile(update.profile_id)?;
+        if profile.source_id != source_id {
+            return Err(Error::InvalidInput(
+                "route profile belongs to a different source".to_string(),
+            ));
+        }
+        let Some(purpose) = current.tool.purpose() else {
+            return Err(Error::InvalidInput(
+                "list_sources is a discovery tool and cannot have a route".to_string(),
+            ));
+        };
+        if purpose != profile.purpose {
+            return Err(Error::InvalidInput(format!(
+                "tool {} requires a {} profile",
+                current.tool.as_str(),
+                purpose.as_str()
+            )));
+        }
+        validate_route_policy(current.tool, update.min_approval_policy)?;
+        let changed = self.conn.execute(
+            "UPDATE source_tool_routes
+                SET profile_id = ?, min_approval_policy = ?,
+                    version = version + 1, updated_at = ?
+              WHERE id = ? AND source_id = ?",
+            params![
+                update.profile_id,
+                update.min_approval_policy.as_str(),
+                now_ms(),
+                id,
+                source_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        self.get_route_by_id(id)
+    }
+
+    /// Deletes an unused route. Pending/approved requests still referencing it
+    /// must be resolved first; failed claims would otherwise strand the admin UI.
+    pub fn delete_route(&self, source_id: &str, id: i64) -> Result<()> {
+        let route = self.get_route_by_id(id)?;
+        if route.source_id != source_id {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        let approvals = active_approval_count_for(&self.conn, "route_id", id)?;
+        if approvals > 0 {
+            return Err(Error::Conflict(format!(
+                "工具路由 {id} 还有 {approvals} 个待批/已批请求，请先处理"
+            )));
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM source_tool_routes WHERE id = ? AND source_id = ?",
+            params![id, source_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        Ok(())
     }
 
     pub fn create_grant(&self, grant: &NewGrant) -> Result<Grant> {
@@ -1711,6 +2077,20 @@ impl Store {
         )?)
     }
 
+    pub fn count_audit_events_all(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM audit_events", [], |row| row.get(0))?)
+    }
+
+    pub fn count_pending_approvals(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM approval_requests WHERE status = 'pending'",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Newest audit events first; ties break on insertion order (newest id first).
     pub fn list_recent_audit(&self, limit: usize) -> Result<Vec<AuditEvent>> {
         let mut statement = self.conn.prepare(
@@ -1720,33 +2100,59 @@ impl Store {
                FROM audit_events ORDER BY ts DESC, id DESC LIMIT ?",
         )?;
         let rows = statement
-            .query_map([limit as i64], |row| {
-                Ok(AuditEvent {
-                    ts: row.get(0)?,
-                    event: row.get(1)?,
-                    approval_id: row.get(2)?,
-                    token_id: row.get(3)?,
-                    agent: row.get(4)?,
-                    source_id: row.get(5)?,
-                    tool: row.get(6)?,
-                    profile_id: row.get(7)?,
-                    profile_version: row.get(8)?,
-                    route_id: row.get(9)?,
-                    route_version: row.get(10)?,
-                    request_digest: row.get(11)?,
-                    channel: row.get(12)?,
-                    decision: row.get(13)?,
-                    actor: row.get(14)?,
-                    high_risk: row.get::<_, i64>(15)? != 0,
-                    reason_code: row.get(16)?,
-                    reason: row.get(17)?,
-                    duration_ms: row.get(18)?,
-                    row_count: row.get(19)?,
-                    error_code: row.get(20)?,
-                })
-            })?
+            .query_map([limit as i64], audit_event_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Filtered audit page used by the local admin UI.
+    pub fn query_audit(
+        &self,
+        agent: Option<&str>,
+        source_id: Option<&str>,
+        decision: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> Result<(Vec<AuditEvent>, i64)> {
+        let mut filters = Vec::new();
+        let mut values = Vec::<Value>::new();
+        if let Some(agent) = agent {
+            filters.push("agent = ?");
+            values.push(Value::Text(agent.to_string()));
+        }
+        if let Some(source_id) = source_id {
+            filters.push("source_id = ?");
+            values.push(Value::Text(source_id.to_string()));
+        }
+        if let Some(decision) = decision {
+            filters.push("decision = ?");
+            values.push(Value::Text(decision.to_string()));
+        }
+        let where_clause = if filters.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", filters.join(" AND "))
+        };
+        let total: i64 = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM audit_events{where_clause}"),
+            params_from_iter(values.iter()),
+            |row| row.get(0),
+        )?;
+        let mut page_values = values;
+        page_values.push(Value::Integer(limit as i64));
+        page_values.push(Value::Integer(offset as i64));
+        let sql = format!(
+            "SELECT ts, event, approval_id, token_id, agent, source_id, tool, profile_id,
+                    profile_version, route_id, route_version, request_digest, channel, decision,
+                    actor, high_risk, reason_code, reason, duration_ms, row_count, error_code
+               FROM audit_events{where_clause}
+              ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut statement = self.conn.prepare(&sql)?;
+        let rows = statement
+            .query_map(params_from_iter(page_values.iter()), audit_event_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((rows, total))
     }
 
     pub fn get_token_identity(&self, token_id: &str) -> Result<TokenIdentity> {
@@ -2219,6 +2625,32 @@ fn source_event(
     }
 }
 
+fn audit_event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEvent> {
+    Ok(AuditEvent {
+        ts: row.get(0)?,
+        event: row.get(1)?,
+        approval_id: row.get(2)?,
+        token_id: row.get(3)?,
+        agent: row.get(4)?,
+        source_id: row.get(5)?,
+        tool: row.get(6)?,
+        profile_id: row.get(7)?,
+        profile_version: row.get(8)?,
+        route_id: row.get(9)?,
+        route_version: row.get(10)?,
+        request_digest: row.get(11)?,
+        channel: row.get(12)?,
+        decision: row.get(13)?,
+        actor: row.get(14)?,
+        high_risk: row.get::<_, i64>(15)? != 0,
+        reason_code: row.get(16)?,
+        reason: row.get(17)?,
+        duration_ms: row.get(18)?,
+        row_count: row.get(19)?,
+        error_code: row.get(20)?,
+    })
+}
+
 fn insert_audit(conn: &Connection, event: &AuditEvent) -> Result<()> {
     conn.execute(
         "INSERT INTO audit_events
@@ -2392,6 +2824,27 @@ fn exists<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Resul
         .unwrap_or(false))
 }
 
+/// Pending or approved-but-not-yet-consumed approvals still hold a profile/route
+/// reference; deleting the target would strand them.
+fn active_approval_count_for(conn: &Connection, column: &str, id: i64) -> Result<i64> {
+    let sql = match column {
+        "profile_id" => {
+            "SELECT COUNT(*) FROM approval_requests
+              WHERE profile_id = ? AND status IN ('pending', 'approved')"
+        }
+        "route_id" => {
+            "SELECT COUNT(*) FROM approval_requests
+              WHERE route_id = ? AND status IN ('pending', 'approved')"
+        }
+        _ => {
+            return Err(Error::InvalidInput(
+                "unsupported approval reference column".to_string(),
+            ))
+        }
+    };
+    Ok(conn.query_row(sql, [id], |row| row.get(0))?)
+}
+
 #[cfg(test)]
 mod migration_tests {
     use super::*;
@@ -2445,8 +2898,8 @@ mod migration_tests {
                 .expect("load legacy rows");
         }
 
-        let store = Store::open(&path).expect("upgrade to v5");
-        assert_eq!(store.schema_version().expect("version"), 5);
+        let store = Store::open(&path).expect("upgrade to v6");
+        assert_eq!(store.schema_version().expect("version"), 6);
         assert_eq!(
             store.get_source("legacy").expect("legacy source").driver,
             Driver::Postgres
@@ -2492,5 +2945,56 @@ mod migration_tests {
             .expect("foreign key check")
             .count();
         assert_eq!(violations, 0, "foreign keys broken after migration");
+    }
+
+    #[test]
+    fn t13_v5_state_without_sqlite_driver_is_repaired() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let path = dir.path().join("state.db");
+        {
+            let connection = Connection::open(&path).expect("create v5 state");
+            connection
+                .execute_batch(
+                    "CREATE TABLE schema_migrations (
+                       version INTEGER PRIMARY KEY,
+                       applied_at INTEGER NOT NULL
+                     );",
+                )
+                .expect("schema_migrations");
+            for migration in [MIGRATION_1, MIGRATION_2, MIGRATION_3, MIGRATION_4] {
+                connection
+                    .execute_batch(migration)
+                    .expect("apply legacy migration");
+            }
+            // The T-13 branch shipped admin_keys as v5 while the sources CHECK
+            // still only accepted postgres.
+            connection
+                .execute_batch(MIGRATION_6)
+                .expect("admin_keys table");
+            connection
+                .execute_batch(
+                    "INSERT INTO schema_migrations (version, applied_at)
+                       VALUES (1, 1), (2, 2), (3, 3), (4, 4), (5, 5);",
+                )
+                .expect("mark v5");
+        }
+
+        let store = Store::open(&path).expect("repair v5");
+        assert_eq!(store.schema_version().expect("version"), 6);
+        let sqlite = store
+            .create_source(&NewSource {
+                id: "sqlite-main".to_string(),
+                driver: Driver::Sqlite,
+                environment: Environment::NonProduction,
+                parent_source_id: None,
+                created_token_id: None,
+                created_agent: None,
+                created_origin: Some("test".to_string()),
+            })
+            .expect("sqlite source after v5 repair");
+        assert_eq!(sqlite.driver, Driver::Sqlite);
+        store
+            .create_admin_key("laptop", 1_000)
+            .expect("admin keys preserved");
     }
 }

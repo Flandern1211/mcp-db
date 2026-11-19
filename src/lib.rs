@@ -2,6 +2,7 @@ pub mod approval;
 pub mod auth;
 pub mod authorization;
 pub mod config;
+pub mod connection_test;
 pub mod credentials;
 pub mod error;
 pub mod executor;
@@ -23,6 +24,7 @@ pub use approval::{
 };
 pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
+pub use connection_test::{ConnectionInfo, ConnectionTester, PostgresConnectionTester};
 pub use credentials::{CredentialResolver, CredentialSink, EncryptedFileResolver};
 pub use error::Error;
 pub use executor::{
@@ -49,7 +51,7 @@ pub use sqlite::{SqliteExecutor, SqliteMetadata};
 pub use state::{
     ApprovalPolicy, Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute,
     NewSource, Profile, ProfilePurpose, QuotaReservation, ReservationStatus, Route, Source,
-    SourceStatus, Store, TokenIdentity, Tool,
+    SourceStatus, Store, TokenIdentity, TokenRecord, Tool,
 };
 pub use transport::admin::{admin_app, AdminSession, AdminState, ADMIN_LOGIN_TTL_MS};
 
