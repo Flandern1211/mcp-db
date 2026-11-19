@@ -2,6 +2,7 @@ pub mod approval;
 pub mod auth;
 pub mod authorization;
 pub mod config;
+pub mod connection_test;
 pub mod credentials;
 pub mod error;
 pub mod executor;
@@ -21,6 +22,7 @@ pub use approval::{
 };
 pub use authorization::{AuthorizedCall, Authorizer};
 pub use config::Config;
+pub use connection_test::{ConnectionInfo, ConnectionTester, PostgresConnectionTester};
 pub use credentials::{CredentialResolver, CredentialSink, EncryptedFileResolver};
 pub use error::Error;
 pub use executor::{

@@ -229,6 +229,16 @@ pub struct TokenRecord {
     pub revoked_at: Option<i64>,
 }
 
+/// Administrative view of a long-lived admin key. Only the hash is persisted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminKey {
+    pub id: i64,
+    pub label: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSource {
     pub id: String,
@@ -275,6 +285,18 @@ pub struct Profile {
     pub statement_timeout_ms: Option<u64>,
 }
 
+/// Mutable profile fields. `purpose` is immutable; changing it requires a new
+/// profile so existing approvals cannot silently gain different permissions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileUpdate {
+    pub name: String,
+    pub enabled: bool,
+    /// `None` keeps the existing credential; `Some` rotates it.
+    pub credential_ref: Option<String>,
+    pub max_connections: Option<u32>,
+    pub statement_timeout_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewRoute {
     pub source_id: String,
@@ -291,6 +313,13 @@ pub struct Route {
     pub profile_id: i64,
     pub min_approval_policy: ApprovalPolicy,
     pub version: i64,
+}
+
+/// Mutable route fields. `tool` is immutable; delete and recreate to change it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteUpdate {
+    pub profile_id: i64,
+    pub min_approval_policy: ApprovalPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

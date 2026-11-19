@@ -21,6 +21,13 @@ pub fn generate_admin_login_token() -> String {
     format!("mcpdb_admin_{}", URL_SAFE_NO_PAD.encode(bytes))
 }
 
+/// Long-lived, revocable admin key. It never expires, but only its hash is stored.
+pub fn generate_admin_key() -> String {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    format!("mcpdb_adminkey_{}", URL_SAFE_NO_PAD.encode(bytes))
+}
+
 /// Random URL-safe secret used for admin session ids and CSRF values.
 pub fn generate_secret() -> String {
     let mut bytes = [0_u8; 32];

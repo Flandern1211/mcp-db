@@ -12,13 +12,13 @@ use crate::approval::{
 use crate::auth;
 use crate::error::{Error, Result};
 use crate::state::model::{
-    validate_credential_ref, validate_profile_name, validate_source_id, ApprovalPolicy, Driver,
-    Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
-    ProfilePurpose, ProvisionUsage, QuotaReservation, ReservationStatus, Route, Source,
-    SourceStatus, TokenIdentity, TokenRecord, Tool,
+    validate_credential_ref, validate_profile_name, validate_source_id, AdminKey, ApprovalPolicy,
+    Driver, Environment, Grant, IssuedToken, NewGrant, NewProfile, NewRoute, NewSource, Profile,
+    ProfilePurpose, ProfileUpdate, ProvisionUsage, QuotaReservation, ReservationStatus, Route,
+    RouteUpdate, Source, SourceStatus, TokenIdentity, TokenRecord, Tool,
 };
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -223,6 +223,21 @@ CREATE INDEX IF NOT EXISTS admin_login_tokens_expiry
   ON admin_login_tokens(expires_at);
 "#;
 
+/// Long-lived admin keys. They never expire; only a hash is stored and a key
+/// can be revoked at any time. `last_used_at` is for operator visibility.
+const MIGRATION_5: &str = r#"
+CREATE TABLE IF NOT EXISTS admin_keys (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  key_hash TEXT NOT NULL UNIQUE,
+  label TEXT NOT NULL,
+  created_at INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS admin_keys_active
+  ON admin_keys(revoked_at);
+"#;
+
 pub struct Store {
     conn: Connection,
 }
@@ -293,6 +308,13 @@ impl Store {
             transaction.execute_batch(MIGRATION_4)?;
             transaction.execute(
                 "INSERT INTO schema_migrations (version, applied_at) VALUES (4, ?)",
+                [now_ms()],
+            )?;
+        }
+        if version < 5 {
+            transaction.execute_batch(MIGRATION_5)?;
+            transaction.execute(
+                "INSERT INTO schema_migrations (version, applied_at) VALUES (5, ?)",
                 [now_ms()],
             )?;
         }
@@ -464,6 +486,71 @@ impl Store {
         } else {
             Err(Error::Unauthenticated)
         }
+    }
+
+    /// Creates a long-lived admin key and returns its plaintext exactly once.
+    /// The key never expires; only a SHA-256 hash is persisted.
+    pub fn create_admin_key(&self, label: &str, now: i64) -> Result<String> {
+        let label = label.trim();
+        if label.is_empty() || label.chars().count() > 64 || label.chars().any(|c| c.is_control()) {
+            return Err(Error::InvalidInput(
+                "admin key label must be 1-64 printable characters".to_string(),
+            ));
+        }
+        let key = auth::generate_admin_key();
+        let hash = auth::hash_token(&key);
+        self.conn.execute(
+            "INSERT INTO admin_keys (key_hash, label, created_at) VALUES (?, ?, ?)",
+            params![hash, label, now],
+        )?;
+        Ok(key)
+    }
+
+    /// Verifies a long-lived admin key and records its last use. Revoked or
+    /// unknown keys return the same error.
+    pub fn authenticate_admin_key(&self, raw_key: &str, now: i64) -> Result<()> {
+        let hash = auth::hash_token(raw_key.trim());
+        let changed = self.conn.execute(
+            "UPDATE admin_keys SET last_used_at = ?
+              WHERE key_hash = ? AND revoked_at IS NULL",
+            params![now, hash],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::Unauthenticated)
+        }
+    }
+
+    pub fn revoke_admin_key(&self, id: i64, now: i64) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE admin_keys SET revoked_at = ?
+              WHERE id = ? AND revoked_at IS NULL",
+            params![now, id],
+        )?;
+        if changed == 1 {
+            Ok(())
+        } else {
+            Err(Error::NotFound(format!("admin key {id}")))
+        }
+    }
+
+    pub fn list_admin_keys(&self) -> Result<Vec<AdminKey>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, label, created_at, last_used_at, revoked_at
+               FROM admin_keys ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(AdminKey {
+                id: row.get(0)?,
+                label: row.get(1)?,
+                created_at: row.get(2)?,
+                last_used_at: row.get(3)?,
+                revoked_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Error::from)
     }
 
     pub fn create_source(&self, source: &NewSource) -> Result<Source> {
@@ -794,6 +881,107 @@ impl Store {
         })
     }
 
+    /// Updates mutable profile fields and bumps `version`. Purpose is immutable.
+    pub fn update_profile(
+        &self,
+        source_id: &str,
+        id: i64,
+        update: &ProfileUpdate,
+    ) -> Result<Profile> {
+        let source = self.get_source(source_id)?;
+        if source.status != SourceStatus::Active {
+            return Err(Error::InvalidInput(
+                "归档数据源上的连接配置不能修改".to_string(),
+            ));
+        }
+        let current = self.get_profile(id)?;
+        if current.source_id != source_id {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        validate_profile_name(&update.name)?;
+        if update.name != current.name {
+            let duplicate: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM connection_profiles
+                  WHERE source_id = ? AND name = ? AND id <> ?",
+                params![source_id, update.name, id],
+                |row| row.get(0),
+            )?;
+            if duplicate > 0 {
+                return Err(Error::Conflict(format!(
+                    "数据源 {source_id} 上已存在同名连接配置：{}",
+                    update.name
+                )));
+            }
+        }
+        let credential_ref = update
+            .credential_ref
+            .clone()
+            .unwrap_or_else(|| current.credential_ref.clone());
+        validate_credential_ref(&credential_ref)?;
+        let provision_namespace = credential_ref.starts_with("keyring:provision/");
+        if (current.purpose == ProfilePurpose::Provision) != provision_namespace {
+            return Err(Error::InvalidInput(
+                "provision profiles must use keyring:provision/ and other profiles must not"
+                    .to_string(),
+            ));
+        }
+        crate::postgres::validate_limits(update.max_connections, update.statement_timeout_ms)?;
+        let changed = self.conn.execute(
+            "UPDATE connection_profiles
+                SET name = ?, credential_ref = ?, enabled = ?,
+                    max_connections = ?, statement_timeout_ms = ?,
+                    version = version + 1, updated_at = ?
+              WHERE id = ? AND source_id = ?",
+            params![
+                update.name,
+                credential_ref,
+                if update.enabled { 1 } else { 0 },
+                update.max_connections.map(i64::from),
+                update.statement_timeout_ms.map(|value| value as i64),
+                now_ms(),
+                id,
+                source_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        self.get_profile(id)
+    }
+
+    /// Deletes an unused profile. Referenced profiles must be detached first so a
+    /// route or an in-flight approval can never point at a missing connection.
+    pub fn delete_profile(&self, source_id: &str, id: i64) -> Result<()> {
+        let profile = self.get_profile(id)?;
+        if profile.source_id != source_id {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        let routes: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM source_tool_routes WHERE profile_id = ?",
+            [id],
+            |row| row.get(0),
+        )?;
+        if routes > 0 {
+            return Err(Error::Conflict(format!(
+                "连接配置 {id} 仍被 {routes} 个工具路由引用，请先删除或改绑这些路由"
+            )));
+        }
+        let approvals = active_approval_count_for(&self.conn, "profile_id", id)?;
+        if approvals > 0 {
+            return Err(Error::Conflict(format!(
+                "连接配置 {id} 还有 {approvals} 个待批/已批请求，请先处理"
+            )));
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM connection_profiles WHERE id = ? AND source_id = ?",
+            params![id, source_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("profile {id}")));
+        }
+        Ok(())
+    }
+
     pub fn list_profiles(&self, source_id: &str) -> Result<Vec<Profile>> {
         let mut statement = self
             .conn
@@ -911,6 +1099,112 @@ impl Store {
                 })
             })
             .collect()
+    }
+
+    pub fn get_route_by_id(&self, id: i64) -> Result<Route> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, source_id, tool, profile_id, min_approval_policy, version
+                   FROM source_tool_routes WHERE id = ?",
+                [id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((id, source_id, tool_text, profile_id, policy, version)) = row else {
+            return Err(Error::NotFound(format!("route {id}")));
+        };
+        Ok(Route {
+            id,
+            source_id,
+            tool: Tool::parse(&tool_text)?,
+            profile_id,
+            min_approval_policy: ApprovalPolicy::parse(&policy)?,
+            version,
+        })
+    }
+
+    /// Updates a route's profile and minimum policy, bumping `version`. The tool
+    /// itself is immutable so an approval can never be redirected to another tool.
+    pub fn update_route(&self, source_id: &str, id: i64, update: &RouteUpdate) -> Result<Route> {
+        let current = self.get_route_by_id(id)?;
+        if current.source_id != source_id {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        let source = self.get_source(source_id)?;
+        if source.status != SourceStatus::Active {
+            return Err(Error::InvalidInput(
+                "归档数据源上的工具路由不能修改".to_string(),
+            ));
+        }
+        let profile = self.get_profile(update.profile_id)?;
+        if profile.source_id != source_id {
+            return Err(Error::InvalidInput(
+                "route profile belongs to a different source".to_string(),
+            ));
+        }
+        let Some(purpose) = current.tool.purpose() else {
+            return Err(Error::InvalidInput(
+                "list_sources is a discovery tool and cannot have a route".to_string(),
+            ));
+        };
+        if purpose != profile.purpose {
+            return Err(Error::InvalidInput(format!(
+                "tool {} requires a {} profile",
+                current.tool.as_str(),
+                purpose.as_str()
+            )));
+        }
+        validate_route_policy(current.tool, update.min_approval_policy)?;
+        let changed = self.conn.execute(
+            "UPDATE source_tool_routes
+                SET profile_id = ?, min_approval_policy = ?,
+                    version = version + 1, updated_at = ?
+              WHERE id = ? AND source_id = ?",
+            params![
+                update.profile_id,
+                update.min_approval_policy.as_str(),
+                now_ms(),
+                id,
+                source_id
+            ],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        self.get_route_by_id(id)
+    }
+
+    /// Deletes an unused route. Pending/approved requests still referencing it
+    /// must be resolved first; failed claims would otherwise strand the admin UI.
+    pub fn delete_route(&self, source_id: &str, id: i64) -> Result<()> {
+        let route = self.get_route_by_id(id)?;
+        if route.source_id != source_id {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        let approvals = active_approval_count_for(&self.conn, "route_id", id)?;
+        if approvals > 0 {
+            return Err(Error::Conflict(format!(
+                "工具路由 {id} 还有 {approvals} 个待批/已批请求，请先处理"
+            )));
+        }
+        let changed = self.conn.execute(
+            "DELETE FROM source_tool_routes WHERE id = ? AND source_id = ?",
+            params![id, source_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::NotFound(format!("route {id}")));
+        }
+        Ok(())
     }
 
     pub fn create_grant(&self, grant: &NewGrant) -> Result<Grant> {
@@ -2456,4 +2750,25 @@ fn exists<P: rusqlite::Params>(conn: &Connection, sql: &str, params: P) -> Resul
         .query_row(sql, params, |_| Ok(true))
         .optional()?
         .unwrap_or(false))
+}
+
+/// Pending or approved-but-not-yet-consumed approvals still hold a profile/route
+/// reference; deleting the target would strand them.
+fn active_approval_count_for(conn: &Connection, column: &str, id: i64) -> Result<i64> {
+    let sql = match column {
+        "profile_id" => {
+            "SELECT COUNT(*) FROM approval_requests
+              WHERE profile_id = ? AND status IN ('pending', 'approved')"
+        }
+        "route_id" => {
+            "SELECT COUNT(*) FROM approval_requests
+              WHERE route_id = ? AND status IN ('pending', 'approved')"
+        }
+        _ => {
+            return Err(Error::InvalidInput(
+                "unsupported approval reference column".to_string(),
+            ))
+        }
+    };
+    Ok(conn.query_row(sql, [id], |row| row.get(0))?)
 }

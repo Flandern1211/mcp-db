@@ -20,10 +20,12 @@ use serde_json::{json, Value};
 
 use crate::approval::AuditEvent;
 use crate::auth;
+use crate::connection_test::ConnectionTester;
+use crate::credentials::{CredentialResolver, CredentialSink};
 use crate::provision::ProvisionLimits;
 use crate::state::{
     ApprovalPolicy, Environment, NewGrant, NewProfile, NewRoute, NewSource, Profile,
-    ProfilePurpose, ReservationStatus, Route, Source, Store, Tool,
+    ProfilePurpose, ProfileUpdate, ReservationStatus, Route, RouteUpdate, Source, Store, Tool,
 };
 use crate::DecisionOutcome;
 use crate::Error;
@@ -53,6 +55,13 @@ pub struct AdminState {
     pub store: Arc<Mutex<Store>>,
     pub provision_limits: ProvisionLimits,
     pub approval_execution_ttl_ms: i64,
+    /// Present only when an encrypted credential store is configured; the admin
+    /// form never receives an existing DSN back, it can only write a new one.
+    pub credentials: Option<Arc<dyn CredentialSink>>,
+    /// Resolves stored references for "test connection" on saved profiles.
+    pub resolver: Option<Arc<dyn CredentialResolver>>,
+    /// Executes the read-only connectivity probe.
+    pub tester: Option<Arc<dyn ConnectionTester>>,
     pub sessions: Arc<Mutex<HashMap<String, AdminSession>>>,
     pub login_challenges: Arc<Mutex<HashMap<String, i64>>>,
 }
@@ -62,11 +71,17 @@ impl AdminState {
         store: Arc<Mutex<Store>>,
         provision_limits: ProvisionLimits,
         approval_execution_ttl_ms: i64,
+        credentials: Option<Arc<dyn CredentialSink>>,
+        resolver: Option<Arc<dyn CredentialResolver>>,
+        tester: Option<Arc<dyn ConnectionTester>>,
     ) -> Self {
         Self {
             store,
             provision_limits,
             approval_execution_ttl_ms,
+            credentials,
+            resolver,
+            tester,
             sessions: Default::default(),
             login_challenges: Default::default(),
         }
@@ -118,7 +133,20 @@ pub fn admin_app(state: AdminState) -> Router {
         .route("/admin/api/sources/{id}/archive", post(archive))
         .route("/admin/api/sources/{id}/restore", post(restore))
         .route("/admin/api/sources/{id}/profiles", post(create_profile))
+        .route(
+            "/admin/api/sources/{id}/profiles/{profile_id}",
+            axum::routing::put(update_profile).delete(delete_profile),
+        )
+        .route(
+            "/admin/api/sources/{id}/profiles/{profile_id}/test",
+            post(test_profile),
+        )
+        .route("/admin/api/connection-test", post(test_connection))
         .route("/admin/api/sources/{id}/routes", post(create_route))
+        .route(
+            "/admin/api/sources/{id}/routes/{route_id}",
+            axum::routing::put(update_route).delete(delete_route),
+        )
         .route("/admin/api/tokens", get(list_tokens).post(create_token))
         .route("/admin/api/tokens/{id}/revoke", post(revoke_token))
         .route(
@@ -271,8 +299,19 @@ async fn login(
     if !state.login_challenge_valid(challenge, now) {
         return error_response(StatusCode::FORBIDDEN, "invalid login page CSRF challenge");
     }
-    let consumed = match state.store.lock() {
-        Ok(store) => store.consume_admin_login_token(&body.token, now),
+    let auth_reason = match state.store.lock() {
+        Ok(store) => {
+            if store
+                .consume_admin_login_token(body.token.trim(), now)
+                .is_ok()
+            {
+                Some("one-time login token consumed")
+            } else if store.authenticate_admin_key(body.token.trim(), now).is_ok() {
+                Some("permanent admin key authenticated")
+            } else {
+                None
+            }
+        }
         Err(_) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -280,12 +319,12 @@ async fn login(
             )
         }
     };
-    if consumed.is_err() {
+    let Some(auth_reason) = auth_reason else {
         return error_response(
             StatusCode::UNAUTHORIZED,
-            "login token is invalid, expired or already used",
+            "管理员密钥无效、已撤销，或登录令牌已过期/已使用",
         );
-    }
+    };
     let session_id = auth::generate_secret();
     let session = AdminSession {
         csrf: auth::generate_secret(),
@@ -309,7 +348,7 @@ async fn login(
             None,
             None,
             "allowed",
-            Some("one-time login token consumed"),
+            Some(auth_reason),
             now,
         ))
     });
@@ -539,7 +578,11 @@ async fn restore(
 struct CreateProfileBody {
     name: String,
     purpose: String,
-    credential_ref: String,
+    /// Preferred path from the web form: a plaintext DSN that is encrypted
+    /// immediately and never echoed back.
+    dsn: Option<String>,
+    /// Legacy/CLI path for callers that manage the credential store themselves.
+    credential_ref: Option<String>,
     max_connections: Option<u32>,
     statement_timeout_ms: Option<u64>,
 }
@@ -557,12 +600,47 @@ async fn create_profile(
         Ok(purpose) => purpose,
         Err(error) => return map_store_error(error),
     };
+    let name = body.name.trim().to_string();
+    let dsn = body
+        .dsn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let credential_ref = match dsn {
+        Some(dsn) => {
+            if let Err(message) = validate_postgres_dsn(dsn) {
+                return error_response(StatusCode::BAD_REQUEST, message);
+            }
+            let Some(sink) = state.credentials.as_ref() else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "凭证库未配置，服务端无法保存数据库连接串",
+                );
+            };
+            let reference = managed_credential_ref(&source_id, purpose);
+            if let Err(error) = sink.store(&reference, dsn) {
+                return map_store_error(error);
+            }
+            reference
+        }
+        None => match body
+            .credential_ref
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(reference) => reference.to_string(),
+            None => {
+                return error_response(StatusCode::BAD_REQUEST, "请输入数据库连接串");
+            }
+        },
+    };
     match store_call(&state, |store| {
         let profile = store.create_profile(&NewProfile {
             source_id: source_id.clone(),
-            name: body.name.trim().to_string(),
+            name,
             purpose,
-            credential_ref: body.credential_ref.trim().to_string(),
+            credential_ref,
             max_connections: body.max_connections,
             statement_timeout_ms: body.statement_timeout_ms,
         })?;
@@ -578,6 +656,210 @@ async fn create_profile(
     }) {
         Ok(value) => json_response(StatusCode::CREATED, json!({ "profile": value })),
         Err(response) => *response,
+    }
+}
+
+/// Reject malformed or non-PostgreSQL DSNs before they reach the credential store.
+fn validate_postgres_dsn(dsn: &str) -> Result<(), &'static str> {
+    if !(dsn.starts_with("postgres://") || dsn.starts_with("postgresql://")) {
+        return Err("连接串必须以 postgres:// 或 postgresql:// 开头");
+    }
+    let config: tokio_postgres::Config = dsn
+        .parse()
+        .map_err(|_| "连接串格式不正确，请检查用户名、密码和主机地址")?;
+    if config.get_dbname().is_none() {
+        return Err("连接串必须包含数据库名");
+    }
+    Ok(())
+}
+
+/// Server-owned reference: the browser never has to invent or remember one.
+/// The random suffix prevents a failed/repeated create from overwriting the
+/// credential still used by an existing profile with the same name.
+fn managed_credential_ref(source_id: &str, purpose: ProfilePurpose) -> String {
+    let suffix = &auth::generate_secret()[..12];
+    if purpose == ProfilePurpose::Provision {
+        format!("keyring:provision/managed/{source_id}/{suffix}")
+    } else {
+        format!("keyring:managed/{source_id}/{suffix}")
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateProfileBody {
+    name: String,
+    enabled: Option<bool>,
+    dsn: Option<String>,
+    max_connections: Option<u32>,
+    statement_timeout_ms: Option<u64>,
+}
+
+async fn update_profile(
+    State(state): State<AdminState>,
+    AxumPath((source_id, profile_id)): AxumPath<(String, i64)>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateProfileBody>,
+) -> Response {
+    if let Err(response) = write_guard(&state, &headers) {
+        return *response;
+    }
+    let name = body.name.trim().to_string();
+    let dsn = body
+        .dsn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let credential_ref = match dsn {
+        Some(dsn) => {
+            if let Err(message) = validate_postgres_dsn(dsn) {
+                return error_response(StatusCode::BAD_REQUEST, message);
+            }
+            let Some(sink) = state.credentials.as_ref() else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "凭证库未配置，服务端无法保存数据库连接串",
+                );
+            };
+            let purpose = match store_call(&state, |store| {
+                let profile = store.get_profile(profile_id)?;
+                if profile.source_id != source_id {
+                    return Err(Error::NotFound(format!("profile {profile_id}")));
+                }
+                Ok(profile.purpose)
+            }) {
+                Ok(purpose) => purpose,
+                Err(response) => return *response,
+            };
+            let reference = managed_credential_ref(&source_id, purpose);
+            if let Err(error) = sink.store(&reference, dsn) {
+                return map_store_error(error);
+            }
+            Some(reference)
+        }
+        None => None,
+    };
+    match store_call(&state, |store| {
+        let current = store.get_profile(profile_id)?;
+        if current.source_id != source_id {
+            return Err(Error::NotFound(format!("profile {profile_id}")));
+        }
+        let profile = store.update_profile(
+            &source_id,
+            profile_id,
+            &ProfileUpdate {
+                name,
+                enabled: body.enabled.unwrap_or(current.enabled),
+                credential_ref,
+                max_connections: body.max_connections,
+                statement_timeout_ms: body.statement_timeout_ms,
+            },
+        )?;
+        record_admin_event(
+            store,
+            "admin_profile_updated",
+            "profile",
+            Some(&source_id),
+            Some(&profile_id.to_string()),
+            "updated connection profile",
+        )?;
+        Ok(profile_json(&profile))
+    }) {
+        Ok(value) => json_response(StatusCode::OK, json!({ "profile": value })),
+        Err(response) => *response,
+    }
+}
+
+async fn delete_profile(
+    State(state): State<AdminState>,
+    AxumPath((source_id, profile_id)): AxumPath<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = write_guard(&state, &headers) {
+        return *response;
+    }
+    match store_call(&state, |store| {
+        store.delete_profile(&source_id, profile_id)?;
+        record_admin_event(
+            store,
+            "admin_profile_deleted",
+            "profile",
+            Some(&source_id),
+            Some(&profile_id.to_string()),
+            "deleted connection profile",
+        )?;
+        Ok(json!({ "deleted": true }))
+    }) {
+        Ok(value) => json_response(StatusCode::OK, value),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Deserialize)]
+struct TestConnectionBody {
+    dsn: String,
+}
+
+async fn test_connection(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<TestConnectionBody>,
+) -> Response {
+    let Some(_) = read_guard(&state, &headers) else {
+        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+    };
+    let dsn = body.dsn.trim();
+    if dsn.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "请输入数据库连接串");
+    }
+    probe_connection(&state, dsn).await
+}
+
+async fn test_profile(
+    State(state): State<AdminState>,
+    AxumPath((source_id, profile_id)): AxumPath<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(_) = read_guard(&state, &headers) else {
+        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+    };
+    let credential_ref = match store_call(&state, |store| {
+        let profile = store.get_profile(profile_id)?;
+        if profile.source_id != source_id {
+            return Err(Error::NotFound(format!("profile {profile_id}")));
+        }
+        Ok(profile.credential_ref)
+    }) {
+        Ok(reference) => reference,
+        Err(response) => return *response,
+    };
+    let Some(resolver) = state.resolver.as_ref() else {
+        return error_response(StatusCode::BAD_REQUEST, "凭证库未配置，无法解析连接串");
+    };
+    let dsn = match resolver.resolve(&credential_ref) {
+        Ok(dsn) => dsn,
+        Err(error) => return map_store_error(error),
+    };
+    probe_connection(&state, &dsn).await
+}
+
+async fn probe_connection(state: &AdminState, dsn: &str) -> Response {
+    let Some(tester) = state.tester.as_ref() else {
+        return error_response(StatusCode::BAD_REQUEST, "连接测试器未配置");
+    };
+    let started = std::time::Instant::now();
+    match tester.test(dsn).await {
+        Ok(info) => json_response(
+            StatusCode::OK,
+            json!({
+                "ok": true,
+                "database": info.database,
+                "user": info.user,
+                "serverVersion": info.server_version,
+                "latencyMs": started.elapsed().as_millis() as u64,
+            }),
+        ),
+        Err(Error::InvalidInput(message)) => error_response(StatusCode::BAD_REQUEST, &message),
+        Err(error) => error_response(StatusCode::BAD_GATEWAY, &format!("连接失败：{error}")),
     }
 }
 
@@ -632,6 +914,84 @@ async fn create_route(
         Ok(route_json(&route, &profile.name))
     }) {
         Ok(value) => json_response(StatusCode::CREATED, json!({ "route": value })),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdateRouteBody {
+    profile_id: i64,
+    min_approval_policy: Option<String>,
+}
+
+async fn update_route(
+    State(state): State<AdminState>,
+    AxumPath((source_id, route_id)): AxumPath<(String, i64)>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateRouteBody>,
+) -> Response {
+    if let Err(response) = write_guard(&state, &headers) {
+        return *response;
+    }
+    match store_call(&state, |store| {
+        let current = store.get_route_by_id(route_id)?;
+        if current.source_id != source_id {
+            return Err(Error::NotFound(format!("route {route_id}")));
+        }
+        let policy = match body
+            .min_approval_policy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(value) => ApprovalPolicy::parse(value)?,
+            None => current.min_approval_policy,
+        };
+        let route = store.update_route(
+            &source_id,
+            route_id,
+            &RouteUpdate {
+                profile_id: body.profile_id,
+                min_approval_policy: policy,
+            },
+        )?;
+        record_admin_event(
+            store,
+            "admin_route_updated",
+            "route",
+            Some(&source_id),
+            Some(&route_id.to_string()),
+            "updated tool route",
+        )?;
+        let profile = store.get_profile(route.profile_id)?;
+        Ok(route_json(&route, &profile.name))
+    }) {
+        Ok(value) => json_response(StatusCode::OK, json!({ "route": value })),
+        Err(response) => *response,
+    }
+}
+
+async fn delete_route(
+    State(state): State<AdminState>,
+    AxumPath((source_id, route_id)): AxumPath<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = write_guard(&state, &headers) {
+        return *response;
+    }
+    match store_call(&state, |store| {
+        store.delete_route(&source_id, route_id)?;
+        record_admin_event(
+            store,
+            "admin_route_deleted",
+            "route",
+            Some(&source_id),
+            Some(&route_id.to_string()),
+            "deleted tool route",
+        )?;
+        Ok(json!({ "deleted": true }))
+    }) {
+        Ok(value) => json_response(StatusCode::OK, value),
         Err(response) => *response,
     }
 }
@@ -1091,6 +1451,7 @@ fn profile_json(profile: &Profile) -> Value {
         "name": profile.name,
         "purpose": profile.purpose.as_str(),
         "credential_ref": profile.credential_ref,
+        "credential_configured": true,
         "enabled": profile.enabled,
         "version": profile.version,
         "max_connections": profile.max_connections,
@@ -1447,5 +1808,25 @@ mod tests {
         assert!(constant_time_eq("abc", "abc"));
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "ab"));
+    }
+
+    #[test]
+    fn validates_postgres_dsn_before_storing() {
+        assert!(validate_postgres_dsn("postgres://user:pw@127.0.0.1:5432/app").is_ok());
+        assert!(validate_postgres_dsn("postgresql://user@db.internal/app").is_ok());
+        assert!(validate_postgres_dsn("mysql://user:pw@127.0.0.1/app").is_err());
+        assert!(validate_postgres_dsn("postgres://user:pw@127.0.0.1").is_err());
+        assert!(validate_postgres_dsn("not a dsn").is_err());
+    }
+
+    #[test]
+    fn managed_refs_are_server_owned_and_provision_namespaced() {
+        let query = managed_credential_ref("app", ProfilePurpose::Query);
+        let provision = managed_credential_ref("app", ProfilePurpose::Provision);
+        assert!(query.starts_with("keyring:managed/app/"));
+        assert!(provision.starts_with("keyring:provision/managed/app/"));
+        assert!(query.len() <= 128 && provision.len() <= 128);
+        assert!(crate::state::model::validate_credential_ref(&query).is_ok());
+        assert!(crate::state::model::validate_credential_ref(&provision).is_ok());
     }
 }

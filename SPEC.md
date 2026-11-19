@@ -14,9 +14,9 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 
 - 单实例、多数据源的 Streamable HTTP MCP 服务；不要求与数据库同机，不要求全年常驻。
 - 首版正式交付形态为 OCI 容器镜像（Docker 服务）。MCP 端口默认只发布到宿主回环地址或受控网络。
-- 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的一次性登录令牌；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
-- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次，服务端只存其 SHA-256 hash；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 请求校验 Host 为回环地址；Origin 存在且非 `null` 时必须与请求 scheme、host、port 严格同源，跨端口拒绝；`null` 不获得同源信任，登录 POST 需要页面发放的随机 CSRF challenge，后续写请求需要会话绑定 CSRF，未持有对应 challenge 的 `null` 请求拒绝。
-- 管理页是内嵌静态中文 SPA（概览 / 访问令牌 / 待批请求 / 审计日志 / 数据源），由 admin listener 同源提供，不使用 CDN、外部字体或前端框架；数据经 `/admin/api/*` JSON 接口读写。所有 admin 响应设置 no-store、nosniff、no-referrer 和 `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'` 的 CSP，不使用内联脚本。令牌明文只在签发响应返回一次；管理页不编辑明文 DSN。
+- 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的登录凭证（一次性令牌或永久管理员密钥）；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
+- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次；管理员密钥永不过期但可随时吊销，`last_used_at` 记录最近使用。两类凭证服务端都只存其 SHA-256 hash，明文仅 CLI 输出一次；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 请求校验 Host 为回环地址；Origin 存在且非 `null` 时必须与请求 scheme、host、port 严格同源，跨端口拒绝；`null` 不获得同源信任，登录 POST 需要页面发放的随机 CSRF challenge，后续写请求需要会话绑定 CSRF，未持有对应 challenge 的 `null` 请求拒绝。
+- 管理页是内嵌静态中文 SPA（概览 / 访问令牌 / 待批请求 / 审计日志 / 数据源），由 admin listener 同源提供，不使用 CDN、外部字体或前端框架；数据经 `/admin/api/*` JSON 接口读写。所有 admin 响应设置 no-store、nosniff、no-referrer 和 `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'` 的 CSP，不使用内联脚本。令牌明文只在签发响应返回一次；管理页可录入数据库连接串（DSN），服务端立即加密写入凭证库并只保存内部引用，页面不回显 DSN。
 - 首版普通数据库能力仅支持 PostgreSQL；MySQL/MariaDB、SQLite、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
 - source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
 - agent 使用管理面签发的 Bearer token；明文只在签发时返回一次，服务端只保存哈希和识别信息。
@@ -47,7 +47,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 - 使用期间 HTTP 服务须保持运行。单人可按需启动，多客户端可常驻；部署位置不改变授权与审批语义。
 - source、profile 元数据、token/grants、审计、审批状态和建库预留须持久化；数据库连接池与 MCP 会话是进程内状态。
 - 停机/重启不能自动执行旧批准或盲目重放写入。尚未执行的待批/已批请求终止，客户端需重新发起并重新审批；已经发出的写入若结果未知，保留未知状态并人工核对，不标记为未执行或重试。
-- 首版管理面仅本机：MCP 与管理监听分离，管理端口只发布到宿主回环地址，登录使用 CLI 生成的一次性令牌；admin 会话须有 HttpOnly、SameSite 和 CSRF 防护。跨主机接入属于后续阶段，启用前必须明确公开访问地址、受信代理及 Origin 校验配置，并在 HTTPS 下使用 Secure cookie。
+- 首版管理面仅本机：MCP 与管理监听分离，管理端口只发布到宿主回环地址，登录使用 CLI 生成的登录凭证（一次性令牌或永久管理员密钥）；admin 会话须有 HttpOnly、SameSite 和 CSRF 防护。跨主机接入属于后续阶段，启用前必须明确公开访问地址、受信代理及 Origin 校验配置，并在 HTTPS 下使用 Secure cookie。
 
 ## 3. 授权、连接与审批
 
@@ -76,6 +76,8 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 同一 DSN 可以供多个普通 profiles 引用，但这不产生数据库级隔离。管理页须提示复用凭证的风险；`query` 的实际只读性必须由数据库权限、受支持的只读会话/事务或对应驱动的只读打开方式实现，不能仅靠 profile 名称保证。每个已发布驱动都必须通过 query profile 直接尝试数据写入和 schema DDL（绕过 SQL tool 分类），由数据库/文件边界拒绝且夹具状态不变，才能启用该 profile；无法完成负向集成验证的 profile 不得用于查询路径。
 
 agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永不回显。profile 只能由 admin 配置和停用，token/grant 不赋予管理 profile 的权限。
+
+profile 和 tool 路由都支持管理页创建、修改和删除。profile 的用途类别不可修改（变更用途必须新建 profile），可修改名称、启用状态、连接串、连接上限和语句超时；每次修改 `version` 递增。路由的 tool 不可修改（变更 tool 必须删除重建），可修改绑定的 profile 和最低审批策略；每次修改 `version` 递增。审批请求记录创建时的 profile/route 版本，执行前重验发现版本变化时拒绝，因此修改后必须重新发起审批。仍被工具路由引用的 profile、仍被 pending/approved 审批引用的 profile 或 route 不允许删除，返回冲突。管理页的“测试连接”只执行只读查询（当前数据库、账号、服务端版本），不写入数据，也不回显 DSN。
 
 ### 3.2.1 首版 PostgreSQL 资源与只读机制
 
@@ -156,7 +158,7 @@ agent 不拿到 DSN/数据库密码；凭证由服务端安全存储引用并永
 | `AC2-07` | 结果限制 | 超过 source 行数上限显式截断；不把结果截断等同于限制数据库扫描成本 |
 | `AC2-08` | 资源限制 | 每 profile 连接上限、语句超时、token 请求速率按配置执行；未支持的硬限制明确拒绝配置，不假装生效 |
 | `AC2-09` | 审计 | 记录 token/agent、source、tool、profile 标识、决定、渠道、原因与适用耗时/行数，绝不记录凭证 |
-| `AC2-10` | 部署与管理隔离 | 首版以 Docker 服务在非数据库主机按需启动；管理页仅通过宿主回环端口和一次性登录令牌访问；agent 不能操作 admin API；跨主机接入在后续阶段具备 TLS/认证/网络控制后才可启用 |
+| `AC2-10` | 部署与管理隔离 | 首版以 Docker 服务在非数据库主机按需启动；管理页仅通过宿主回环端口和一次性登录令牌/永久管理员密钥访问；agent 不能操作 admin API；跨主机接入在后续阶段具备 TLS/认证/网络控制后才可启用 |
 | `AC2-11` | 配置校验 | 未知 tool/profile、错误用途映射、生产写 grant、非法凭证引用或限制保存失败；连接数不固定为两个，query 实际只读性有验证依据 |
 | `AC2-12` | 工具发现 | 展示 token 在有效 source 上 grants 的 tool 并集，加基础 `list_sources`；不可见不替代调用鉴权 |
 | `AC2-13` | 精确 grant | A 库获某 tool 不允许对 B 库调用该 tool；直接构造参数也拒绝；source/profile/环境限制始终生效 |

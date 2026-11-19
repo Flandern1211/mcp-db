@@ -54,6 +54,9 @@ fn setup() -> Fixture {
         store.clone(),
         ProvisionLimits::default(),
         60_000,
+        None,
+        None,
+        None,
     ));
     Fixture {
         _dir: dir,
@@ -423,6 +426,55 @@ async fn login_token_is_single_use_and_expires() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "token must expire");
+}
+
+#[tokio::test]
+async fn permanent_admin_key_can_log_in_repeatedly_until_revoked() {
+    let fixture = setup();
+    let key = {
+        let store = fixture.store.lock().expect("store lock");
+        store.create_admin_key("test", now_ms()).expect("admin key")
+    };
+
+    for _ in 0..2 {
+        let challenge = fetch_challenge(&fixture).await;
+        let (status, _, body) = send_json(
+            fixture.admin.clone(),
+            admin_request(
+                Method::POST,
+                "/admin/api/login",
+                Some(&json!({ "token": key })),
+                None,
+                Some(ORIGIN),
+                Some(&challenge),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "permanent key login: {body}");
+    }
+
+    let id = {
+        let store = fixture.store.lock().expect("store lock");
+        store.list_admin_keys().expect("list keys")[0].id
+    };
+    {
+        let store = fixture.store.lock().expect("store lock");
+        store.revoke_admin_key(id, now_ms()).expect("revoke");
+    }
+    let challenge = fetch_challenge(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::POST,
+            "/admin/api/login",
+            Some(&json!({ "token": key })),
+            None,
+            Some(ORIGIN),
+            Some(&challenge),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "revoked key is rejected");
 }
 
 #[tokio::test]
@@ -1312,4 +1364,135 @@ async fn web_settles_quarantined_reservation() {
     let reservation = store.get_reservation(reservation_id).expect("reservation");
     assert_eq!(reservation.status, ReservationStatus::Released);
     assert_eq!(reservation.reason_code.as_deref(), Some("ADMIN_SETTLED"));
+}
+
+#[tokio::test]
+async fn profiles_and_routes_support_update_delete_and_versioning() {
+    let fixture = setup();
+    let (cookie, csrf) = login(&fixture).await;
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources",
+            Some(&json!({ "id": "crud", "environment": "nonproduction" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/crud/profiles",
+            Some(&json!({
+                "name": "query_ro",
+                "purpose": "query",
+                "credential_ref": "keyring:mcp-db/crud/query",
+                "max_connections": 2,
+                "statement_timeout_ms": 1000
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let profile_id = body["profile"]["id"].as_i64().expect("profile id");
+    assert_eq!(body["profile"]["version"], 1);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::PUT,
+            &format!("/admin/api/sources/crud/profiles/{profile_id}"),
+            Some(&json!({
+                "name": "query_ro",
+                "enabled": false,
+                "max_connections": 3,
+                "statement_timeout_ms": 2000
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["profile"]["version"], 2);
+    assert_eq!(body["profile"]["enabled"], false);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::POST,
+            "/admin/api/sources/crud/routes",
+            Some(&json!({
+                "tool": "list_tables",
+                "profile_id": profile_id
+            })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let route_id = body["route"]["id"].as_i64().expect("route id");
+    assert_eq!(body["route"]["version"], 1);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::PUT,
+            &format!("/admin/api/sources/crud/routes/{route_id}"),
+            Some(&json!({ "profile_id": profile_id, "min_approval_policy": "direct" })),
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["route"]["version"], 2);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/sources/crud/profiles/{profile_id}"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "referenced profile: {body}");
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/sources/crud/routes/{route_id}"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            &format!("/admin/api/sources/crud/profiles/{profile_id}"),
+            None,
+            &cookie,
+            &csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

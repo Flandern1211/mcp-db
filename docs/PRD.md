@@ -82,9 +82,9 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 ### 3.5 管理与运维
 
 1. 管理员通过 CLI 和本机 Web 管理页处理审批、查看审计、管理 token/profile/route。
-2. 管理页提供概览、访问令牌、待批请求、审计日志、数据源五个入口；可签发/撤销令牌、增删精确 source×tool grants、创建 profiles 与 routes、归档/恢复 source，并核对隔离预留。
-3. 待批请求先展示完整 SQL 或建库规格、绑定参数、profile/route 版本，再允许批准或拒绝；审批不能盲批。
-4. 管理页只通过发布到宿主回环地址的独立端口访问，并要求 CLI 生成的一次性登录令牌。
+2. 管理页提供概览、访问令牌、待批请求、审计日志、数据源五个入口；可签发/撤销令牌、增删精确 source×tool grants、创建/修改/删除 profiles 与 routes、测试连接、归档/恢复 source，并核对隔离预留。
+3. 待批请求先展示完整 SQL 或建库规格、绑定参数、profile/route 版本，再允许批准或拒绝；审批不能盲批。修改 profile/route 会递增版本并使旧审批在执行前被拒绝。
+4. 管理页只通过发布到宿主回环地址的独立端口访问，并要求 CLI 生成的一次性登录令牌或永久管理员密钥。
 5. 管理员可以归档 source；归档阻止新请求、使待批失效并关闭连接，但不删除物理数据库。
 6. 管理员重启服务后，配置、grants、审计、配额和隔离预留仍然存在；旧批准和外部写不重放。
 
@@ -111,7 +111,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 - `list_sources`、`list_tables`、`describe_table`、`explain_query`、`query_sql`、`mutate_sql`、`execute_ddl`、`create_database`。
 - 普通写入 direct/approval 策略、elicitation、管理员待批队列和高危强制审批。
 - token 签发/撤销、grant/profile/route 管理、审批和审计持久化。
-- 本机 Web 管理页与 CLI 管理面；管理页使用一次性登录令牌。
+- 本机 Web 管理页与 CLI 管理面；管理页使用一次性登录令牌或永久管理员密钥。
 - 参数绑定、显式结果截断、连接数、语句超时、请求速率和建库配额。
 - 从 Bun/TypeScript v1 的可恢复迁移。
 - Docker 健康检查、非 root 运行和最小镜像运行依赖。
@@ -168,7 +168,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 
 1. Docker 镜像可构建、以非 root 启动、健康检查通过。
 2. CLI 可登记 PostgreSQL source/profile、签发和撤销 token、配置 grants 与 routes。
-3. Web 管理页可用一次性登录令牌登录；agent token 无法访问管理面。
+3. Web 管理页可用一次性登录令牌或永久管理员密钥登录；agent token 无法访问管理面。
 4. 只读 token 能完成发现和查询；直接构造未授权 source/tool 调用被拒绝。
 5. PostgreSQL query profile 绕过 MCP 分类直连的 INSERT/UPDATE/DELETE 和 schema DDL 均被拒绝，夹具不变。
 6. 普通写入的 direct/elicitation/admin 队列行为符合策略；高危操作强制管理员审批。

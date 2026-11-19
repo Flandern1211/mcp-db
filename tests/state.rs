@@ -167,7 +167,29 @@ fn models_persist_across_restart() {
         store.list_grants_for_token(&issued.token_id).unwrap().len(),
         2
     );
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
+}
+
+#[test]
+fn admin_keys_never_expire_until_revoked() {
+    let (_dir, store) = store();
+    let now = 1_000;
+    let key = store.create_admin_key("laptop", now).unwrap();
+    assert!(key.starts_with("mcpdb_adminkey_"));
+    store
+        .authenticate_admin_key(&key, now + 10_000_000)
+        .unwrap();
+    let listed = store.list_admin_keys().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].label, "laptop");
+    assert!(listed[0].last_used_at.is_some());
+    store
+        .revoke_admin_key(listed[0].id, now + 20_000_000)
+        .unwrap();
+    assert!(store
+        .authenticate_admin_key(&key, now + 30_000_000)
+        .is_err());
+    assert!(store.create_admin_key("  ", now).is_err());
 }
 
 #[test]
@@ -332,7 +354,7 @@ fn legacy_approvals_and_audit_survive_upgrade() {
     drop(connection);
 
     let store = Store::open(&path).expect("upgrade store");
-    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(store.schema_version().unwrap(), 5);
     assert!(store.authenticate("legacy-token").is_err());
     drop(store);
 

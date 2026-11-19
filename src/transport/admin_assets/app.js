@@ -11,13 +11,13 @@ const TOOLS = [
   "create_database",
 ];
 const TOOL_LABELS = {
-  list_tables: "list_tables",
-  describe_table: "describe_table",
-  explain_query: "explain_query",
-  query_sql: "query_sql",
-  mutate_sql: "mutate_sql",
-  execute_ddl: "execute_ddl",
-  create_database: "create_database",
+  list_tables: "list_tables（列出表）",
+  describe_table: "describe_table（查看表结构）",
+  explain_query: "explain_query（查看执行计划）",
+  query_sql: "query_sql（执行查询）",
+  mutate_sql: "mutate_sql（执行写入）",
+  execute_ddl: "execute_ddl（结构变更）",
+  create_database: "create_database（建库）",
 };
 const TOOL_PURPOSE = {
   list_tables: "query",
@@ -30,8 +30,8 @@ const TOOL_PURPOSE = {
 };
 const PURPOSE_LABELS = {
   query: "查询",
-  mutate: "数据写入",
-  schema: "结构管理",
+  mutate: "写入",
+  schema: "结构变更",
   provision: "建库",
 };
 const ENVIRONMENT_LABELS = { production: "生产", nonproduction: "非生产" };
@@ -390,7 +390,7 @@ function renderShell() {
           { class: "brand", href: "#/overview" },
           h("div", { class: "brand-mark" }, "db"),
           h("div", { class: "brand-name" }, "mcp-db"),
-          h("span", { class: "brand-badge" }, "Admin"),
+          h("span", { class: "brand-badge" }, "管理台"),
         ),
         h("nav", { class: "nav", "aria-label": "管理台导航" }, navItems),
         h(
@@ -693,8 +693,8 @@ function reservationSection() {
                   {},
                   h("th", {}, "ID"),
                   h("th", {}, "数据库"),
-                  h("th", {}, "父 Source"),
-                  h("th", {}, "Token"),
+                  h("th", {}, "父数据源"),
+                  h("th", {}, "令牌"),
                   h("th", {}, "原因"),
                   h("th", { class: "th-actions" }, "操作"),
                 ),
@@ -761,7 +761,7 @@ function renderTokens(root) {
       h(
         "p",
         { class: "page-desc" },
-        "令牌使用精确的 source × tool grants；不再使用 readonly/readwrite 模式。明文只在签发时显示一次，服务端只保存哈希。",
+        "令牌按「数据源 × 工具」精确授权，不再使用只读/读写模式；明文只在签发时显示一次，服务端只保存哈希。",
       ),
       h(
         "div",
@@ -789,7 +789,7 @@ function renderTokens(root) {
         ? emptyState(
             "key",
             active.length === 0 ? "还没有访问令牌" : "没有可显示的令牌",
-            "签发第一个令牌，为它配置 source 与 tool grants。",
+            "签发第一个令牌，为它配置数据源与工具授权。",
             h(
               "button",
               { class: "btn btn-primary", type: "button", onClick: openCreateTokenModal },
@@ -833,7 +833,7 @@ function tokenTable(rows) {
             "tr",
             {},
             h("th", {}, "Agent / 令牌"),
-            h("th", {}, "Grants"),
+            h("th", {}, "授权"),
             h("th", {}, "状态"),
             h("th", {}, "签发时间"),
             h("th", { class: "th-actions" }, "操作"),
@@ -987,7 +987,7 @@ function openCreateTokenModal() {
         h(
           "div",
           { class: "field-hint" },
-          "审计按 agent 分组；同一 agent 可以签发多个令牌。签发后不会自动获得任何 source 权限。",
+          "审计按 agent 分组；同一 agent 可以签发多个令牌。签发后不会自动获得任何数据源授权。",
         ),
       ),
       errorEl,
@@ -1124,10 +1124,10 @@ async function openGrantsModal(token) {
 
   const sourceSelect = h(
     "select",
-    { class: "select", "aria-label": "source" },
+    { class: "select", "aria-label": "数据源" },
     sources.map((source) => h("option", { value: source.id }, sourceLabel(source))),
   );
-  const toolSelect = h("select", { class: "select", "aria-label": "tool" });
+  const toolSelect = h("select", { class: "select", "aria-label": "工具" });
   const policySelect = h("select", { class: "select", "aria-label": "执行策略" });
   const addError = h("p", { class: "form-error hidden" });
 
@@ -1198,10 +1198,10 @@ async function openGrantsModal(token) {
       h(
         "div",
         { class: "callout" },
-        "每条 grant 精确绑定一个 source 和一个 tool。查询权限不隐含写入，写入权限不隐含查询。生产 source 不能授予数据写入或结构管理。",
+        "授权表示「令牌 + 数据源 + 工具」的允许关系。每条授权精确绑定一个数据源和一个工具：查询权限不隐含写入，写入权限不隐含查询。生产数据源不能授予写入或结构变更。",
       ),
       grants.length === 0
-        ? h("div", { class: "callout" }, "该令牌还没有 grants，agent 只能看到 list_sources。")
+        ? h("div", { class: "callout" }, "该令牌还没有授权，agent 只能看到 list_sources。")
         : h(
             "div",
             { class: "grant-list" },
@@ -1253,7 +1253,7 @@ async function openGrantsModal(token) {
       h(
         "div",
         { class: "detail-section" },
-        h("div", { class: "detail-block-title" }, "添加 grant"),
+        h("div", { class: "detail-block-title" }, "添加授权"),
         sources.length === 0
           ? h("div", { class: "callout callout-warning" }, "没有启用中的数据源。")
           : h(
@@ -1262,13 +1262,13 @@ async function openGrantsModal(token) {
               h(
                 "div",
                 { class: "field" },
-                h("label", { class: "field-label" }, "Source"),
+                h("label", { class: "field-label" }, "数据源"),
                 sourceSelect,
               ),
               h(
                 "div",
                 { class: "field" },
-                h("label", { class: "field-label" }, "Tool"),
+                h("label", { class: "field-label" }, "工具"),
                 toolSelect,
               ),
               h(
@@ -1281,7 +1281,7 @@ async function openGrantsModal(token) {
         h(
           "div",
           { class: "field-hint" },
-          "tool 还需要该 source 上存在用途匹配的 route 才能被调用。list_sources 是所有有效令牌的基础发现工具，无需 grant。",
+          "工具还需要该数据源上存在用途匹配的工具路由才能被调用。list_sources 是所有有效令牌的基础发现工具，无需授权。",
         ),
         addError,
       ),
@@ -1380,7 +1380,7 @@ function renderApprovals(root) {
       h(
         "p",
         { class: "page-desc" },
-        "高危写入、审批模式的普通写入和建库请求会在这里等待决定。请先打开审查弹层核对完整 SQL、参数、profile 与 route 版本，再批准或拒绝。",
+        "高危写入、审批模式的普通写入和建库请求会在这里等待决定。请先打开审查弹层核对完整 SQL、参数、连接配置与工具路由版本，再批准或拒绝。",
       ),
       h(
         "div",
@@ -1422,7 +1422,7 @@ function approvalsTable(rows) {
             {},
             h("th", {}, "ID"),
             h("th", {}, "Agent / 令牌"),
-            h("th", {}, "Source"),
+            h("th", {}, "数据源"),
             h("th", {}, "工具"),
             h("th", {}, "风险"),
             h("th", {}, "请求预览"),
@@ -1530,7 +1530,7 @@ function openApprovalModal(record) {
         h(
           "div",
           { class: "detail-label" },
-          "结果 tools",
+          "结果工具",
         ),
         h("div", { class: "detail-value mono" }, (spec.result_tools || []).join(", ") || "—"),
       ]
@@ -1562,34 +1562,34 @@ function openApprovalModal(record) {
           : h(
               "div",
               { class: "callout" },
-              "批准只对当前不可变请求摘要有效且只能消费一次；token、source、profile、route 或策略变化会使批准失效。",
+              "批准只对当前不可变请求摘要有效且只能消费一次；令牌、数据源、连接配置、工具路由或策略变化会使批准失效。",
             ),
         h(
           "div",
           { class: "detail-grid" },
           h("div", { class: "detail-label" }, "Agent"),
           h("div", { class: "detail-value" }, record.agent),
-          h("div", { class: "detail-label" }, "Token"),
+          h("div", { class: "detail-label" }, "令牌"),
           h("div", { class: "detail-value mono" }, record.token_id),
-          h("div", { class: "detail-label" }, "Source"),
+          h("div", { class: "detail-label" }, "数据源"),
           h("div", { class: "detail-value" }, record.source_id),
           h("div", { class: "detail-label" }, "工具"),
           h("div", { class: "detail-value mono" }, record.tool),
-          h("div", { class: "detail-label" }, "Profile"),
+          h("div", { class: "detail-label" }, "连接配置"),
           h(
             "div",
             { class: "detail-value" },
             `#${record.profile_id} · v${record.profile_version}`,
           ),
-          h("div", { class: "detail-label" }, "Route"),
+          h("div", { class: "detail-label" }, "工具路由"),
           h(
             "div",
             { class: "detail-value" },
             `#${record.route_id} · v${record.route_version}`,
           ),
-          h("div", { class: "detail-label" }, "Grant 策略"),
+          h("div", { class: "detail-label" }, "授权策略"),
           h("div", { class: "detail-value" }, policyLabel(record.grant_policy)),
-          h("div", { class: "detail-label" }, "Route 最低策略"),
+          h("div", { class: "detail-label" }, "路由最低策略"),
           h("div", { class: "detail-value" }, policyLabel(record.route_min_policy)),
           h("div", { class: "detail-label" }, "渠道"),
           h("div", { class: "detail-value" }, record.channel),
@@ -1695,8 +1695,8 @@ function renderAudit(root) {
   });
   const sourceSelect = h(
     "select",
-    { class: "filter-input", "aria-label": "按 source 过滤" },
-    h("option", { value: "" }, "全部 source"),
+    { class: "filter-input", "aria-label": "按数据源过滤" },
+    h("option", { value: "" }, "全部数据源"),
     state.sources.map((source) => h("option", { value: source.id }, sourceLabel(source))),
   );
   sourceSelect.value = filters.source;
@@ -1728,7 +1728,7 @@ function renderAudit(root) {
     h(
       "div",
       { class: "filter-field" },
-      h("label", { class: "filter-label" }, "Source"),
+      h("label", { class: "filter-label" }, "数据源"),
       sourceSelect,
     ),
     h(
@@ -1767,7 +1767,7 @@ function renderAudit(root) {
       h(
         "p",
         { class: "page-desc" },
-        "记录工具调用、审批决策和管理操作。可按 agent、source 和决定筛选。审计不保存令牌明文或凭证。",
+        "记录工具调用、审批决策和管理操作。可按 agent、数据源和决定筛选。审计不保存令牌明文或凭证。",
       ),
       form,
       items.length === 0
@@ -1827,7 +1827,7 @@ function auditTable(rows) {
             h("th", {}, "时间"),
             h("th", {}, "事件"),
             h("th", {}, "Agent / 令牌"),
-            h("th", {}, "Source"),
+            h("th", {}, "数据源"),
             h("th", {}, "工具"),
             h("th", {}, "决定"),
             h("th", {}, "角色"),
@@ -1926,9 +1926,9 @@ function openAuditModal(record) {
           h("div", { class: "detail-value mono" }, record.event),
           h("div", { class: "detail-label" }, "Agent"),
           h("div", { class: "detail-value" }, record.agent || "—"),
-          h("div", { class: "detail-label" }, "Token"),
+          h("div", { class: "detail-label" }, "令牌"),
           h("div", { class: "detail-value mono" }, record.token_id || "—"),
-          h("div", { class: "detail-label" }, "Source"),
+          h("div", { class: "detail-label" }, "数据源"),
           h("div", { class: "detail-value" }, record.source_id || "—"),
           h("div", { class: "detail-label" }, "工具"),
           h("div", { class: "detail-value mono" }, record.tool),
@@ -1948,7 +1948,7 @@ function openAuditModal(record) {
             { class: "detail-value" },
             record.approval_id === null ? "—" : `#${record.approval_id}`,
           ),
-          h("div", { class: "detail-label" }, "Profile"),
+          h("div", { class: "detail-label" }, "连接配置"),
           h(
             "div",
             { class: "detail-value" },
@@ -1956,7 +1956,7 @@ function openAuditModal(record) {
               ? "—"
               : `#${record.profile_id} · v${record.profile_version}`,
           ),
-          h("div", { class: "detail-label" }, "Route"),
+          h("div", { class: "detail-label" }, "工具路由"),
           h(
             "div",
             { class: "detail-value" },
@@ -2009,7 +2009,7 @@ function renderSources(root) {
       h(
         "p",
         { class: "page-desc" },
-        "数据源代表一个 PostgreSQL 数据库。连接凭证通过 profile 的 credential_ref 引用密钥环，不在管理页编辑 DSN。归档不会删除物理数据库。",
+        "数据源代表一个 PostgreSQL 数据库。连接配置直接填写数据库连接串，服务端加密保存，页面不回显。归档不会删除物理数据库。",
       ),
       h(
         "div",
@@ -2025,7 +2025,7 @@ function renderSources(root) {
         ? emptyState(
             "source",
             "还没有配置数据源",
-            "新增第一个数据源，再为它配置 profiles 与 routes。",
+            "新增第一个数据源，再为它配置连接配置与工具路由。",
             h(
               "button",
               { class: "btn btn-primary", type: "button", onClick: openCreateSourceModal },
@@ -2056,8 +2056,8 @@ function sourcesTable(rows) {
             h("th", {}, "ID"),
             h("th", {}, "环境"),
             h("th", {}, "状态"),
-            h("th", {}, "Profiles"),
-            h("th", {}, "Grants"),
+            h("th", {}, "连接配置"),
+            h("th", {}, "授权"),
             h("th", {}, "创建时间"),
             h("th", { class: "th-actions" }, "操作"),
           ),
@@ -2220,14 +2220,14 @@ function openCreateSourceModal() {
           h(
             "div",
             { class: "field-hint" },
-            "生产 source 禁止 mutate_sql 与 execute_ddl grants。",
+            "生产数据源禁止 mutate_sql 与 execute_ddl 授权。",
           ),
         ),
       ),
       h(
         "div",
         { class: "callout" },
-        "创建后请添加用途匹配的 connection profiles（query/mutate/schema/provision），再配置 tool routes。凭证引用使用 keyring:<account>，不是 DSN。",
+        "创建后请添加用途匹配的连接配置（查询 / 写入 / 结构变更 / 建库），再配置工具路由。连接配置里直接填写数据库连接串即可，服务端会加密保存。",
       ),
       errorEl,
     ),
@@ -2306,7 +2306,7 @@ function sourceDetailModal(data) {
           statusLabel(source.status),
         ),
       ),
-      h("p", { class: "modal-subtitle" }, "profiles 引用密钥环中的凭证；管理页不回显 DSN 或密码。"),
+      h("p", { class: "modal-subtitle" }, "连接配置引用密钥环中的凭证；管理页不回显 DSN 或密码。"),
     ),
     h(
       "div",
@@ -2316,13 +2316,13 @@ function sourceDetailModal(data) {
         { class: "detail-grid" },
         h("div", { class: "detail-label" }, "驱动"),
         h("div", { class: "detail-value" }, source.driver),
-        h("div", { class: "detail-label" }, "父 Source"),
+        h("div", { class: "detail-label" }, "父数据源"),
         h("div", { class: "detail-value" }, source.parent_source_id || "—"),
         h("div", { class: "detail-label" }, "创建时间"),
         h("div", { class: "detail-value" }, formatDateTime(source.created_at)),
         h("div", { class: "detail-label" }, "归档时间"),
         h("div", { class: "detail-value" }, formatDateTime(source.archived_at)),
-        h("div", { class: "detail-label" }, "Grants"),
+        h("div", { class: "detail-label" }, "授权"),
         h("div", { class: "detail-value" }, String(source.grant_count)),
       ),
       h(
@@ -2331,7 +2331,7 @@ function sourceDetailModal(data) {
         h(
           "div",
           { class: "section-head" },
-          h("h3", { class: "section-title" }, "Connection profiles"),
+          h("h3", { class: "section-title" }, "连接配置"),
           h(
             "button",
             {
@@ -2340,11 +2340,12 @@ function sourceDetailModal(data) {
               onClick: () => openProfileModal(source.id),
             },
             icon("plus", 14),
-            "添加 Profile",
+            "添加连接配置",
           ),
         ),
+        h("p", { class: "field-hint" }, "连接配置表示这个数据源使用哪套数据库账号。"),
         profiles.length === 0
-          ? h("div", { class: "callout callout-warning" }, "还没有 profile；恢复 source 前至少需要一个启用的 profile。")
+          ? h("div", { class: "callout callout-warning" }, "还没有连接配置；恢复数据源前至少需要一个启用的连接配置。")
           : h(
               "div",
               { class: "table-card" },
@@ -2362,10 +2363,11 @@ function sourceDetailModal(data) {
                       {},
                       h("th", {}, "名称"),
                       h("th", {}, "用途"),
-                      h("th", {}, "Credential ref"),
+                      h("th", {}, "凭证"),
                       h("th", {}, "连接上限"),
                       h("th", {}, "语句超时"),
                       h("th", {}, "版本"),
+                      h("th", { class: "th-actions" }, "操作"),
                     ),
                   ),
                   h(
@@ -2394,7 +2396,7 @@ function sourceDetailModal(data) {
                             purposeLabel(profile.purpose),
                           ),
                         ),
-                        h("td", {}, h("code", { class: "key" }, profile.credential_ref)),
+                        h("td", {}, h("span", { class: "badge" }, "已加密配置")),
                         h(
                           "td",
                           { class: "cell-date" },
@@ -2408,6 +2410,41 @@ function sourceDetailModal(data) {
                             : `${profile.statement_timeout_ms} ms`,
                         ),
                         h("td", { class: "cell-date" }, `v${profile.version}`),
+                        h(
+                          "td",
+                          {},
+                          h(
+                            "div",
+                            { class: "cell-actions" },
+                            h(
+                              "button",
+                              {
+                                class: "btn btn-secondary btn-small",
+                                type: "button",
+                                onClick: () => openProfileModal(source.id, profile),
+                              },
+                              "编辑",
+                            ),
+                            h(
+                              "button",
+                              {
+                                class: "btn btn-secondary btn-small",
+                                type: "button",
+                                onClick: () => testSavedProfile(source.id, profile.id),
+                              },
+                              "测试",
+                            ),
+                            h(
+                              "button",
+                              {
+                                class: "btn btn-danger btn-small",
+                                type: "button",
+                                onClick: () => deleteProfile(source.id, profile),
+                              },
+                              "删除",
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -2421,7 +2458,7 @@ function sourceDetailModal(data) {
         h(
           "div",
           { class: "section-head" },
-          h("h3", { class: "section-title" }, "Tool routes"),
+          h("h3", { class: "section-title" }, "工具路由"),
           h(
             "button",
             {
@@ -2430,11 +2467,12 @@ function sourceDetailModal(data) {
               onClick: () => openRouteModal(source.id, profiles),
             },
             icon("plus", 14),
-            "添加路由",
+            "添加工具路由",
           ),
         ),
+        h("p", { class: "field-hint" }, "工具路由表示这个工具使用哪套连接配置。"),
         routes.length === 0
-          ? h("div", { class: "callout" }, "还没有 route；即使有 grants，agent 也无法调用对应 tool。")
+          ? h("div", { class: "callout" }, "还没有工具路由；即使有授权，agent 也无法调用对应工具。")
           : h(
               "div",
               { class: "table-card" },
@@ -2450,10 +2488,11 @@ function sourceDetailModal(data) {
                     h(
                       "tr",
                       {},
-                      h("th", {}, "Tool"),
-                      h("th", {}, "Profile"),
+                      h("th", {}, "工具"),
+                      h("th", {}, "连接配置"),
                       h("th", {}, "最低策略"),
                       h("th", {}, "版本"),
+                      h("th", { class: "th-actions" }, "操作"),
                     ),
                   ),
                   h(
@@ -2479,6 +2518,32 @@ function sourceDetailModal(data) {
                           ),
                         ),
                         h("td", { class: "cell-date" }, `v${route.version}`),
+                        h(
+                          "td",
+                          {},
+                          h(
+                            "div",
+                            { class: "cell-actions" },
+                            h(
+                              "button",
+                              {
+                                class: "btn btn-secondary btn-small",
+                                type: "button",
+                                onClick: () => openRouteModal(source.id, profiles, route),
+                              },
+                              "编辑",
+                            ),
+                            h(
+                              "button",
+                              {
+                                class: "btn btn-danger btn-small",
+                                type: "button",
+                                onClick: () => deleteRoute(source.id, route),
+                              },
+                              "删除",
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   ),
@@ -2525,7 +2590,56 @@ function sourceDetailModal(data) {
   );
 }
 
-function openProfileModal(sourceId) {
+async function testSavedProfile(sourceId, profileId) {
+  try {
+    const data = await api(
+      `/admin/api/sources/${encodeURIComponent(sourceId)}/profiles/${profileId}/test`,
+      { method: "POST" },
+    );
+    showToast(
+      `连接成功：${data.database} / ${data.user} / PostgreSQL ${data.serverVersion}（${data.latencyMs} ms）`,
+    );
+  } catch (error) {
+    showToast(errorMessage(error), "error");
+  }
+}
+
+async function deleteProfile(sourceId, profile) {
+  if (!window.confirm(`确认删除连接配置「${profile.name}」？仍被工具路由或未完成审批引用时会被拒绝。`)) {
+    return;
+  }
+  try {
+    await api(
+      `/admin/api/sources/${encodeURIComponent(sourceId)}/profiles/${profile.id}`,
+      { method: "DELETE" },
+    );
+    showToast("连接配置已删除");
+    await reloadSourcesPage();
+    await openSourceDetail(sourceId);
+  } catch (error) {
+    showToast(errorMessage(error), "error");
+  }
+}
+
+async function deleteRoute(sourceId, route) {
+  if (!window.confirm(`确认删除工具路由「${route.tool}」？删除后 agent 将无法调用该工具。`)) {
+    return;
+  }
+  try {
+    await api(
+      `/admin/api/sources/${encodeURIComponent(sourceId)}/routes/${route.id}`,
+      { method: "DELETE" },
+    );
+    showToast("工具路由已删除");
+    await reloadSourcesPage();
+    await openSourceDetail(sourceId);
+  } catch (error) {
+    showToast(errorMessage(error), "error");
+  }
+}
+
+function openProfileModal(sourceId, profile) {
+  const editing = Boolean(profile);
   let busy = false;
   const nameInput = h("input", {
     class: "input",
@@ -2533,35 +2647,91 @@ function openProfileModal(sourceId) {
     placeholder: "例如 query_ro",
     maxlength: "64",
     autocomplete: "off",
+    value: editing ? profile.name : "",
   });
   const purposeSelect = h(
     "select",
-    { class: "select", id: "profile-purpose" },
+    { class: "select", id: "profile-purpose", disabled: editing },
     Object.entries(PURPOSE_LABELS).map(([value, label]) =>
-      h("option", { value }, `${label}（${value}）`),
+      h(
+        "option",
+        { value, selected: editing && profile.purpose === value },
+        label,
+      ),
     ),
   );
-  const credentialInput = h("input", {
+  const dsnInput = h("input", {
     class: "input",
-    id: "profile-credential",
-    placeholder: "keyring:mcp-db/source/query",
-    maxlength: "136",
-    autocomplete: "off",
+    id: "profile-dsn",
+    type: "password",
+    placeholder: editing
+      ? "留空表示沿用现有连接串"
+      : "postgres://用户名:密码@127.0.0.1:5432/数据库名",
+    maxlength: "2048",
+    autocomplete: "new-password",
+  });
+  const enabledInput = h("input", {
+    type: "checkbox",
+    id: "profile-enabled",
+    checked: editing ? profile.enabled : true,
   });
   const maxInput = h("input", {
     class: "input",
     id: "profile-max-connections",
     inputmode: "numeric",
     placeholder: "默认 5",
+    value: editing && profile.max_connections !== null ? String(profile.max_connections) : "",
   });
   const timeoutInput = h("input", {
     class: "input",
     id: "profile-timeout",
     inputmode: "numeric",
     placeholder: "默认 30000",
+    value:
+      editing && profile.statement_timeout_ms !== null
+        ? String(profile.statement_timeout_ms)
+        : "",
   });
   const errorEl = h("p", { class: "form-error hidden" });
-  const submit = h("button", { class: "btn btn-primary", type: "submit" }, "添加 Profile");
+  const testResultEl = h("p", { class: "field-hint hidden" });
+  const testButton = h(
+    "button",
+    {
+      class: "btn btn-secondary",
+      type: "button",
+      onClick: async () => {
+        const dsn = dsnInput.value.trim();
+        if (!editing && !/^postgres(ql)?:\/\//.test(dsn)) {
+          errorEl.textContent = "请先填写数据库连接串，再测试连接";
+          errorEl.classList.remove("hidden");
+          return;
+        }
+        testButton.disabled = true;
+        testResultEl.classList.add("hidden");
+        try {
+          const data = dsn
+            ? await api("/admin/api/connection-test", { method: "POST", body: { dsn } })
+            : await api(
+                `/admin/api/sources/${encodeURIComponent(sourceId)}/profiles/${profile.id}/test`,
+                { method: "POST" },
+              );
+          testResultEl.textContent = `连接成功：${data.database} / ${data.user} / PostgreSQL ${data.serverVersion}（${data.latencyMs} ms）`;
+          testResultEl.classList.remove("hidden");
+        } catch (error) {
+          errorEl.textContent = errorMessage(error);
+          errorEl.classList.remove("hidden");
+        } finally {
+          testButton.disabled = false;
+        }
+      },
+    },
+    "测试连接",
+  );
+  const submit = h(
+    "button",
+    { class: "btn btn-primary", type: "submit" },
+    editing ? "保存修改" : "添加连接配置",
+  );
 
   const form = h(
     "form",
@@ -2572,17 +2742,17 @@ function openProfileModal(sourceId) {
         if (busy) return;
         errorEl.classList.add("hidden");
         const name = nameInput.value.trim();
-        const credentialRef = credentialInput.value.trim();
+        const dsn = dsnInput.value.trim();
         if (!name) {
-          errorEl.textContent = "请输入 profile 名称";
+          errorEl.textContent = "请输入连接配置名称";
           errorEl.classList.remove("hidden");
           nameInput.focus();
           return;
         }
-        if (!/^keyring:/.test(credentialRef)) {
-          errorEl.textContent = "credential_ref 必须使用 keyring:<account> 形式，不能填写 DSN";
+        if ((!editing && !dsn) || (dsn && !/^postgres(ql)?:\/\//.test(dsn))) {
+          errorEl.textContent = "请输入 PostgreSQL 连接串，例如 postgres://用户:密码@主机:5432/数据库名";
           errorEl.classList.remove("hidden");
-          credentialInput.focus();
+          dsnInput.focus();
           return;
         }
         const maxConnections = maxInput.value.trim();
@@ -2599,26 +2769,30 @@ function openProfileModal(sourceId) {
         }
         busy = true;
         submit.disabled = true;
-        submit.textContent = "添加中…";
+        submit.textContent = editing ? "保存中…" : "添加中…";
         try {
-          await api(`/admin/api/sources/${encodeURIComponent(sourceId)}/profiles`, {
-            method: "POST",
+          const url = editing
+            ? `/admin/api/sources/${encodeURIComponent(sourceId)}/profiles/${profile.id}`
+            : `/admin/api/sources/${encodeURIComponent(sourceId)}/profiles`;
+          await api(url, {
+            method: editing ? "PUT" : "POST",
             body: {
               name,
               purpose: purposeSelect.value,
-              credential_ref: credentialRef,
+              enabled: enabledInput.checked,
+              dsn: dsn || null,
               max_connections: maxConnections ? Number(maxConnections) : null,
               statement_timeout_ms: timeout ? Number(timeout) : null,
             },
           });
           closeModal();
-          showToast("Profile 已添加");
+          showToast(editing ? "连接配置已保存，版本号已递增" : "连接配置已添加");
           await reloadSourcesPage();
           await openSourceDetail(sourceId);
         } catch (error) {
           busy = false;
           submit.disabled = false;
-          submit.textContent = "添加 Profile";
+          submit.textContent = editing ? "保存修改" : "添加连接配置";
           errorEl.textContent = errorMessage(error);
           errorEl.classList.remove("hidden");
         }
@@ -2646,13 +2820,27 @@ function openProfileModal(sourceId) {
       h(
         "div",
         { class: "field" },
-        h("label", { class: "field-label", for: "profile-credential" }, "Credential ref"),
-        credentialInput,
+        h("label", { class: "field-label", for: "profile-dsn" }, "数据库连接串"),
+        dsnInput,
         h(
           "div",
           { class: "field-hint" },
-          "只填写密钥环引用，例如 keyring:mcp-db/query。provision profile 必须使用 keyring:provision/ 命名空间。",
+          editing
+            ? "留空表示沿用现有加密凭证；填写新连接串会在保存时轮换凭证并递增版本号。"
+            : "直接填写该数据源的 PostgreSQL 连接串；服务端会立即加密保存，页面不会回显。请使用与该用途匹配的账号（查询用只读账号，写入用读写账号，建库用具备 CREATEDB 权限的管理账号）。",
         ),
+        testResultEl,
+      ),
+      h(
+        "div",
+        { class: "field" },
+        h(
+          "label",
+          { class: "field-label", for: "profile-enabled" },
+          h("span", {}, enabledInput),
+          " 启用这个连接配置",
+        ),
+        h("div", { class: "field-hint" }, "停用后，使用该配置的工具路由会拒绝新调用。"),
       ),
       h(
         "div",
@@ -2673,13 +2861,14 @@ function openProfileModal(sourceId) {
       h(
         "div",
         { class: "callout callout-warning" },
-        "query profile 的实际只读性取决于数据库账号权限和连接只读设置；多个 profile 复用同一凭证不会产生数据库级隔离。",
+        "查询用途连接配置的实际只读性取决于数据库账号权限和连接只读设置；多个连接配置复用同一凭证不会产生数据库级隔离。",
       ),
       errorEl,
     ),
     h(
       "div",
       { class: "modal-foot" },
+      testButton,
       h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
       submit,
     ),
@@ -2692,7 +2881,7 @@ function openProfileModal(sourceId) {
       h(
         "div",
         { class: "modal-head" },
-        h("h2", { class: "modal-title" }, "添加 Connection Profile"),
+        h("h2", { class: "modal-title" }, editing ? "编辑连接配置" : "添加连接配置"),
         h("p", { class: "modal-subtitle" }, sourceId),
       ),
       form,
@@ -2701,13 +2890,19 @@ function openProfileModal(sourceId) {
   nameInput.focus();
 }
 
-function openRouteModal(sourceId, profiles) {
+function openRouteModal(sourceId, profiles, route) {
+  const editing = Boolean(route);
   let busy = false;
-  const enabled = profiles.filter((profile) => profile.enabled);
   const toolSelect = h(
     "select",
-    { class: "select", id: "route-tool" },
-    TOOLS.map((tool) => h("option", { value: tool }, TOOL_LABELS[tool])),
+    { class: "select", id: "route-tool", disabled: editing },
+    TOOLS.map((tool) =>
+      h(
+        "option",
+        { value: tool, selected: editing && route.tool === tool },
+        TOOL_LABELS[tool],
+      ),
+    ),
   );
   const profileSelect = h("select", { class: "select", id: "route-profile" });
   const policySelect = h(
@@ -2718,21 +2913,38 @@ function openRouteModal(sourceId, profiles) {
   );
   const hint = h("div", { class: "field-hint" });
   const errorEl = h("p", { class: "form-error hidden" });
-  const submit = h("button", { class: "btn btn-primary", type: "submit" }, "添加路由");
+  const submit = h(
+    "button",
+    { class: "btn btn-primary", type: "submit" },
+    editing ? "保存修改" : "添加工具路由",
+  );
 
   function renderProfiles() {
     const purpose = TOOL_PURPOSE[toolSelect.value];
-    const matching = enabled.filter((profile) => profile.purpose === purpose);
+    const matching = profiles.filter(
+      (profile) =>
+        profile.purpose === purpose &&
+        (profile.enabled || (editing && route.profile_id === profile.id)),
+    );
     profileSelect.replaceChildren(
       ...matching.map((profile) =>
-        h("option", { value: String(profile.id) }, `${profile.name} · #${profile.id}`),
+        h(
+          "option",
+          { value: String(profile.id), selected: editing && route.profile_id === profile.id },
+          `${profile.name} · #${profile.id}`,
+        ),
       ),
     );
     profileSelect.disabled = matching.length === 0;
     hint.textContent =
       matching.length === 0
-        ? `该 tool 需要 ${purpose} 用途的 profile，请先添加。`
-        : `该 tool 固定使用 ${purpose} 用途 profile。`;
+        ? `该工具需要「${purposeLabel(purpose)}」用途的连接配置，请先添加。`
+        : `该工具固定使用「${purposeLabel(purpose)}」用途的连接配置。`;
+    if (editing) {
+      policySelect.value = route.min_approval_policy;
+      policySelect.disabled = route.tool === "create_database";
+      return;
+    }
     const requiresApproval = ["mutate_sql", "execute_ddl", "create_database"].includes(
       toolSelect.value,
     );
@@ -2753,16 +2965,19 @@ function openRouteModal(sourceId, profiles) {
         if (busy) return;
         errorEl.classList.add("hidden");
         if (!profileSelect.value) {
-          errorEl.textContent = "没有用途匹配的 profile";
+          errorEl.textContent = "没有用途匹配的连接配置";
           errorEl.classList.remove("hidden");
           return;
         }
         busy = true;
         submit.disabled = true;
-        submit.textContent = "添加中…";
+        submit.textContent = editing ? "保存中…" : "添加中…";
         try {
-          await api(`/admin/api/sources/${encodeURIComponent(sourceId)}/routes`, {
-            method: "POST",
+          const url = editing
+            ? `/admin/api/sources/${encodeURIComponent(sourceId)}/routes/${route.id}`
+            : `/admin/api/sources/${encodeURIComponent(sourceId)}/routes`;
+          await api(url, {
+            method: editing ? "PUT" : "POST",
             body: {
               tool: toolSelect.value,
               profile_id: Number(profileSelect.value),
@@ -2770,13 +2985,13 @@ function openRouteModal(sourceId, profiles) {
             },
           });
           closeModal();
-          showToast("路由已添加");
+          showToast(editing ? "路由已保存，版本号已递增" : "路由已添加");
           await reloadSourcesPage();
           await openSourceDetail(sourceId);
         } catch (error) {
           busy = false;
           submit.disabled = false;
-          submit.textContent = "添加路由";
+          submit.textContent = editing ? "保存修改" : "添加工具路由";
           errorEl.textContent = errorMessage(error);
           errorEl.classList.remove("hidden");
         }
@@ -2788,13 +3003,13 @@ function openRouteModal(sourceId, profiles) {
       h(
         "div",
         { class: "field" },
-        h("label", { class: "field-label", for: "route-tool" }, "Tool"),
+        h("label", { class: "field-label", for: "route-tool" }, "工具"),
         toolSelect,
       ),
       h(
         "div",
         { class: "field" },
-        h("label", { class: "field-label", for: "route-profile" }, "Profile"),
+        h("label", { class: "field-label", for: "route-profile" }, "连接配置"),
         profileSelect,
         hint,
       ),
@@ -2806,7 +3021,7 @@ function openRouteModal(sourceId, profiles) {
         h(
           "div",
           { class: "field-hint" },
-          "实际策略取 grant、route 最低策略和内置高危规则中的更严格者；create_database 始终审批。",
+          "实际策略取授权策略、工具路由最低策略和内置高危规则中的更严格者；create_database 始终需要审批。",
         ),
       ),
       errorEl,
@@ -2826,7 +3041,7 @@ function openRouteModal(sourceId, profiles) {
       h(
         "div",
         { class: "modal-head" },
-        h("h2", { class: "modal-title" }, "添加 Tool Route"),
+        h("h2", { class: "modal-title" }, editing ? "编辑工具路由" : "添加工具路由"),
         h("p", { class: "modal-subtitle" }, sourceId),
       ),
       form,
@@ -2872,7 +3087,7 @@ function openEnvironmentModal(source) {
         "div",
         { class: "modal-head" },
         h("h2", { class: "modal-title" }, "修改环境分类"),
-        h("p", { class: "modal-subtitle" }, "只有已归档 source 可以修改环境分类。"),
+        h("p", { class: "modal-subtitle" }, "只有已归档数据源可以修改环境分类。"),
       ),
       h(
         "div",
@@ -2881,7 +3096,7 @@ function openEnvironmentModal(source) {
         h(
           "div",
           { class: "callout callout-warning" },
-          "标记为生产前必须先撤销该 source 上的 mutate_sql、execute_ddl 和 create_database grants。",
+          "标记为生产前必须先撤销该数据源上的 mutate_sql、execute_ddl 和 create_database 授权。",
         ),
         errorEl,
       ),
@@ -2939,7 +3154,7 @@ function openArchiveModal(source) {
         h(
           "div",
           { class: "callout callout-danger" },
-          "归档会阻止新请求、使待批请求失效，并从 agent 的 source 列表移除。配置、grants 和审计保留，物理数据库不会被删除。",
+          "归档会阻止新请求、使待批请求失效，并从 agent 的数据源列表移除。配置、授权和审计保留，物理数据库不会被删除。",
         ),
         errorEl,
       ),
@@ -2997,7 +3212,7 @@ function openRestoreModal(source) {
         h(
           "div",
           { class: "callout" },
-          "恢复前会复核启用的 profiles、grants 和适用建库配额。任一条件不满足时恢复失败。",
+          "恢复前会复核启用的连接配置、授权和适用建库配额。任一条件不满足时恢复失败。",
         ),
         errorEl,
       ),
@@ -3055,8 +3270,8 @@ function openSettleModal(reservation, target) {
           "div",
           { class: "callout callout-warning" },
           commit
-            ? "只有确认数据库已创建并完成本地登记时才提交；提交要求对应 source 处于启用状态。"
-            : "只有确认数据库未创建或已由人工清理时才释放；释放会恢复该 token × 父 source 的配额。",
+            ? "只有确认数据库已创建并完成本地登记时才提交；提交要求对应数据源处于启用状态。"
+            : "只有确认数据库未创建或已由人工清理时才释放；释放会恢复该令牌 × 父数据源的配额。",
         ),
         errorEl,
       ),
@@ -3178,7 +3393,7 @@ function renderLogin() {
     id: "admin-token",
     type: "password",
     autocomplete: "off",
-    placeholder: "输入一次性登录令牌",
+    placeholder: "输入管理员密钥或一次性登录令牌",
   });
   const errorEl = h("p", { class: "form-error hidden" });
   const submit = h("button", { class: "btn btn-primary", type: "submit" }, "登录");
@@ -3227,7 +3442,7 @@ function renderLogin() {
         }
       },
     },
-    h("label", { class: "field-label", for: "admin-token" }, "一次性登录令牌"),
+    h("label", { class: "field-label", for: "admin-token" }, "管理员密钥或登录令牌"),
     input,
     errorEl,
     submit,
@@ -3245,19 +3460,19 @@ function renderLogin() {
           { class: "login-brand" },
           h("div", { class: "brand-mark" }, "db"),
           h("div", { class: "brand-name" }, "mcp-db"),
-          h("span", { class: "brand-badge" }, "Admin"),
+          h("span", { class: "brand-badge" }, "管理台"),
         ),
         h("h1", { class: "login-title" }, "管理员登录"),
         h(
           "p",
           { class: "login-desc" },
-          "在服务所在主机运行 mcp-db admin-login-token 获取一次性令牌。令牌 5 分钟内有效且只能使用一次。",
+          "在服务所在主机运行 mcp-db admin-login-token 获取一次性令牌（5 分钟有效），或使用 mcp-db admin-key create 创建的永久管理员密钥登录。",
         ),
         form,
         h(
           "p",
           { class: "login-foot" },
-          "管理面仅监听回环地址；agent Bearer token 不能登录管理台。",
+          "管理面仅监听回环地址；agent 的 Bearer 令牌不能登录管理台。",
         ),
       ),
     ),
