@@ -1130,23 +1130,145 @@ async function openGrantsModal(token) {
   const toolSelect = h("select", { class: "select", "aria-label": "工具" });
   const policySelect = h("select", { class: "select", "aria-label": "执行策略" });
   const addError = h("p", { class: "form-error hidden" });
+  const availabilityNote = h("p", { class: "field-hint hidden" });
+  const submitButton = h(
+    "button",
+    { class: "btn btn-primary", type: "submit", disabled: true },
+    "添加授权",
+  );
+  const availability = new Map();
+  const loadSeq = new Map();
 
   function selectedSource() {
     return sources.find((source) => source.id === sourceSelect.value);
   }
 
+  function showNote(message, className) {
+    availabilityNote.className = className;
+    availabilityNote.textContent = message;
+  }
+
+  function hideNote() {
+    availabilityNote.className = "field-hint hidden";
+    availabilityNote.textContent = "";
+  }
+
+  function toolAvailability(source, detail) {
+    const production = source.environment === "production";
+    const routes = new Map();
+    for (const route of detail.routes || []) {
+      if (!routes.has(route.tool)) routes.set(route.tool, route);
+    }
+    const profiles = new Map((detail.profiles || []).map((profile) => [profile.id, profile]));
+    return TOOLS.filter(
+      (tool) => !(production && (tool === "mutate_sql" || tool === "execute_ddl")),
+    ).map((tool) => {
+      const route = routes.get(tool);
+      if (!route) return { tool, usable: false, reason: "（未配置工具路由）" };
+      const profile = profiles.get(route.profile_id);
+      if (!profile || !profile.enabled) {
+        return { tool, usable: false, reason: "（连接配置已停用）" };
+      }
+      return { tool, usable: true, reason: "" };
+    });
+  }
+
+  async function loadAvailability(sourceId) {
+    const seq = (loadSeq.get(sourceId) || 0) + 1;
+    loadSeq.set(sourceId, seq);
+    availability.set(sourceId, { status: "loading" });
+    try {
+      const detail = await api(`/admin/api/sources/${encodeURIComponent(sourceId)}`);
+      if (loadSeq.get(sourceId) !== seq) return;
+      const source = sources.find((item) => item.id === sourceId);
+      availability.set(sourceId, {
+        status: "ready",
+        options: source ? toolAvailability(source, detail) : [],
+      });
+    } catch (error) {
+      if (loadSeq.get(sourceId) !== seq) return;
+      availability.set(sourceId, { status: "error", error: errorMessage(error) });
+    }
+    if (sourceSelect.value === sourceId) renderTools();
+  }
+
+  function renderLoading() {
+    toolSelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "加载中…"));
+    policySelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "—"));
+    toolSelect.disabled = true;
+    policySelect.disabled = true;
+    submitButton.disabled = true;
+    showNote("正在加载该数据源的可用工具…", "field-hint");
+  }
+
+  function renderAvailabilityError(message) {
+    toolSelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "加载失败"));
+    policySelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "—"));
+    toolSelect.disabled = true;
+    policySelect.disabled = true;
+    submitButton.disabled = true;
+    showNote(message, "form-error");
+  }
+
   function renderTools() {
     const source = selectedSource();
-    const production = source && source.environment === "production";
-    const tools = TOOLS.filter((tool) => !(production && (tool === "mutate_sql" || tool === "execute_ddl")));
+    if (!source) {
+      toolSelect.replaceChildren();
+      policySelect.replaceChildren();
+      toolSelect.disabled = true;
+      policySelect.disabled = true;
+      submitButton.disabled = true;
+      hideNote();
+      return;
+    }
+    const entry = availability.get(source.id);
+    if (!entry) {
+      renderLoading();
+      void loadAvailability(source.id);
+      return;
+    }
+    if (entry.status === "loading") {
+      renderLoading();
+      return;
+    }
+    if (entry.status === "error") {
+      renderAvailabilityError(entry.error);
+      return;
+    }
+    const usable = entry.options.filter((option) => option.usable);
     toolSelect.replaceChildren(
-      ...tools.map((tool) => h("option", { value: tool }, TOOL_LABELS[tool])),
+      ...entry.options.map((option) =>
+        h(
+          "option",
+          { value: option.tool, disabled: !option.usable },
+          option.usable
+            ? TOOL_LABELS[option.tool]
+            : `${TOOL_LABELS[option.tool]}${option.reason}`,
+        ),
+      ),
     );
+    if (usable.length === 0) {
+      toolSelect.disabled = true;
+      policySelect.replaceChildren();
+      policySelect.disabled = true;
+      submitButton.disabled = true;
+      showNote("该数据源还没有可用的工具路由，请先到数据源页配置。", "field-hint");
+      return;
+    }
+    toolSelect.disabled = false;
+    toolSelect.value = usable[0].tool;
+    submitButton.disabled = false;
+    hideNote();
     renderPolicies();
   }
 
   function renderPolicies() {
     const tool = toolSelect.value;
+    if (!tool) {
+      policySelect.replaceChildren();
+      policySelect.disabled = true;
+      return;
+    }
     let policies = ["direct"];
     if (tool === "mutate_sql" || tool === "execute_ddl" || tool === "create_database") {
       policies = ["approval", "direct"];
@@ -1156,9 +1278,15 @@ async function openGrantsModal(token) {
       ...policies.map((policy) => h("option", { value: policy }, policyLabel(policy))),
     );
     policySelect.value = policies[0];
+    policySelect.disabled = false;
   }
 
-  sourceSelect.addEventListener("change", renderTools);
+  sourceSelect.addEventListener("change", () => {
+    const source = selectedSource();
+    const entry = source ? availability.get(source.id) : null;
+    if (entry && entry.status === "error") availability.delete(source.id);
+    renderTools();
+  });
   toolSelect.addEventListener("change", renderPolicies);
   renderTools();
 
@@ -1174,13 +1302,26 @@ async function openGrantsModal(token) {
           addError.classList.remove("hidden");
           return;
         }
+        const source = selectedSource();
+        const tool = toolSelect.value;
+        const policy = policySelect.value;
+        const entry = source ? availability.get(source.id) : null;
+        const usable =
+          entry &&
+          entry.status === "ready" &&
+          entry.options.some((option) => option.usable && option.tool === tool);
+        if (!source || !tool || !policy || !usable) {
+          addError.textContent = "该数据源还没有可用的工具路由，请先到数据源页配置。";
+          addError.classList.remove("hidden");
+          return;
+        }
         try {
           await api(`/admin/api/tokens/${encodeURIComponent(token.id)}/grants`, {
             method: "POST",
             body: {
-              source_id: sourceSelect.value,
-              tool: toolSelect.value,
-              policy: policySelect.value,
+              source_id: source.id,
+              tool,
+              policy,
             },
           });
           showToast("已添加授权");
@@ -1283,6 +1424,7 @@ async function openGrantsModal(token) {
           { class: "field-hint" },
           "工具还需要该数据源上存在用途匹配的工具路由才能被调用。list_sources 是所有有效令牌的基础发现工具，无需授权。",
         ),
+        availabilityNote,
         addError,
       ),
     ),
@@ -1290,7 +1432,7 @@ async function openGrantsModal(token) {
       "div",
       { class: "modal-foot" },
       h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "关闭"),
-      h("button", { class: "btn btn-primary", type: "submit" }, "添加授权"),
+      submitButton,
     ),
   );
 
