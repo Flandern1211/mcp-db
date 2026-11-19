@@ -75,6 +75,7 @@ const ICONS = {
   alert: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
   chevronLeft: '<path d="M15 18l-6-6 6-6"/>',
   chevronRight: '<path d="M9 18l6-6-6-6"/>',
+  chevronDown: '<path d="M6 9l6 6 6-6"/>',
 };
 
 const state = {
@@ -1128,39 +1129,74 @@ async function openGrantsModal(token) {
     sources.map((source) => h("option", { value: source.id }, sourceLabel(source))),
   );
   const toolSelect = h("select", { class: "select", "aria-label": "工具" });
-  const policySelect = h("select", { class: "select", "aria-label": "执行策略" });
+  const policyHint = h("p", { class: "field-hint" });
+  const tightenInput = h("input", { type: "checkbox" });
+  const tightenLabel = h(
+    "label",
+    { class: "toggle hidden" },
+    tightenInput,
+    "添加授权时要求逐次审批（比工具路由更严格）",
+  );
   const addError = h("p", { class: "form-error hidden" });
+  const routeCache = new Map();
+  let inheritedPolicy = "direct";
 
   function selectedSource() {
     return sources.find((source) => source.id === sourceSelect.value);
   }
 
-  function renderTools() {
+  async function loadRoutes(sourceId) {
+    if (!routeCache.has(sourceId)) {
+      try {
+        const detail = await api(`/admin/api/sources/${encodeURIComponent(sourceId)}`);
+        routeCache.set(sourceId, detail.routes || []);
+      } catch {
+        routeCache.set(sourceId, []);
+      }
+    }
+    return routeCache.get(sourceId);
+  }
+
+  function selectedRoute() {
+    const routes = routeCache.get(sourceSelect.value) || [];
+    return routes.find((route) => route.tool === toolSelect.value);
+  }
+
+  function renderPolicy() {
+    const route = selectedRoute();
+    tightenInput.checked = false;
+    tightenLabel.classList.add("hidden");
+    if (!route) {
+      inheritedPolicy = "direct";
+      policyHint.textContent =
+        "这个工具在该数据源还没有工具路由，授权后也无法调用；请先在数据源页添加对应工具路由。";
+      return;
+    }
+    inheritedPolicy = route.min_approval_policy;
+    if (inheritedPolicy === "approval") {
+      policyHint.textContent = "执行策略继承自工具路由：逐次审批。";
+    } else {
+      policyHint.textContent = "执行策略继承自工具路由：直接执行。";
+      tightenLabel.classList.remove("hidden");
+    }
+  }
+
+  async function renderTools() {
     const source = selectedSource();
     const production = source && source.environment === "production";
     const tools = TOOLS.filter((tool) => !(production && (tool === "mutate_sql" || tool === "execute_ddl")));
     toolSelect.replaceChildren(
       ...tools.map((tool) => h("option", { value: tool }, TOOL_LABELS[tool])),
     );
-    renderPolicies();
+    await loadRoutes(sourceSelect.value);
+    renderPolicy();
   }
 
-  function renderPolicies() {
-    const tool = toolSelect.value;
-    let policies = ["direct"];
-    if (tool === "mutate_sql" || tool === "execute_ddl" || tool === "create_database") {
-      policies = ["approval", "direct"];
-    }
-    if (tool === "create_database") policies = ["approval"];
-    policySelect.replaceChildren(
-      ...policies.map((policy) => h("option", { value: policy }, policyLabel(policy))),
-    );
-    policySelect.value = policies[0];
-  }
-
-  sourceSelect.addEventListener("change", renderTools);
-  toolSelect.addEventListener("change", renderPolicies);
-  renderTools();
+  sourceSelect.addEventListener("change", () => {
+    void renderTools();
+  });
+  toolSelect.addEventListener("change", renderPolicy);
+  void renderTools();
 
   const form = h(
     "form",
@@ -1180,7 +1216,10 @@ async function openGrantsModal(token) {
             body: {
               source_id: sourceSelect.value,
               tool: toolSelect.value,
-              policy: policySelect.value,
+              policy:
+                inheritedPolicy === "approval" || tightenInput.checked
+                  ? "approval"
+                  : "direct",
             },
           });
           showToast("已添加授权");
@@ -1258,7 +1297,7 @@ async function openGrantsModal(token) {
           ? h("div", { class: "callout callout-warning" }, "没有启用中的数据源。")
           : h(
               "div",
-              { class: "perm-row" },
+              { class: "perm-row perm-row-two" },
               h(
                 "div",
                 { class: "field" },
@@ -1271,13 +1310,9 @@ async function openGrantsModal(token) {
                 h("label", { class: "field-label" }, "工具"),
                 toolSelect,
               ),
-              h(
-                "div",
-                { class: "field" },
-                h("label", { class: "field-label" }, "策略"),
-                policySelect,
-              ),
             ),
+        policyHint,
+        tightenLabel,
         h(
           "div",
           { class: "field-hint" },
@@ -2331,7 +2366,7 @@ function sourceDetailModal(data) {
         h(
           "div",
           { class: "section-head" },
-          h("h3", { class: "section-title" }, "连接配置"),
+          h("h3", { class: "section-title" }, "连接配置与工具路由"),
           h(
             "button",
             {
@@ -2343,212 +2378,182 @@ function sourceDetailModal(data) {
             "添加连接配置",
           ),
         ),
-        h("p", { class: "field-hint" }, "连接配置表示这个数据源使用哪套数据库账号。"),
+        h(
+          "p",
+          { class: "field-hint" },
+          "每个连接配置下面直接管理它负责的工具路由：先建连接配置，再在这个配置里选择允许哪些工具以及审批策略。",
+        ),
         profiles.length === 0
           ? h("div", { class: "callout callout-warning" }, "还没有连接配置；恢复数据源前至少需要一个启用的连接配置。")
           : h(
               "div",
-              { class: "table-card" },
-              h(
-                "div",
-                { class: "table-scroll" },
-                h(
-                  "table",
-                  {},
-                  h(
-                    "thead",
-                    {},
-                    h(
-                      "tr",
-                      {},
-                      h("th", {}, "名称"),
-                      h("th", {}, "用途"),
-                      h("th", {}, "凭证"),
-                      h("th", {}, "连接上限"),
-                      h("th", {}, "语句超时"),
-                      h("th", {}, "版本"),
-                      h("th", { class: "th-actions" }, "操作"),
-                    ),
-                  ),
-                  h(
-                    "tbody",
-                    {},
-                    profiles.map((profile) =>
-                      h(
-                        "tr",
-                        {},
-                        h(
-                          "td",
-                          {},
-                          h("div", { class: "cell-title" }, profile.name),
+              { class: "profile-list" },
+              profiles.map((profile) => {
+                const profileRoutes = routes.filter(
+                  (route) => route.profile_id === profile.id,
+                );
+                const routesPanel = h(
+                  "div",
+                  { class: "profile-routes hidden" },
+                  profileRoutes.length === 0
+                    ? h(
+                        "div",
+                        { class: "profile-routes-empty" },
+                        "这个连接配置还没有工具路由；添加后 agent 才能通过它调用对应工具。",
+                      )
+                    : h(
+                        "div",
+                        { class: "route-list" },
+                        profileRoutes.map((route) =>
                           h(
                             "div",
-                            { class: "cell-sub" },
-                            profile.enabled ? "启用" : "停用",
+                            { class: "route-row" },
+                            h(
+                              "div",
+                              { class: "route-main" },
+                              h(
+                                "span",
+                                { class: "badge tool-badge" },
+                                TOOL_LABELS[route.tool] || route.tool,
+                              ),
+                              h(
+                                "span",
+                                { class: `badge policy-${route.min_approval_policy}` },
+                                policyLabel(route.min_approval_policy),
+                              ),
+                              h("span", { class: "cell-date" }, `v${route.version}`),
+                            ),
+                            h(
+                              "div",
+                              { class: "action-row" },
+                              h(
+                                "button",
+                                {
+                                  class: "btn btn-secondary btn-small",
+                                  type: "button",
+                                  onClick: () =>
+                                    openRouteModal(source.id, profile, routes, route),
+                                },
+                                "编辑",
+                              ),
+                              h(
+                                "button",
+                                {
+                                  class: "btn btn-danger btn-small",
+                                  type: "button",
+                                  onClick: () => deleteRoute(source.id, route),
+                                },
+                                "删除",
+                              ),
+                            ),
                           ),
                         ),
+                      ),
+                );
+                const routesToggle = h(
+                  "button",
+                  {
+                    class: "profile-routes-toggle",
+                    type: "button",
+                    "aria-expanded": "false",
+                    onClick: () => {
+                      const expanded = routesPanel.classList.toggle("hidden") === false;
+                      routesToggle.classList.toggle("open", expanded);
+                      routesToggle.setAttribute("aria-expanded", String(expanded));
+                    },
+                  },
+                  h(
+                    "span",
+                    { class: "profile-routes-label" },
+                    "工具路由",
+                    h("span", { class: "count-pill" }, String(profileRoutes.length)),
+                  ),
+                  icon("chevronDown", 16),
+                );
+                return h(
+                  "div",
+                  { class: "profile-card" },
+                  h(
+                    "div",
+                    { class: "profile-head" },
+                    h(
+                      "div",
+                      { class: "profile-main" },
+                      h(
+                        "div",
+                        { class: "profile-name-row" },
+                        h("strong", {}, profile.name),
                         h(
-                          "td",
-                          {},
-                          h(
-                            "span",
-                            { class: "badge tool-badge" },
-                            purposeLabel(profile.purpose),
-                          ),
+                          "span",
+                          { class: "badge tool-badge" },
+                          purposeLabel(profile.purpose),
                         ),
-                        h("td", {}, h("span", { class: "badge" }, "已加密配置")),
                         h(
-                          "td",
-                          { class: "cell-date" },
-                          profile.max_connections === null ? "默认" : String(profile.max_connections),
+                          "span",
+                          { class: "badge" },
+                          profile.enabled ? "启用" : "停用",
                         ),
-                        h(
-                          "td",
-                          { class: "cell-date" },
+                      ),
+                      h(
+                        "div",
+                        { class: "profile-meta" },
+                        `凭证：已加密配置 · 连接上限：${
+                          profile.max_connections === null
+                            ? "默认"
+                            : profile.max_connections
+                        } · 语句超时：${
                           profile.statement_timeout_ms === null
                             ? "默认"
-                            : `${profile.statement_timeout_ms} ms`,
-                        ),
-                        h("td", { class: "cell-date" }, `v${profile.version}`),
-                        h(
-                          "td",
-                          {},
-                          h(
-                            "div",
-                            { class: "cell-actions" },
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-secondary btn-small",
-                                type: "button",
-                                onClick: () => openProfileModal(source.id, profile),
-                              },
-                              "编辑",
-                            ),
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-secondary btn-small",
-                                type: "button",
-                                onClick: () => testSavedProfile(source.id, profile.id),
-                              },
-                              "测试",
-                            ),
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-danger btn-small",
-                                type: "button",
-                                onClick: () => deleteProfile(source.id, profile),
-                              },
-                              "删除",
-                            ),
-                          ),
-                        ),
+                            : `${profile.statement_timeout_ms} ms`
+                        } · v${profile.version}`,
                       ),
                     ),
-                  ),
-                ),
-              ),
-            ),
-      ),
-      h(
-        "div",
-        { class: "detail-section" },
-        h(
-          "div",
-          { class: "section-head" },
-          h("h3", { class: "section-title" }, "工具路由"),
-          h(
-            "button",
-            {
-              class: "btn btn-secondary btn-small",
-              type: "button",
-              onClick: () => openRouteModal(source.id, profiles),
-            },
-            icon("plus", 14),
-            "添加工具路由",
-          ),
-        ),
-        h("p", { class: "field-hint" }, "工具路由表示这个工具使用哪套连接配置。"),
-        routes.length === 0
-          ? h("div", { class: "callout" }, "还没有工具路由；即使有授权，agent 也无法调用对应工具。")
-          : h(
-              "div",
-              { class: "table-card" },
-              h(
-                "div",
-                { class: "table-scroll" },
-                h(
-                  "table",
-                  {},
-                  h(
-                    "thead",
-                    {},
                     h(
-                      "tr",
-                      {},
-                      h("th", {}, "工具"),
-                      h("th", {}, "连接配置"),
-                      h("th", {}, "最低策略"),
-                      h("th", {}, "版本"),
-                      h("th", { class: "th-actions" }, "操作"),
-                    ),
-                  ),
-                  h(
-                    "tbody",
-                    {},
-                    routes.map((route) =>
+                      "div",
+                      { class: "action-row" },
                       h(
-                        "tr",
-                        {},
-                        h("td", {}, h("span", { class: "badge tool-badge" }, route.tool)),
-                        h(
-                          "td",
-                          {},
-                          route.profile_name || profileNames.get(route.profile_id) || `#${route.profile_id}`,
-                        ),
-                        h(
-                          "td",
-                          {},
-                          h(
-                            "span",
-                            { class: `badge policy-${route.min_approval_policy}` },
-                            policyLabel(route.min_approval_policy),
-                          ),
-                        ),
-                        h("td", { class: "cell-date" }, `v${route.version}`),
-                        h(
-                          "td",
-                          {},
-                          h(
-                            "div",
-                            { class: "cell-actions" },
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-secondary btn-small",
-                                type: "button",
-                                onClick: () => openRouteModal(source.id, profiles, route),
-                              },
-                              "编辑",
-                            ),
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-danger btn-small",
-                                type: "button",
-                                onClick: () => deleteRoute(source.id, route),
-                              },
-                              "删除",
-                            ),
-                          ),
-                        ),
+                        "button",
+                        {
+                          class: "btn btn-secondary btn-small",
+                          type: "button",
+                          onClick: () => openProfileModal(source.id, profile),
+                        },
+                        "编辑",
+                      ),
+                      h(
+                        "button",
+                        {
+                          class: "btn btn-secondary btn-small",
+                          type: "button",
+                          onClick: () => testSavedProfile(source.id, profile.id),
+                        },
+                        "测试连接",
+                      ),
+                      h(
+                        "button",
+                        {
+                          class: "btn btn-primary btn-small",
+                          type: "button",
+                          onClick: () => openRouteModal(source.id, profile, routes),
+                        },
+                        icon("plus", 14),
+                        "添加工具路由",
+                      ),
+                      h(
+                        "button",
+                        {
+                          class: "btn btn-danger btn-small",
+                          type: "button",
+                          onClick: () => deleteProfile(source.id, profile),
+                        },
+                        "删除",
                       ),
                     ),
                   ),
-                ),
-              ),
+                  routesToggle,
+                  routesPanel,
+                );
+              }),
             ),
       ),
     ),
@@ -2670,6 +2675,20 @@ function openProfileModal(sourceId, profile) {
     maxlength: "2048",
     autocomplete: "new-password",
   });
+  const dsnToggle = h(
+    "button",
+    {
+      class: "btn btn-secondary btn-small",
+      type: "button",
+      onClick: () => {
+        const reveal = dsnInput.type === "password";
+        dsnInput.type = reveal ? "text" : "password";
+        dsnToggle.textContent = reveal ? "隐藏" : "显示";
+      },
+    },
+    "显示",
+  );
+  const dsnWrap = h("div", { class: "input-with-action" }, dsnInput, dsnToggle);
   const enabledInput = h("input", {
     type: "checkbox",
     id: "profile-enabled",
@@ -2821,13 +2840,13 @@ function openProfileModal(sourceId, profile) {
         "div",
         { class: "field" },
         h("label", { class: "field-label", for: "profile-dsn" }, "数据库连接串"),
-        dsnInput,
+        dsnWrap,
         h(
           "div",
           { class: "field-hint" },
           editing
-            ? "留空表示沿用现有加密凭证；填写新连接串会在保存时轮换凭证并递增版本号。"
-            : "直接填写该数据源的 PostgreSQL 连接串；服务端会立即加密保存，页面不会回显。请使用与该用途匹配的账号（查询用只读账号，写入用读写账号，建库用具备 CREATEDB 权限的管理账号）。",
+            ? "留空表示沿用现有加密凭证；填写新连接串会在保存时轮换凭证并递增版本号。连接串默认隐藏，点击“显示”可核对。"
+            : "直接填写该数据源的 PostgreSQL 连接串；服务端会立即加密保存，页面不会回显。连接串默认隐藏，点击“显示”可核对。请使用与该用途匹配的账号（查询用只读账号，写入用读写账号，建库用具备 CREATEDB 权限的管理账号）。",
         ),
         testResultEl,
       ),
@@ -2890,13 +2909,18 @@ function openProfileModal(sourceId, profile) {
   nameInput.focus();
 }
 
-function openRouteModal(sourceId, profiles, route) {
+function openRouteModal(sourceId, profile, allRoutes, route) {
   const editing = Boolean(route);
   let busy = false;
+  const availableTools = TOOLS.filter(
+    (tool) =>
+      TOOL_PURPOSE[tool] === profile.purpose &&
+      (editing ? route.tool === tool : !allRoutes.some((item) => item.tool === tool)),
+  );
   const toolSelect = h(
     "select",
-    { class: "select", id: "route-tool", disabled: editing },
-    TOOLS.map((tool) =>
+    { class: "select", id: "route-tool", disabled: editing || availableTools.length === 0 },
+    availableTools.map((tool) =>
       h(
         "option",
         { value: tool, selected: editing && route.tool === tool },
@@ -2904,7 +2928,6 @@ function openRouteModal(sourceId, profiles, route) {
       ),
     ),
   );
-  const profileSelect = h("select", { class: "select", id: "route-profile" });
   const policySelect = h(
     "select",
     { class: "select", id: "route-policy" },
@@ -2919,42 +2942,25 @@ function openRouteModal(sourceId, profiles, route) {
     editing ? "保存修改" : "添加工具路由",
   );
 
-  function renderProfiles() {
-    const purpose = TOOL_PURPOSE[toolSelect.value];
-    const matching = profiles.filter(
-      (profile) =>
-        profile.purpose === purpose &&
-        (profile.enabled || (editing && route.profile_id === profile.id)),
-    );
-    profileSelect.replaceChildren(
-      ...matching.map((profile) =>
-        h(
-          "option",
-          { value: String(profile.id), selected: editing && route.profile_id === profile.id },
-          `${profile.name} · #${profile.id}`,
-        ),
-      ),
-    );
-    profileSelect.disabled = matching.length === 0;
-    hint.textContent =
-      matching.length === 0
-        ? `该工具需要「${purposeLabel(purpose)}」用途的连接配置，请先添加。`
-        : `该工具固定使用「${purposeLabel(purpose)}」用途的连接配置。`;
+  function renderPolicy() {
     if (editing) {
       policySelect.value = route.min_approval_policy;
       policySelect.disabled = route.tool === "create_database";
       return;
     }
-    const requiresApproval = ["mutate_sql", "execute_ddl", "create_database"].includes(
-      toolSelect.value,
-    );
+    const tool = toolSelect.value;
+    const requiresApproval = ["mutate_sql", "execute_ddl", "create_database"].includes(tool);
     policySelect.value = requiresApproval ? "approval" : "direct";
-    policySelect.disabled = toolSelect.value === "create_database";
-    if (toolSelect.value === "create_database") policySelect.value = "approval";
+    policySelect.disabled = tool === "create_database";
+    if (tool === "create_database") policySelect.value = "approval";
   }
 
-  toolSelect.addEventListener("change", renderProfiles);
-  renderProfiles();
+  hint.textContent =
+    availableTools.length === 0
+      ? `没有可添加的工具：该用途（${purposeLabel(profile.purpose)}）的工具可能都已添加路由。`
+      : `工具固定使用当前连接配置「${profile.name}」（${purposeLabel(profile.purpose)}）。`;
+  toolSelect.addEventListener("change", renderPolicy);
+  renderPolicy();
 
   const form = h(
     "form",
@@ -2964,8 +2970,8 @@ function openRouteModal(sourceId, profiles, route) {
         event.preventDefault();
         if (busy) return;
         errorEl.classList.add("hidden");
-        if (!profileSelect.value) {
-          errorEl.textContent = "没有用途匹配的连接配置";
+        if (!toolSelect.value) {
+          errorEl.textContent = "没有可添加的工具";
           errorEl.classList.remove("hidden");
           return;
         }
@@ -2980,7 +2986,7 @@ function openRouteModal(sourceId, profiles, route) {
             method: editing ? "PUT" : "POST",
             body: {
               tool: toolSelect.value,
-              profile_id: Number(profileSelect.value),
+              profile_id: profile.id,
               min_approval_policy: policySelect.value,
             },
           });
@@ -3009,8 +3015,8 @@ function openRouteModal(sourceId, profiles, route) {
       h(
         "div",
         { class: "field" },
-        h("label", { class: "field-label", for: "route-profile" }, "连接配置"),
-        profileSelect,
+        h("label", { class: "field-label" }, "连接配置"),
+        h("div", { class: "profile-fixed" }, `${profile.name} · #${profile.id}`),
         hint,
       ),
       h(
@@ -3042,7 +3048,7 @@ function openRouteModal(sourceId, profiles, route) {
         "div",
         { class: "modal-head" },
         h("h2", { class: "modal-title" }, editing ? "编辑工具路由" : "添加工具路由"),
-        h("p", { class: "modal-subtitle" }, sourceId),
+        h("p", { class: "modal-subtitle" }, `${sourceId} · ${profile.name}`),
       ),
       form,
     ),
