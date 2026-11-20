@@ -1,9 +1,12 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
 
 use crate::approval::{
     ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalRecord, ApprovalStatus, AuditEvent,
@@ -19,6 +22,9 @@ use crate::state::model::{
 };
 
 const SCHEMA_VERSION: i64 = 6;
+const GRANT_POLICY_CHANGED: &str = "GRANT_POLICY_CHANGED";
+const GRANT_REVOKED_EVENT: &str = "admin_grant_revoked";
+const GRANT_UPDATED_EVENT: &str = "admin_grant_updated";
 
 const MIGRATION_1: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -1400,9 +1406,158 @@ impl Store {
             .collect()
     }
 
+    /// Resolves grant eligibility without requiring that the token already has a grant.
+    pub(crate) fn grant_route(
+        &self,
+        source: &Source,
+        tool: Tool,
+    ) -> Result<std::result::Result<Route, &'static str>> {
+        if source.status != SourceStatus::Active {
+            return Ok(Err("数据源已归档"));
+        }
+        if source.environment == Environment::Production && tool.is_write() {
+            return Ok(Err("生产数据源禁止普通写入和结构变更"));
+        }
+        if !tool.supported_by(source.driver) {
+            return Ok(Err("该数据源驱动不支持建库"));
+        }
+        let route = match self.get_route(&source.id, tool) {
+            Ok(route) => route,
+            Err(Error::NotFound(_)) => return Ok(Err("未配置工具路由")),
+            Err(error) => return Err(error),
+        };
+        let profile = match self.get_profile(route.profile_id) {
+            Ok(profile) => profile,
+            Err(Error::NotFound(_)) => return Ok(Err("路由的连接配置不存在")),
+            Err(error) => return Err(error),
+        };
+        if !profile.enabled {
+            return Ok(Err("连接配置已停用"));
+        }
+        if profile.source_id != source.id || tool.purpose() != Some(profile.purpose) {
+            return Ok(Err("路由的连接配置与数据源或工具用途不匹配"));
+        }
+        Ok(Ok(route))
+    }
+
+    /// Replaces just one token/source set; approvals and audit share the commit.
+    pub fn replace_source_grants(
+        &self,
+        token_id: &str,
+        source_id: &str,
+        expected: &[(Tool, ApprovalPolicy)],
+        grants: &[(Tool, ApprovalPolicy)],
+        actor: &str,
+        now: i64,
+    ) -> Result<Vec<Grant>> {
+        let expected = grant_set(expected)?;
+        let desired = grant_set(grants)?;
+        // The CLI and other processes do not share the server's Store mutex.
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let identity = self.get_token_identity(token_id)?;
+        let source = self.get_source(source_id)?;
+        let current = {
+            let mut statement = tx.prepare(
+                "SELECT tool, policy FROM tool_grants WHERE token_id = ? AND source_id = ?",
+            )?;
+            let rows = statement.query_map(params![token_id, source_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            rows.map(|row| {
+                let (tool, policy) = row?;
+                Ok((
+                    Tool::parse(&tool)?.as_str(),
+                    ApprovalPolicy::parse(&policy)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>>>()?
+        };
+        if current != expected {
+            return Err(Error::Conflict(
+                "此数据源的授权在读取后已变更，请重新编辑。".to_string(),
+            ));
+        }
+        for (tool, policy) in grants {
+            if current.get(tool.as_str()) == Some(policy) {
+                continue;
+            }
+            validate_grant_policy(*tool, *policy)?;
+            let route = self.grant_route(&source, *tool)?.map_err(|reason| {
+                Error::InvalidInput(format!("无法保存 {} 的授权：{reason}。", tool.as_str()))
+            })?;
+            if *policy == ApprovalPolicy::Direct
+                && route.min_approval_policy == ApprovalPolicy::Approval
+            {
+                return Err(Error::InvalidInput(format!(
+                    "{} 的路由最低策略为逐次审批，不能设为直接执行。",
+                    tool.as_str()
+                )));
+            }
+        }
+
+        for tool in Tool::SOURCE_TOOLS {
+            let name = tool.as_str();
+            let before = current.get(name);
+            let after = desired.get(name);
+            let event = match (before, after) {
+                (a, b) if a == b => continue,
+                (Some(_), None) => {
+                    tx.execute(
+                        "DELETE FROM tool_grants WHERE token_id = ? AND source_id = ? AND tool = ?",
+                        params![token_id, source_id, name],
+                    )?;
+                    GRANT_REVOKED_EVENT
+                }
+                (Some(_), Some(policy)) => {
+                    tx.execute(
+                        "UPDATE tool_grants SET policy = ? WHERE token_id = ? AND source_id = ? AND tool = ?",
+                        params![policy.as_str(), token_id, source_id, name],
+                    )?;
+                    GRANT_UPDATED_EVENT
+                }
+                (None, Some(policy)) => {
+                    tx.execute(
+                        "INSERT INTO tool_grants (token_id, source_id, tool, policy, created_at) VALUES (?, ?, ?, ?, ?)",
+                        params![token_id, source_id, name, policy.as_str(), now],
+                    )?;
+                    "admin_grant_added"
+                }
+                (None, None) => continue,
+            };
+            if before.is_some() {
+                expire_grant_approvals(&tx, token_id, source_id, name, actor, now)?;
+            }
+            let reason = format!(
+                "{} -> {}",
+                before.map_or("—", |p| p.as_str()),
+                after.map_or("—", |p| p.as_str())
+            );
+            let mut audit =
+                grant_change_event(token_id, source_id, name, event, actor, Some(&reason), now);
+            audit.agent = Some(identity.agent.clone());
+            insert_audit(&tx, &audit)?;
+        }
+        let updated = self
+            .list_grants_for_token(token_id)?
+            .into_iter()
+            .filter(|grant| grant.source_id == source_id)
+            .collect();
+        tx.commit()?;
+        Ok(updated)
+    }
+
     /// Removes one grant so the next call is denied without re-issuing the token.
-    pub fn revoke_grant(&self, token_id: &str, source_id: &str, tool: Tool) -> Result<()> {
-        let changed = self.conn.execute(
+    /// The removal, its exact audit event and the expiry of unconsumed approvals
+    /// for this scope commit together, so a re-added grant cannot revive them.
+    pub fn revoke_grant(
+        &self,
+        token_id: &str,
+        source_id: &str,
+        tool: Tool,
+        actor: &str,
+    ) -> Result<()> {
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
             "DELETE FROM tool_grants WHERE token_id = ? AND source_id = ? AND tool = ?",
             params![token_id, source_id, tool.as_str()],
         )?;
@@ -1412,6 +1567,21 @@ impl Store {
                 tool.as_str()
             )));
         }
+        let now = now_ms();
+        expire_grant_approvals(&tx, token_id, source_id, tool.as_str(), actor, now)?;
+        insert_audit(
+            &tx,
+            &grant_change_event(
+                token_id,
+                source_id,
+                tool.as_str(),
+                GRANT_REVOKED_EVENT,
+                actor,
+                None,
+                now,
+            ),
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1451,7 +1621,40 @@ impl Store {
         rows.into_iter().map(|tool| Tool::parse(&tool)).collect()
     }
 
+    /// Highest audit id so far. Take it before reading authorization, then require
+    /// the approval insert to see no grant change above it.
+    pub(crate) fn audit_marker(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM audit_events", [], |row| {
+                row.get(0)
+            })?)
+    }
+
     pub fn insert_approval_request(&self, request: &NewApprovalRequest) -> Result<ApprovalRecord> {
+        self.insert_approval(request, None)
+    }
+
+    pub(crate) fn insert_current_approval_request(
+        &self,
+        request: &NewApprovalRequest,
+        marker: i64,
+    ) -> Result<ApprovalRecord> {
+        self.insert_approval(request, Some(marker))
+    }
+
+    pub(crate) fn recheck_execution_draft(&self, draft: &ApprovalDraft, marker: i64) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        validate_execution_draft(&tx, draft, marker)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_approval(
+        &self,
+        request: &NewApprovalRequest,
+        marker: Option<i64>,
+    ) -> Result<ApprovalRecord> {
         if request.channel == ApprovalChannel::Elicitation
             && (request.draft.high_risk || request.draft.tool == Tool::CreateDatabase)
         {
@@ -1476,7 +1679,10 @@ impl Store {
         }
         let draft = &request.draft;
         let digest = draft.digest();
-        let transaction = self.conn.unchecked_transaction()?;
+        let transaction = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some(marker) = marker.filter(|_| request.status != ApprovalStatus::Denied) {
+            validate_execution_draft(&transaction, draft, marker)?;
+        }
         transaction.execute(
             "INSERT INTO approval_requests
                (token_id, agent, source_id, source_environment, tool, sql, params_json,
@@ -2224,6 +2430,89 @@ fn validate_route_policy(tool: Tool, policy: ApprovalPolicy) -> Result<()> {
     }
 }
 
+/// A grant change invalidates confirmations that were issued under the old
+/// grant. The audit event recorded here is what later approval inserts compare
+/// against, so a revoke-then-regrant cycle cannot quietly restore them.
+fn expire_grant_approvals(
+    conn: &Connection,
+    token_id: &str,
+    source_id: &str,
+    tool: &str,
+    actor: &str,
+    now: i64,
+) -> Result<()> {
+    let stale = approval_rows(
+        conn,
+        "WHERE token_id = ? AND source_id = ? AND tool = ?
+           AND status IN ('pending', 'approved') AND consumed_at IS NULL",
+        params![token_id, source_id, tool],
+    )?;
+    for mut record in stale {
+        conn.execute(
+            "UPDATE approval_requests SET status = 'expired', reason_code = ? WHERE id = ?",
+            params![GRANT_POLICY_CHANGED, record.id],
+        )?;
+        record.reason_code = Some(GRANT_POLICY_CHANGED.to_string());
+        insert_audit(
+            conn,
+            &AuditEvent::for_approval(&record, "invalidated", "rejected", actor, now),
+        )?;
+    }
+    Ok(())
+}
+
+fn grant_change_event(
+    token_id: &str,
+    source_id: &str,
+    tool: &str,
+    event: &str,
+    actor: &str,
+    reason: Option<&str>,
+    now: i64,
+) -> AuditEvent {
+    AuditEvent {
+        ts: now,
+        event: event.to_string(),
+        approval_id: None,
+        token_id: Some(token_id.to_string()),
+        agent: None,
+        source_id: Some(source_id.to_string()),
+        tool: tool.to_string(),
+        profile_id: None,
+        profile_version: None,
+        route_id: None,
+        route_version: None,
+        request_digest: None,
+        channel: (actor == "admin-web").then(|| "web".to_string()),
+        decision: "allowed".to_string(),
+        actor: actor.to_string(),
+        high_risk: false,
+        reason_code: None,
+        reason: reason.map(str::to_string),
+        duration_ms: None,
+        row_count: None,
+        error_code: None,
+    }
+}
+
+fn grant_set(entries: &[(Tool, ApprovalPolicy)]) -> Result<BTreeMap<&'static str, ApprovalPolicy>> {
+    let mut set = BTreeMap::new();
+    for (tool, policy) in entries {
+        if *tool == Tool::ListSources {
+            return Err(Error::InvalidInput(
+                "list_sources is available to every authenticated token".to_string(),
+            ));
+        }
+        if set.insert(tool.as_str(), *policy).is_some() {
+            return Err(Error::InvalidInput(format!(
+                "工具 {} 重复出现。",
+                tool.as_str()
+            )));
+        }
+    }
+    Ok(set)
+}
+
 fn validate_grant_policy(tool: Tool, policy: ApprovalPolicy) -> Result<()> {
     if tool == Tool::CreateDatabase {
         return if policy == ApprovalPolicy::Approval {
@@ -2749,7 +3038,7 @@ fn claim_step(
         )?;
         return Ok(ClaimStep::Outcome(ClaimOutcome::Expired));
     }
-    if let Some(reason) = claim_stale_reason(conn, &record)? {
+    if let Some(reason) = claim_stale_reason(conn, &record.draft)? {
         conn.execute(
             "UPDATE approval_requests SET status = 'expired', reason_code = ?
               WHERE id = ? AND status = 'approved'",
@@ -2778,8 +3067,30 @@ fn claim_step(
     Ok(ClaimStep::Claimed(Box::new(record)))
 }
 
-fn claim_stale_reason(conn: &Connection, record: &ApprovalRecord) -> Result<Option<&'static str>> {
-    let draft = &record.draft;
+fn validate_execution_draft(conn: &Connection, draft: &ApprovalDraft, marker: i64) -> Result<()> {
+    if let Some(reason) = claim_stale_reason(conn, draft)? {
+        return Err(Error::ApprovalStale(reason));
+    }
+    // The current policy can match again after a revoke/regrant or two edits.
+    if exists(
+        conn,
+        "SELECT 1 FROM audit_events
+          WHERE id > ? AND token_id = ? AND source_id = ? AND tool = ? AND event IN (?, ?)",
+        params![
+            marker,
+            draft.token_id,
+            draft.source_id,
+            draft.tool.as_str(),
+            GRANT_REVOKED_EVENT,
+            GRANT_UPDATED_EVENT
+        ],
+    )? {
+        return Err(Error::ApprovalStale(GRANT_POLICY_CHANGED));
+    }
+    Ok(())
+}
+
+fn claim_stale_reason(conn: &Connection, draft: &ApprovalDraft) -> Result<Option<&'static str>> {
     if !exists(
         conn,
         "SELECT 1 FROM tokens WHERE id = ? AND status = 'active'",
@@ -2805,7 +3116,7 @@ fn claim_stale_reason(conn: &Connection, record: &ApprovalRecord) -> Result<Opti
             draft.grant_policy.as_str()
         ],
     )? {
-        return Ok(Some("GRANT_POLICY_CHANGED"));
+        return Ok(Some(GRANT_POLICY_CHANGED));
     }
     if !exists(
         conn,

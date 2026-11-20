@@ -1121,23 +1121,70 @@ tbody tr.row-revoked .cell-title {
   gap: 8px;
 }
 
+.tool-badge.badge-warning {
+  --badge-color: var(--color-warning);
+}
+
 .grant-item {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 9px 11px;
   border: 1px solid var(--line);
   border-radius: 9px;
   background: #ffffff;
 }
 
-.grant-main {
+.grant-summary {
+  padding: 10px 12px;
+  color: var(--primary);
+  cursor: pointer;
+  overflow-wrap: anywhere;
+}
+
+.grant-summary .field-hint {
+  margin-inline-start: 8px;
+}
+
+.grant-editor {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
+  gap: 10px;
+  padding: 0 12px 12px;
+}
+
+.grant-tool {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 170px);
   align-items: center;
-  gap: 6px;
-  min-width: 0;
+  gap: 4px 10px;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+  overflow-wrap: anywhere;
+}
+
+.grant-tool .check-row,
+.grant-policy-hint {
+  margin: 0;
+}
+
+.grant-tool .checkbox {
+  flex-shrink: 0;
+}
+
+.grant-policy-hint {
+  grid-column: 1 / -1;
+}
+
+.grant-editor [hidden] {
+  display: none;
+}
+
+.grant-editor .actions {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+@media (max-width: 640px) {
+  .grant-tool {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .cell-nowrap {

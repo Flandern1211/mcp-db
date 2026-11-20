@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path as AxumPath, Query, Request, State};
+use axum::extract::{FromRequest, Path as AxumPath, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
@@ -154,6 +154,10 @@ pub fn admin_app(state: AdminState) -> Router {
         .route(
             "/admin/api/tokens/{id}/grants",
             get(list_grants).post(add_grant).delete(remove_grant),
+        )
+        .route(
+            "/admin/api/tokens/{id}/sources/{source_id}/grants",
+            axum::routing::put(replace_source_grants),
         )
         .route("/admin/api/approvals", get(list_approvals))
         .route("/admin/api/approvals/{id}/approve", post(approve))
@@ -450,7 +454,15 @@ async fn list_sources(State(state): State<AdminState>, headers: HeaderMap) -> Re
         let sources = store.list_all_sources()?;
         let mut items = Vec::with_capacity(sources.len());
         for source in &sources {
-            items.push(source_json(store, source)?);
+            let mut item = source_json(store, source)?;
+            let tools = Tool::SOURCE_TOOLS.into_iter().map(|tool| {
+                Ok(match store.grant_route(source, tool)? {
+                    Ok(route) => json!({ "tool": tool.as_str(), "min_policy": route.min_approval_policy.as_str() }),
+                    Err(reason) => json!({ "tool": tool.as_str(), "reason": reason }),
+                })
+            }).collect::<crate::error::Result<Vec<_>>>()?;
+            item["grant_tools"] = json!(tools);
+            items.push(item);
         }
         Ok(json!({ "sources": items }))
     }) {
@@ -1102,6 +1114,64 @@ async fn list_grants(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceGrantEntry {
+    tool: String,
+    policy: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplaceSourceGrantsBody {
+    expected: Vec<SourceGrantEntry>,
+    grants: Vec<SourceGrantEntry>,
+}
+
+async fn replace_source_grants(
+    State(state): State<AdminState>,
+    AxumPath((id, source_id)): AxumPath<(String, String)>,
+    request: Request,
+) -> Response {
+    if let Err(response) = write_guard(&state, request.headers()) {
+        return *response;
+    }
+    let Json(body) = match Json::<ReplaceSourceGrantsBody>::from_request(request, &state).await {
+        Ok(body) => body,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "必须提供 expected 和 grants 两组授权，每项包含 tool 和 policy。",
+            )
+        }
+    };
+    let parse = |items: Vec<SourceGrantEntry>| -> crate::error::Result<Vec<_>> {
+        items
+            .into_iter()
+            .map(|entry| {
+                Ok((
+                    Tool::parse(&entry.tool)?,
+                    ApprovalPolicy::parse(&entry.policy)?,
+                ))
+            })
+            .collect()
+    };
+    match store_call(&state, |store| {
+        let updated = store.replace_source_grants(
+            &id,
+            &source_id,
+            &parse(body.expected)?,
+            &parse(body.grants)?,
+            ADMIN_ACTOR,
+            now_ms(),
+        )?;
+        Ok(json!({ "grants": updated.iter().map(grant_json).collect::<Vec<_>>() }))
+    }) {
+        Ok(value) => json_response(StatusCode::OK, value),
+        Err(response) => *response,
+    }
+}
+
+#[derive(Deserialize)]
 struct AddGrantBody {
     source_id: String,
     tool: String,
@@ -1175,15 +1245,7 @@ async fn remove_grant(
         Err(error) => return map_store_error(error),
     };
     match store_call(&state, |store| {
-        store.revoke_grant(&id, query.source.trim(), tool)?;
-        record_admin_event(
-            store,
-            "admin_grant_revoked",
-            "grant",
-            Some(query.source.trim()),
-            Some(&id),
-            "removed explicit source/tool grant",
-        )?;
+        store.revoke_grant(&id, query.source.trim(), tool, ADMIN_ACTOR)?;
         Ok(json!({ "ok": true }))
     }) {
         Ok(value) => json_response(StatusCode::OK, value),

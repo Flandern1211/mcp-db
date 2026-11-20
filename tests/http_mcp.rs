@@ -1432,6 +1432,78 @@ async fn elicitation_accept_executes_once() {
 }
 
 #[tokio::test]
+async fn elicitation_requires_a_fresh_confirmation_after_grant_policy_changes() {
+    struct ChangeOnce {
+        state_path: std::path::PathBuf,
+        token_id: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ElicitationGate for ChangeOnce {
+        async fn ask(&self, _: &RequestContext<RoleServer>, _: &str) -> ElicitationOutcome {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                use ApprovalPolicy::{Approval, Direct};
+                let admin = Store::open_admin(&self.state_path).unwrap();
+                let mut before = [(Tool::MutateSql, Approval)];
+                let mut after = [(Tool::MutateSql, Direct)];
+                let ts = now_ms();
+                for _ in 0..2 {
+                    admin
+                        .replace_source_grants(
+                            &self.token_id,
+                            "a",
+                            &before,
+                            &after,
+                            "admin-web",
+                            ts,
+                        )
+                        .unwrap();
+                    std::mem::swap(&mut before, &mut after);
+                }
+            }
+            ElicitationOutcome::Accepted
+        }
+    }
+
+    let (dir, mut state, token, mock) = elicitation_state(ElicitationOutcome::Accepted);
+    let token_id = state
+        .store
+        .lock()
+        .unwrap()
+        .authenticate(&token)
+        .unwrap()
+        .token_id;
+    state.elicitation = Arc::new(ChangeOnce {
+        state_path: dir.path().join("state.db"),
+        token_id,
+        calls: AtomicUsize::new(0),
+    });
+    let router = app(state);
+    let session = init_session(router.clone(), &token).await;
+    let call = || {
+        request(
+            Method::POST,
+            "/mcp",
+            MUTATE_INSERT,
+            Some(&token),
+            Some(&session),
+        )
+    };
+    let (status, _, body) = send(router.clone(), call()).await;
+    assert_eq!(status, StatusCode::OK);
+    let result = &body["result"]["structuredContent"];
+    assert_eq!(result["code"], "APPROVAL_STALE");
+    assert_eq!(result["reasonCode"], "GRANT_POLICY_CHANGED");
+    assert_eq!(mock.mutations.load(Ordering::SeqCst), 0);
+
+    let (status, _, body) = send(router, call()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["structuredContent"]["rowCount"], 1);
+    assert_eq!(mock.mutations.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn elicitation_decline_and_cancel_do_not_execute() {
     for outcome in [ElicitationOutcome::Declined, ElicitationOutcome::Cancelled] {
         let (_dir, state, token, mock) = elicitation_state(outcome);
