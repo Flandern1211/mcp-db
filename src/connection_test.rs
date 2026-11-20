@@ -38,7 +38,10 @@ impl ConnectionTester for PostgresConnectionTester {
                 .await
                 .map_err(|_| Error::ExecutionNotStarted("connection test timed out".to_string()))?
                 .map_err(|error| {
-                    Error::ExecutionNotStarted(format!("connection test failed: {error}"))
+                    Error::ExecutionNotStarted(format!(
+                        "connection test failed: {}",
+                        describe_error(&error)
+                    ))
                 })?;
         let connection_task = tokio::spawn(async move {
             let _ = connection.await;
@@ -54,7 +57,10 @@ impl ConnectionTester for PostgresConnectionTester {
         .await
         .map_err(|_| Error::ExecutionNotStarted("connection test query timed out".to_string()))?
         .map_err(|error| {
-            Error::ExecutionNotStarted(format!("connection test query failed: {error}"))
+            Error::ExecutionNotStarted(format!(
+                "connection test query failed: {}",
+                describe_error(&error)
+            ))
         })?;
         connection_task.abort();
         Ok(ConnectionInfo {
@@ -63,4 +69,19 @@ impl ConnectionTester for PostgresConnectionTester {
             server_version: row.get(2),
         })
     }
+}
+
+/// `tokio_postgres::Error`'s Display often only says "error connecting to
+/// server"; the DNS/refused/auth cause sits in the source chain.
+fn describe_error(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![error.to_string()];
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let text = cause.to_string();
+        if !parts.iter().any(|part| part == &text) {
+            parts.push(text);
+        }
+        source = cause.source();
+    }
+    parts.join(": ")
 }

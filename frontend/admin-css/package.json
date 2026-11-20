@@ -1,0 +1,13 @@
+{
+  "name": "mcp-db-admin-css",
+  "private": true,
+  "description": "Build-only CSS bundle for the embedded admin UI (daisyUI + Tailwind).",
+  "scripts": {
+    "build": "tailwindcss -i ./input.css -o ../../src/transport/admin_assets/daisyui.css --minify"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "4.3.5",
+    "daisyui": "5.8.1",
+    "tailwindcss": "4.3.5"
+  }
+}

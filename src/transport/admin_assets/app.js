@@ -75,6 +75,7 @@ const ICONS = {
   alert: '<circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/>',
   chevronLeft: '<path d="M15 18l-6-6 6-6"/>',
   chevronRight: '<path d="M9 18l6-6-6-6"/>',
+  chevronDown: '<path d="M6 9l6 6 6-6"/>',
 };
 
 const state = {
@@ -392,14 +393,18 @@ function renderShell() {
           h("div", { class: "brand-name" }, "mcp-db"),
           h("span", { class: "brand-badge" }, "管理台"),
         ),
-        h("nav", { class: "nav", "aria-label": "管理台导航" }, navItems),
+        h(
+          "nav",
+          { "aria-label": "管理台导航" },
+          h("ul", { class: "menu nav" }, navItems.map((item) => h("li", {}, item))),
+        ),
         h(
           "div",
           { class: "sidebar-footer" },
           h(
             "div",
             { class: "account" },
-            h("span", { class: "avatar" }, "A"),
+            h("span", { class: "account-avatar" }, "A"),
             h("span", {}, "管理员"),
           ),
           h(
@@ -483,7 +488,7 @@ function loadingState() {
   return h(
     "div",
     { class: "loading-state" },
-    h("span", { class: "spinner", "aria-hidden": "true" }),
+    h("span", { class: "loading loading-spinner loading-sm", "aria-hidden": "true" }),
     h("span", {}, "加载中…"),
   );
 }
@@ -498,7 +503,7 @@ function renderError(root, error) {
       h("p", { class: "empty-desc" }, errorMessage(error)),
       h(
         "button",
-        { class: "btn btn-secondary", type: "button", onClick: () => void refreshView() },
+        { class: "btn", type: "button", onClick: () => void refreshView() },
         "重试",
       ),
     ),
@@ -560,7 +565,7 @@ function renderOverview(root) {
             "div",
             { class: "stat-card" },
             h("div", { class: "stat-label" }, stat.label),
-            h("div", { class: "stat-value" }, String(stat.value)),
+            h("div", { class: "stat-number" }, String(stat.value)),
             h("div", { class: "stat-sub" }, stat.sub),
           ),
         ),
@@ -588,7 +593,7 @@ function recentAuditTable(rows) {
       { class: "table-scroll" },
       h(
         "table",
-        {},
+        { class: "table" },
         h(
           "thead",
           {},
@@ -623,7 +628,7 @@ function recentAuditTable(rows) {
                 {},
                 h(
                   "span",
-                  { class: `badge decision-${record.decision}` },
+                  { class: `badge badge-sm badge-soft decision-${record.decision}` },
                   decisionLabel(record.decision),
                 ),
               ),
@@ -634,7 +639,7 @@ function recentAuditTable(rows) {
                 h(
                   "button",
                   {
-                    class: "btn btn-secondary btn-small",
+                    class: "btn btn-sm",
                     type: "button",
                     onClick: () => openAuditModal(record),
                   },
@@ -661,7 +666,7 @@ function reservationSection() {
       h(
         "button",
         {
-          class: "btn btn-secondary btn-small",
+          class: "btn btn-sm",
           type: "button",
           onClick: () => void refreshView(),
         },
@@ -675,7 +680,7 @@ function reservationSection() {
       "建库结果未知或部分成功时，预留会保持隔离。核对数据库实际状态后再选择释放或提交。",
     ),
     rows.length === 0
-      ? h("div", { class: "callout" }, "没有隔离预留。")
+      ? h("div", { class: "alert" }, "没有隔离预留。")
       : h(
           "div",
           { class: "table-card" },
@@ -684,7 +689,7 @@ function reservationSection() {
             { class: "table-scroll" },
             h(
               "table",
-              {},
+              { class: "table" },
               h(
                 "thead",
                 {},
@@ -720,7 +725,7 @@ function reservationSection() {
                         h(
                           "button",
                           {
-                            class: "btn btn-secondary btn-small",
+                            class: "btn btn-sm",
                             type: "button",
                             onClick: () => openSettleModal(row, "release"),
                           },
@@ -729,7 +734,7 @@ function reservationSection() {
                         h(
                           "button",
                           {
-                            class: "btn btn-primary btn-small",
+                            class: "btn btn-primary btn-sm",
                             type: "button",
                             onClick: () => openSettleModal(row, "commit"),
                           },
@@ -769,7 +774,7 @@ function renderTokens(root) {
         h(
           "button",
           {
-            class: "btn btn-secondary",
+            class: "btn",
             type: "button",
             onClick: () => {
               location.hash = "#/audit";
@@ -800,8 +805,9 @@ function renderTokens(root) {
       revoked.length > 0
         ? h(
             "label",
-            { class: "toggle" },
+            { class: "check-row" },
             h("input", {
+              class: "checkbox checkbox-sm",
               type: "checkbox",
               checked: state.showRevoked,
               onChange: (event) => {
@@ -825,7 +831,7 @@ function tokenTable(rows) {
       { class: "table-scroll" },
       h(
         "table",
-        {},
+        { class: "table" },
         h(
           "thead",
           {},
@@ -858,7 +864,7 @@ function tokenRow(token) {
         "div",
         { class: "cell-title-row" },
         h("span", { class: "cell-title" }, token.agent),
-        revoked ? h("span", { class: "badge badge-revoked" }, "已撤销") : null,
+        revoked ? h("span", { class: "badge badge-sm badge-soft badge-revoked" }, "已撤销") : null,
       ),
       h("div", { class: "cell-sub mono" }, shortId(token.id, 12)),
     ),
@@ -873,7 +879,7 @@ function tokenRow(token) {
           : grants.map((grant) =>
               h(
                 "span",
-                { class: "badge tool-badge" },
+                { class: "badge badge-sm badge-soft tool-badge" },
                 `${grant.source_id} · ${grant.tool} · ${policyLabel(grant.policy)}`,
               ),
             ),
@@ -884,7 +890,7 @@ function tokenRow(token) {
       {},
       h(
         "span",
-        { class: `badge ${revoked ? "badge-revoked" : "decision-allowed"}` },
+        { class: `badge badge-sm badge-soft ${revoked ? "badge-revoked" : "decision-allowed"}` },
         revoked ? "已撤销" : "有效",
       ),
     ),
@@ -898,7 +904,7 @@ function tokenRow(token) {
         h(
           "button",
           {
-            class: "btn btn-secondary btn-small",
+            class: "btn btn-sm",
             type: "button",
             disabled: revoked,
             onClick: () => void openGrantsModal(token),
@@ -908,7 +914,7 @@ function tokenRow(token) {
         h(
           "button",
           {
-            class: "icon-btn danger",
+            class: "btn btn-circle btn-ghost btn-sm btn-error",
             type: "button",
             title: "撤销",
             "aria-label": `撤销 ${token.agent}`,
@@ -995,7 +1001,7 @@ function openCreateTokenModal() {
     h(
       "div",
       { class: "modal-foot" },
-      h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+      h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
       submit,
     ),
   );
@@ -1003,7 +1009,7 @@ function openCreateTokenModal() {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -1028,7 +1034,7 @@ function showCreatedToken(data) {
   openModal(
     h(
       "div",
-      { class: "modal modal-wide" },
+      { class: "dialog dialog-wide" },
       h(
         "div",
         { class: "modal-head" },
@@ -1040,7 +1046,7 @@ function showCreatedToken(data) {
         { class: "modal-body" },
         h(
           "div",
-          { class: "callout callout-warning" },
+          { class: "alert alert-warning" },
           "这是唯一一次显示令牌明文。关闭后无法再次查看；请立即复制并保存到安全位置。",
         ),
         h(
@@ -1054,7 +1060,7 @@ function showCreatedToken(data) {
             h(
               "button",
               {
-                class: "btn btn-secondary btn-small",
+                class: "btn btn-sm",
                 type: "button",
                 onClick: () => void copyText(plaintext),
               },
@@ -1074,7 +1080,7 @@ function showCreatedToken(data) {
             h(
               "button",
               {
-                class: "btn btn-secondary btn-small",
+                class: "btn btn-sm",
                 type: "button",
                 onClick: () => void copyText(snippet),
               },
@@ -1085,7 +1091,7 @@ function showCreatedToken(data) {
         ),
         h(
           "div",
-          { class: "callout" },
+          { class: "alert" },
           "MCP 地址由 MCPDB_ADDR 决定（默认 127.0.0.1:8787/mcp），与当前管理端口不同，请勿把管理端口当作 MCP 端点。",
         ),
       ),
@@ -1128,7 +1134,14 @@ async function openGrantsModal(token) {
     sources.map((source) => h("option", { value: source.id }, sourceLabel(source))),
   );
   const toolSelect = h("select", { class: "select", "aria-label": "工具" });
-  const policySelect = h("select", { class: "select", "aria-label": "执行策略" });
+  const policyHint = h("p", { class: "field-hint" });
+  const tightenInput = h("input", { class: "checkbox checkbox-sm", type: "checkbox" });
+  const tightenLabel = h(
+    "label",
+    { class: "check-row hidden" },
+    tightenInput,
+    "添加授权时要求逐次审批（比工具路由更严格）",
+  );
   const addError = h("p", { class: "form-error hidden" });
   const availabilityNote = h("p", { class: "field-hint hidden" });
   const submitButton = h(
@@ -1138,6 +1151,7 @@ async function openGrantsModal(token) {
   );
   const availability = new Map();
   const loadSeq = new Map();
+  let inheritedPolicy = "direct";
 
   function selectedSource() {
     return sources.find((source) => source.id === sourceSelect.value);
@@ -1169,7 +1183,7 @@ async function openGrantsModal(token) {
       if (!profile || !profile.enabled) {
         return { tool, usable: false, reason: "（连接配置已停用）" };
       }
-      return { tool, usable: true, reason: "" };
+      return { tool, usable: true, reason: "", route };
     });
   }
 
@@ -1194,30 +1208,54 @@ async function openGrantsModal(token) {
 
   function renderLoading() {
     toolSelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "加载中…"));
-    policySelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "—"));
     toolSelect.disabled = true;
-    policySelect.disabled = true;
     submitButton.disabled = true;
+    policyHint.textContent = "";
+    tightenLabel.classList.add("hidden");
     showNote("正在加载该数据源的可用工具…", "field-hint");
   }
 
   function renderAvailabilityError(message) {
     toolSelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "加载失败"));
-    policySelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "—"));
     toolSelect.disabled = true;
-    policySelect.disabled = true;
     submitButton.disabled = true;
+    policyHint.textContent = "";
+    tightenLabel.classList.add("hidden");
     showNote(message, "form-error");
+  }
+
+  function currentOption() {
+    const entry = availability.get(sourceSelect.value);
+    if (!entry || entry.status !== "ready") return null;
+    return entry.options.find((option) => option.tool === toolSelect.value) || null;
+  }
+
+  function renderPolicy() {
+    const option = currentOption();
+    tightenInput.checked = false;
+    tightenLabel.classList.add("hidden");
+    if (!option || !option.usable) {
+      inheritedPolicy = "direct";
+      policyHint.textContent = "";
+      return;
+    }
+    inheritedPolicy = option.route.min_approval_policy;
+    if (inheritedPolicy === "approval") {
+      policyHint.textContent = "执行策略继承自工具路由：逐次审批。";
+    } else {
+      policyHint.textContent = "执行策略继承自工具路由：直接执行。";
+      tightenLabel.classList.remove("hidden");
+    }
   }
 
   function renderTools() {
     const source = selectedSource();
     if (!source) {
       toolSelect.replaceChildren();
-      policySelect.replaceChildren();
       toolSelect.disabled = true;
-      policySelect.disabled = true;
       submitButton.disabled = true;
+      policyHint.textContent = "";
+      tightenLabel.classList.add("hidden");
       hideNote();
       return;
     }
@@ -1236,49 +1274,42 @@ async function openGrantsModal(token) {
       return;
     }
     const usable = entry.options.filter((option) => option.usable);
+    const granted = new Set(
+      grants
+        .filter((grant) => grant.source_id === source.id)
+        .map((grant) => grant.tool),
+    );
     toolSelect.replaceChildren(
       ...entry.options.map((option) =>
         h(
           "option",
-          { value: option.tool, disabled: !option.usable },
-          option.usable
-            ? TOOL_LABELS[option.tool]
-            : `${TOOL_LABELS[option.tool]}${option.reason}`,
+          { value: option.tool, disabled: !option.usable || granted.has(option.tool) },
+          granted.has(option.tool)
+            ? `${TOOL_LABELS[option.tool]}（已授权）`
+            : option.usable
+              ? TOOL_LABELS[option.tool]
+              : `${TOOL_LABELS[option.tool]}${option.reason}`,
         ),
       ),
     );
-    if (usable.length === 0) {
-      toolSelect.disabled = true;
-      policySelect.replaceChildren();
-      policySelect.disabled = true;
+    const available = usable.filter((option) => !granted.has(option.tool));
+    toolSelect.disabled = available.length === 0;
+    if (available.length === 0) {
       submitButton.disabled = true;
-      showNote("该数据源还没有可用的工具路由，请先到数据源页配置。", "field-hint");
+      policyHint.textContent = "";
+      tightenLabel.classList.add("hidden");
+      showNote(
+        usable.length === 0
+          ? "该数据源还没有可用的工具路由，请先到数据源页配置。"
+          : "这个数据源上所有可用的工具都已经授权了。",
+        "field-hint",
+      );
       return;
     }
-    toolSelect.disabled = false;
-    toolSelect.value = usable[0].tool;
+    toolSelect.value = available[0].tool;
     submitButton.disabled = false;
     hideNote();
-    renderPolicies();
-  }
-
-  function renderPolicies() {
-    const tool = toolSelect.value;
-    if (!tool) {
-      policySelect.replaceChildren();
-      policySelect.disabled = true;
-      return;
-    }
-    let policies = ["direct"];
-    if (tool === "mutate_sql" || tool === "execute_ddl" || tool === "create_database") {
-      policies = ["approval", "direct"];
-    }
-    if (tool === "create_database") policies = ["approval"];
-    policySelect.replaceChildren(
-      ...policies.map((policy) => h("option", { value: policy }, policyLabel(policy))),
-    );
-    policySelect.value = policies[0];
-    policySelect.disabled = false;
+    renderPolicy();
   }
 
   sourceSelect.addEventListener("change", () => {
@@ -1287,9 +1318,8 @@ async function openGrantsModal(token) {
     if (entry && entry.status === "error") availability.delete(source.id);
     renderTools();
   });
-  toolSelect.addEventListener("change", renderPolicies);
+  toolSelect.addEventListener("change", renderPolicy);
   renderTools();
-
   const form = h(
     "form",
     {
@@ -1304,13 +1334,12 @@ async function openGrantsModal(token) {
         }
         const source = selectedSource();
         const tool = toolSelect.value;
-        const policy = policySelect.value;
         const entry = source ? availability.get(source.id) : null;
-        const usable =
-          entry &&
-          entry.status === "ready" &&
-          entry.options.some((option) => option.usable && option.tool === tool);
-        if (!source || !tool || !policy || !usable) {
+        const option =
+          entry && entry.status === "ready"
+            ? entry.options.find((item) => item.usable && item.tool === tool)
+            : null;
+        if (!source || !tool || !option) {
           addError.textContent = "该数据源还没有可用的工具路由，请先到数据源页配置。";
           addError.classList.remove("hidden");
           return;
@@ -1321,7 +1350,10 @@ async function openGrantsModal(token) {
             body: {
               source_id: source.id,
               tool,
-              policy,
+              policy:
+                option.route.min_approval_policy === "approval" || tightenInput.checked
+                  ? "approval"
+                  : "direct",
             },
           });
           showToast("已添加授权");
@@ -1338,11 +1370,11 @@ async function openGrantsModal(token) {
       { class: "modal-body" },
       h(
         "div",
-        { class: "callout" },
+        { class: "alert" },
         "授权表示「令牌 + 数据源 + 工具」的允许关系。每条授权精确绑定一个数据源和一个工具：查询权限不隐含写入，写入权限不隐含查询。生产数据源不能授予写入或结构变更。",
       ),
       grants.length === 0
-        ? h("div", { class: "callout" }, "该令牌还没有授权，agent 只能看到 list_sources。")
+        ? h("div", { class: "alert" }, "该令牌还没有授权，agent 只能看到 list_sources。")
         : h(
             "div",
             { class: "grant-list" },
@@ -1353,18 +1385,18 @@ async function openGrantsModal(token) {
                 h(
                   "div",
                   { class: "grant-main" },
-                  h("span", { class: "badge tool-badge" }, grant.source_id),
-                  h("span", { class: "badge tool-badge" }, grant.tool),
+                  h("span", { class: "badge badge-sm badge-soft tool-badge" }, grant.source_id),
+                  h("span", { class: "badge badge-sm badge-soft tool-badge" }, grant.tool),
                   h(
                     "span",
-                    { class: `badge policy-${grant.policy}` },
+                    { class: `badge badge-sm badge-soft policy-${grant.policy}` },
                     policyLabel(grant.policy),
                   ),
                 ),
                 h(
                   "button",
                   {
-                    class: "icon-btn danger",
+                    class: "btn btn-circle btn-ghost btn-sm btn-error",
                     type: "button",
                     title: "移除授权",
                     "aria-label": `移除 ${grant.source_id}/${grant.tool}`,
@@ -1396,10 +1428,10 @@ async function openGrantsModal(token) {
         { class: "detail-section" },
         h("div", { class: "detail-block-title" }, "添加授权"),
         sources.length === 0
-          ? h("div", { class: "callout callout-warning" }, "没有启用中的数据源。")
+          ? h("div", { class: "alert alert-warning" }, "没有启用中的数据源。")
           : h(
               "div",
-              { class: "perm-row" },
+              { class: "perm-row perm-row-two" },
               h(
                 "div",
                 { class: "field" },
@@ -1412,13 +1444,9 @@ async function openGrantsModal(token) {
                 h("label", { class: "field-label" }, "工具"),
                 toolSelect,
               ),
-              h(
-                "div",
-                { class: "field" },
-                h("label", { class: "field-label" }, "策略"),
-                policySelect,
-              ),
             ),
+        policyHint,
+        tightenLabel,
         h(
           "div",
           { class: "field-hint" },
@@ -1431,7 +1459,7 @@ async function openGrantsModal(token) {
     h(
       "div",
       { class: "modal-foot" },
-      h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "关闭"),
+      h("button", { class: "btn", type: "button", onClick: closeModal }, "关闭"),
       submitButton,
     ),
   );
@@ -1439,7 +1467,7 @@ async function openGrantsModal(token) {
   openModal(
     h(
       "div",
-      { class: "modal modal-wide" },
+      { class: "dialog dialog-wide" },
       h(
         "div",
         { class: "modal-head" },
@@ -1457,7 +1485,7 @@ function openRevokeTokenModal(token) {
   const submit = h(
     "button",
     {
-      class: "btn btn-danger",
+      class: "btn btn-ghost btn-error",
       type: "button",
       onClick: async () => {
         submit.disabled = true;
@@ -1483,7 +1511,7 @@ function openRevokeTokenModal(token) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -1495,7 +1523,7 @@ function openRevokeTokenModal(token) {
         { class: "modal-body" },
         h(
           "div",
-          { class: "callout callout-danger" },
+          { class: "alert alert-error" },
           "撤销后使用该令牌的客户端会立即失去访问，基于该令牌的待批请求也会失效。此操作不可恢复。",
         ),
         errorEl,
@@ -1503,7 +1531,7 @@ function openRevokeTokenModal(token) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
         submit,
       ),
     ),
@@ -1534,7 +1562,7 @@ function renderApprovals(root) {
         ),
         h(
           "button",
-          { class: "btn btn-secondary", type: "button", onClick: () => void refreshApprovals() },
+          { class: "btn", type: "button", onClick: () => void refreshApprovals() },
           icon("refresh", 16),
           "刷新",
         ),
@@ -1555,7 +1583,7 @@ function approvalsTable(rows) {
       { class: "table-scroll" },
       h(
         "table",
-        {},
+        { class: "table" },
         h(
           "thead",
           {},
@@ -1596,17 +1624,17 @@ function approvalRow(record) {
       h("div", {}, record.source_id),
       h(
         "span",
-        { class: `badge env-${record.source_environment}` },
+        { class: `badge badge-sm badge-soft env-${record.source_environment}` },
         environmentLabel(record.source_environment),
       ),
     ),
-    h("td", {}, h("span", { class: "badge tool-badge" }, record.tool)),
+    h("td", {}, h("span", { class: "badge badge-sm badge-soft tool-badge" }, record.tool)),
     h(
       "td",
       {},
       record.high_risk
-        ? h("span", { class: "badge badge-risk" }, "高危")
-        : h("span", { class: "badge" }, "常规"),
+        ? h("span", { class: "badge badge-sm badge-soft badge-risk" }, "高危")
+        : h("span", { class: "badge badge-sm badge-soft" }, "常规"),
     ),
     h("td", {}, h("code", { class: "sql-preview" }, preview)),
     h("td", { class: "cell-date" }, remaining(record.expires_at)),
@@ -1616,7 +1644,7 @@ function approvalRow(record) {
       h(
         "button",
         {
-          class: "btn btn-secondary btn-small",
+          class: "btn btn-sm",
           type: "button",
           onClick: () => openApprovalModal(record),
         },
@@ -1681,7 +1709,7 @@ function openApprovalModal(record) {
   openModal(
     h(
       "div",
-      { class: "modal modal-wide" },
+      { class: "dialog dialog-wide" },
       h(
         "div",
         { class: "modal-head" },
@@ -1700,10 +1728,10 @@ function openApprovalModal(record) {
         "div",
         { class: "modal-body" },
         record.high_risk
-          ? h("div", { class: "callout callout-danger" }, "该请求被标记为高危，必须由管理员逐次决定。")
+          ? h("div", { class: "alert alert-error" }, "该请求被标记为高危，必须由管理员逐次决定。")
           : h(
               "div",
-              { class: "callout" },
+              { class: "alert" },
               "批准只对当前不可变请求摘要有效且只能消费一次；令牌、数据源、连接配置、工具路由或策略变化会使批准失效。",
             ),
         h(
@@ -1769,11 +1797,11 @@ function openApprovalModal(record) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "关闭"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "关闭"),
         h(
           "button",
           {
-            class: "btn btn-danger",
+            class: "btn btn-ghost btn-error",
             type: "button",
             onClick: () => void decideApproval(record.id, false),
           },
@@ -1830,21 +1858,21 @@ const DECISIONS = [
 function renderAudit(root) {
   const filters = state.auditFilters;
   const agentInput = h("input", {
-    class: "filter-input",
+    class: "input filter-input",
     value: filters.agent,
     placeholder: "agent",
     "aria-label": "按 agent 过滤",
   });
   const sourceSelect = h(
     "select",
-    { class: "filter-input", "aria-label": "按数据源过滤" },
+    { class: "select filter-input", "aria-label": "按数据源过滤" },
     h("option", { value: "" }, "全部数据源"),
     state.sources.map((source) => h("option", { value: source.id }, sourceLabel(source))),
   );
   sourceSelect.value = filters.source;
   const decisionSelect = h(
     "select",
-    { class: "filter-input", "aria-label": "按决定过滤" },
+    { class: "select filter-input", "aria-label": "按决定过滤" },
     h("option", { value: "" }, "全部决定"),
     DECISIONS.map((decision) => h("option", { value: decision }, decisionLabel(decision))),
   );
@@ -1885,7 +1913,7 @@ function renderAudit(root) {
       h(
         "button",
         {
-          class: "btn btn-secondary btn-small",
+          class: "btn btn-sm",
           type: "button",
           onClick: async () => {
             state.auditFilters = { agent: "", source: "", decision: "" };
@@ -1896,7 +1924,7 @@ function renderAudit(root) {
         },
         "重置",
       ),
-      h("button", { class: "btn btn-primary btn-small", type: "submit" }, "查询"),
+      h("button", { class: "btn btn-primary btn-sm", type: "submit" }, "查询"),
     ),
   );
 
@@ -1925,7 +1953,7 @@ function renderAudit(root) {
           h(
             "button",
             {
-              class: "btn btn-secondary btn-small",
+              class: "btn btn-sm",
               type: "button",
               disabled: state.auditOffset <= 0,
               onClick: () => void changeAuditPage(-1),
@@ -1936,7 +1964,7 @@ function renderAudit(root) {
           h(
             "button",
             {
-              class: "btn btn-secondary btn-small",
+              class: "btn btn-sm",
               type: "button",
               disabled: state.auditOffset + items.length >= total,
               onClick: () => void changeAuditPage(1),
@@ -1959,7 +1987,7 @@ function auditTable(rows) {
       { class: "table-scroll" },
       h(
         "table",
-        {},
+        { class: "table" },
         h(
           "thead",
           {},
@@ -1994,13 +2022,13 @@ function auditTable(rows) {
                 h("div", { class: "cell-sub mono" }, record.token_id ? shortId(record.token_id, 10) : "—"),
               ),
               h("td", {}, record.source_id || "—"),
-              h("td", {}, h("span", { class: "badge tool-badge" }, record.tool)),
+              h("td", {}, h("span", { class: "badge badge-sm badge-soft tool-badge" }, record.tool)),
               h(
                 "td",
                 {},
                 h(
                   "span",
-                  { class: `badge decision-${record.decision}` },
+                  { class: `badge badge-sm badge-soft decision-${record.decision}` },
                   decisionLabel(record.decision),
                 ),
               ),
@@ -2021,7 +2049,7 @@ function auditTable(rows) {
                 h(
                   "button",
                   {
-                    class: "btn btn-secondary btn-small",
+                    class: "btn btn-sm",
                     type: "button",
                     onClick: () => openAuditModal(record),
                   },
@@ -2051,7 +2079,7 @@ function openAuditModal(record) {
   openModal(
     h(
       "div",
-      { class: "modal modal-wide" },
+      { class: "dialog dialog-wide" },
       h(
         "div",
         { class: "modal-head" },
@@ -2133,7 +2161,7 @@ function openAuditModal(record) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "关闭"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "关闭"),
       ),
     ),
   );
@@ -2188,7 +2216,7 @@ function sourcesTable(rows) {
       { class: "table-scroll" },
       h(
         "table",
-        {},
+        { class: "table" },
         h(
           "thead",
           {},
@@ -2217,7 +2245,7 @@ function sourcesTable(rows) {
                 {},
                 h(
                   "span",
-                  { class: `badge env-${source.environment}` },
+                  { class: `badge badge-sm badge-soft env-${source.environment}` },
                   environmentLabel(source.environment),
                 ),
               ),
@@ -2226,7 +2254,7 @@ function sourcesTable(rows) {
                 {},
                 h(
                   "span",
-                  { class: `badge ${source.status === "archived" ? "status-archived" : ""}` },
+                  { class: `badge badge-sm badge-soft ${source.status === "archived" ? "status-archived" : ""}` },
                   statusLabel(source.status),
                 ),
               ),
@@ -2242,7 +2270,7 @@ function sourcesTable(rows) {
                   h(
                     "button",
                     {
-                      class: "btn btn-secondary btn-small",
+                      class: "btn btn-sm",
                       type: "button",
                       onClick: () => void openSourceDetail(source.id),
                     },
@@ -2252,7 +2280,7 @@ function sourcesTable(rows) {
                     ? h(
                         "button",
                         {
-                          class: "icon-btn danger",
+                          class: "btn btn-circle btn-ghost btn-sm btn-error",
                           type: "button",
                           title: "归档",
                           "aria-label": `归档 ${source.id}`,
@@ -2263,7 +2291,7 @@ function sourcesTable(rows) {
                     : h(
                         "button",
                         {
-                          class: "btn btn-secondary btn-small",
+                          class: "btn btn-sm",
                           type: "button",
                           onClick: () => openRestoreModal(source),
                         },
@@ -2368,7 +2396,7 @@ function openCreateSourceModal() {
       ),
       h(
         "div",
-        { class: "callout" },
+        { class: "alert" },
         "创建后请添加用途匹配的连接配置（查询 / 写入 / 结构变更 / 建库），再配置工具路由。连接配置里直接填写数据库连接串即可，服务端会加密保存。",
       ),
       errorEl,
@@ -2376,7 +2404,7 @@ function openCreateSourceModal() {
     h(
       "div",
       { class: "modal-foot" },
-      h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+      h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
       submit,
     ),
   );
@@ -2384,7 +2412,7 @@ function openCreateSourceModal() {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -2401,7 +2429,7 @@ async function openSourceDetail(id) {
   openModal(
     h(
       "div",
-      { class: "modal modal-wide" },
+      { class: "dialog dialog-wide" },
       h(
         "div",
         { class: "modal-head" },
@@ -2427,7 +2455,7 @@ function sourceDetailModal(data) {
 
   return h(
     "div",
-    { class: "modal modal-wide" },
+    { class: "dialog dialog-wide" },
     h(
       "div",
       { class: "modal-head" },
@@ -2438,13 +2466,13 @@ function sourceDetailModal(data) {
         " ",
         h(
           "span",
-          { class: `badge env-${source.environment}` },
+          { class: `badge badge-sm badge-soft env-${source.environment}` },
           environmentLabel(source.environment),
         ),
         " ",
         h(
           "span",
-          { class: `badge ${source.status === "archived" ? "status-archived" : ""}` },
+          { class: `badge badge-sm badge-soft ${source.status === "archived" ? "status-archived" : ""}` },
           statusLabel(source.status),
         ),
       ),
@@ -2473,11 +2501,11 @@ function sourceDetailModal(data) {
         h(
           "div",
           { class: "section-head" },
-          h("h3", { class: "section-title" }, "连接配置"),
+          h("h3", { class: "section-title" }, "连接配置与工具路由"),
           h(
             "button",
             {
-              class: "btn btn-secondary btn-small",
+              class: "btn btn-sm",
               type: "button",
               onClick: () => openProfileModal(source.id),
             },
@@ -2485,212 +2513,182 @@ function sourceDetailModal(data) {
             "添加连接配置",
           ),
         ),
-        h("p", { class: "field-hint" }, "连接配置表示这个数据源使用哪套数据库账号。"),
+        h(
+          "p",
+          { class: "field-hint" },
+          "每个连接配置下面直接管理它负责的工具路由：先建连接配置，再在这个配置里选择允许哪些工具以及审批策略。",
+        ),
         profiles.length === 0
-          ? h("div", { class: "callout callout-warning" }, "还没有连接配置；恢复数据源前至少需要一个启用的连接配置。")
+          ? h("div", { class: "alert alert-warning" }, "还没有连接配置；恢复数据源前至少需要一个启用的连接配置。")
           : h(
               "div",
-              { class: "table-card" },
-              h(
-                "div",
-                { class: "table-scroll" },
-                h(
-                  "table",
-                  {},
-                  h(
-                    "thead",
-                    {},
-                    h(
-                      "tr",
-                      {},
-                      h("th", {}, "名称"),
-                      h("th", {}, "用途"),
-                      h("th", {}, "凭证"),
-                      h("th", {}, "连接上限"),
-                      h("th", {}, "语句超时"),
-                      h("th", {}, "版本"),
-                      h("th", { class: "th-actions" }, "操作"),
-                    ),
-                  ),
-                  h(
-                    "tbody",
-                    {},
-                    profiles.map((profile) =>
-                      h(
-                        "tr",
-                        {},
-                        h(
-                          "td",
-                          {},
-                          h("div", { class: "cell-title" }, profile.name),
+              { class: "profile-list" },
+              profiles.map((profile) => {
+                const profileRoutes = routes.filter(
+                  (route) => route.profile_id === profile.id,
+                );
+                const routesPanel = h(
+                  "div",
+                  { class: "profile-routes hidden" },
+                  profileRoutes.length === 0
+                    ? h(
+                        "div",
+                        { class: "profile-routes-empty" },
+                        "这个连接配置还没有工具路由；添加后 agent 才能通过它调用对应工具。",
+                      )
+                    : h(
+                        "div",
+                        { class: "route-list" },
+                        profileRoutes.map((route) =>
                           h(
                             "div",
-                            { class: "cell-sub" },
-                            profile.enabled ? "启用" : "停用",
+                            { class: "route-row" },
+                            h(
+                              "div",
+                              { class: "route-main" },
+                              h(
+                                "span",
+                                { class: "badge badge-sm badge-soft tool-badge" },
+                                TOOL_LABELS[route.tool] || route.tool,
+                              ),
+                              h(
+                                "span",
+                                { class: `badge badge-sm badge-soft policy-${route.min_approval_policy}` },
+                                policyLabel(route.min_approval_policy),
+                              ),
+                              h("span", { class: "cell-date" }, `v${route.version}`),
+                            ),
+                            h(
+                              "div",
+                              { class: "action-row" },
+                              h(
+                                "button",
+                                {
+                                  class: "btn btn-sm",
+                                  type: "button",
+                                  onClick: () =>
+                                    openRouteModal(source.id, profile, routes, route),
+                                },
+                                "编辑",
+                              ),
+                              h(
+                                "button",
+                                {
+                                  class: "btn btn-ghost btn-error btn-sm",
+                                  type: "button",
+                                  onClick: () => deleteRoute(source.id, route),
+                                },
+                                "删除",
+                              ),
+                            ),
                           ),
                         ),
+                      ),
+                );
+                const routesToggle = h(
+                  "button",
+                  {
+                    class: "profile-routes-toggle",
+                    type: "button",
+                    "aria-expanded": "false",
+                    onClick: () => {
+                      const expanded = routesPanel.classList.toggle("hidden") === false;
+                      routesToggle.classList.toggle("open", expanded);
+                      routesToggle.setAttribute("aria-expanded", String(expanded));
+                    },
+                  },
+                  h(
+                    "span",
+                    { class: "profile-routes-label" },
+                    "工具路由",
+                    h("span", { class: "count-pill" }, String(profileRoutes.length)),
+                  ),
+                  icon("chevronDown", 16),
+                );
+                return h(
+                  "div",
+                  { class: "profile-card" },
+                  h(
+                    "div",
+                    { class: "profile-head" },
+                    h(
+                      "div",
+                      { class: "profile-main" },
+                      h(
+                        "div",
+                        { class: "profile-name-row" },
+                        h("strong", {}, profile.name),
                         h(
-                          "td",
-                          {},
-                          h(
-                            "span",
-                            { class: "badge tool-badge" },
-                            purposeLabel(profile.purpose),
-                          ),
+                          "span",
+                          { class: "badge badge-sm badge-soft tool-badge" },
+                          purposeLabel(profile.purpose),
                         ),
-                        h("td", {}, h("span", { class: "badge" }, "已加密配置")),
                         h(
-                          "td",
-                          { class: "cell-date" },
-                          profile.max_connections === null ? "默认" : String(profile.max_connections),
+                          "span",
+                          { class: "badge badge-sm badge-soft" },
+                          profile.enabled ? "启用" : "停用",
                         ),
-                        h(
-                          "td",
-                          { class: "cell-date" },
+                      ),
+                      h(
+                        "div",
+                        { class: "profile-meta" },
+                        `凭证：已加密配置 · 连接上限：${
+                          profile.max_connections === null
+                            ? "默认"
+                            : profile.max_connections
+                        } · 语句超时：${
                           profile.statement_timeout_ms === null
                             ? "默认"
-                            : `${profile.statement_timeout_ms} ms`,
-                        ),
-                        h("td", { class: "cell-date" }, `v${profile.version}`),
-                        h(
-                          "td",
-                          {},
-                          h(
-                            "div",
-                            { class: "cell-actions" },
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-secondary btn-small",
-                                type: "button",
-                                onClick: () => openProfileModal(source.id, profile),
-                              },
-                              "编辑",
-                            ),
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-secondary btn-small",
-                                type: "button",
-                                onClick: () => testSavedProfile(source.id, profile.id),
-                              },
-                              "测试",
-                            ),
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-danger btn-small",
-                                type: "button",
-                                onClick: () => deleteProfile(source.id, profile),
-                              },
-                              "删除",
-                            ),
-                          ),
-                        ),
+                            : `${profile.statement_timeout_ms} ms`
+                        } · v${profile.version}`,
                       ),
                     ),
-                  ),
-                ),
-              ),
-            ),
-      ),
-      h(
-        "div",
-        { class: "detail-section" },
-        h(
-          "div",
-          { class: "section-head" },
-          h("h3", { class: "section-title" }, "工具路由"),
-          h(
-            "button",
-            {
-              class: "btn btn-secondary btn-small",
-              type: "button",
-              onClick: () => openRouteModal(source.id, profiles),
-            },
-            icon("plus", 14),
-            "添加工具路由",
-          ),
-        ),
-        h("p", { class: "field-hint" }, "工具路由表示这个工具使用哪套连接配置。"),
-        routes.length === 0
-          ? h("div", { class: "callout" }, "还没有工具路由；即使有授权，agent 也无法调用对应工具。")
-          : h(
-              "div",
-              { class: "table-card" },
-              h(
-                "div",
-                { class: "table-scroll" },
-                h(
-                  "table",
-                  {},
-                  h(
-                    "thead",
-                    {},
                     h(
-                      "tr",
-                      {},
-                      h("th", {}, "工具"),
-                      h("th", {}, "连接配置"),
-                      h("th", {}, "最低策略"),
-                      h("th", {}, "版本"),
-                      h("th", { class: "th-actions" }, "操作"),
-                    ),
-                  ),
-                  h(
-                    "tbody",
-                    {},
-                    routes.map((route) =>
+                      "div",
+                      { class: "action-row" },
                       h(
-                        "tr",
-                        {},
-                        h("td", {}, h("span", { class: "badge tool-badge" }, route.tool)),
-                        h(
-                          "td",
-                          {},
-                          route.profile_name || profileNames.get(route.profile_id) || `#${route.profile_id}`,
-                        ),
-                        h(
-                          "td",
-                          {},
-                          h(
-                            "span",
-                            { class: `badge policy-${route.min_approval_policy}` },
-                            policyLabel(route.min_approval_policy),
-                          ),
-                        ),
-                        h("td", { class: "cell-date" }, `v${route.version}`),
-                        h(
-                          "td",
-                          {},
-                          h(
-                            "div",
-                            { class: "cell-actions" },
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-secondary btn-small",
-                                type: "button",
-                                onClick: () => openRouteModal(source.id, profiles, route),
-                              },
-                              "编辑",
-                            ),
-                            h(
-                              "button",
-                              {
-                                class: "btn btn-danger btn-small",
-                                type: "button",
-                                onClick: () => deleteRoute(source.id, route),
-                              },
-                              "删除",
-                            ),
-                          ),
-                        ),
+                        "button",
+                        {
+                          class: "btn btn-sm",
+                          type: "button",
+                          onClick: () => openProfileModal(source.id, profile),
+                        },
+                        "编辑",
+                      ),
+                      h(
+                        "button",
+                        {
+                          class: "btn btn-sm",
+                          type: "button",
+                          onClick: () => testSavedProfile(source.id, profile.id),
+                        },
+                        "测试连接",
+                      ),
+                      h(
+                        "button",
+                        {
+                          class: "btn btn-primary btn-sm",
+                          type: "button",
+                          onClick: () => openRouteModal(source.id, profile, routes),
+                        },
+                        icon("plus", 14),
+                        "添加工具路由",
+                      ),
+                      h(
+                        "button",
+                        {
+                          class: "btn btn-ghost btn-error btn-sm",
+                          type: "button",
+                          onClick: () => deleteProfile(source.id, profile),
+                        },
+                        "删除",
                       ),
                     ),
                   ),
-                ),
-              ),
+                  routesToggle,
+                  routesPanel,
+                );
+              }),
             ),
       ),
     ),
@@ -2701,7 +2699,7 @@ function sourceDetailModal(data) {
         ? h(
             "button",
             {
-              class: "btn btn-secondary",
+              class: "btn",
               type: "button",
               onClick: () => openEnvironmentModal(source),
             },
@@ -2712,7 +2710,7 @@ function sourceDetailModal(data) {
         ? h(
             "button",
             {
-              class: "btn btn-danger",
+              class: "btn btn-ghost btn-error",
               type: "button",
               onClick: () => openArchiveModal(source),
             },
@@ -2727,7 +2725,7 @@ function sourceDetailModal(data) {
             },
             "恢复",
           ),
-      h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "关闭"),
+      h("button", { class: "btn", type: "button", onClick: closeModal }, "关闭"),
     ),
   );
 }
@@ -2812,7 +2810,22 @@ function openProfileModal(sourceId, profile) {
     maxlength: "2048",
     autocomplete: "new-password",
   });
+  const dsnToggle = h(
+    "button",
+    {
+      class: "btn btn-sm",
+      type: "button",
+      onClick: () => {
+        const reveal = dsnInput.type === "password";
+        dsnInput.type = reveal ? "text" : "password";
+        dsnToggle.textContent = reveal ? "隐藏" : "显示";
+      },
+    },
+    "显示",
+  );
+  const dsnWrap = h("div", { class: "input-with-action" }, dsnInput, dsnToggle);
   const enabledInput = h("input", {
+    class: "checkbox checkbox-sm",
     type: "checkbox",
     id: "profile-enabled",
     checked: editing ? profile.enabled : true,
@@ -2839,7 +2852,7 @@ function openProfileModal(sourceId, profile) {
   const testButton = h(
     "button",
     {
-      class: "btn btn-secondary",
+      class: "btn",
       type: "button",
       onClick: async () => {
         const dsn = dsnInput.value.trim();
@@ -2963,13 +2976,13 @@ function openProfileModal(sourceId, profile) {
         "div",
         { class: "field" },
         h("label", { class: "field-label", for: "profile-dsn" }, "数据库连接串"),
-        dsnInput,
+        dsnWrap,
         h(
           "div",
           { class: "field-hint" },
           editing
-            ? "留空表示沿用现有加密凭证；填写新连接串会在保存时轮换凭证并递增版本号。"
-            : "直接填写该数据源的 PostgreSQL 连接串；服务端会立即加密保存，页面不会回显。请使用与该用途匹配的账号（查询用只读账号，写入用读写账号，建库用具备 CREATEDB 权限的管理账号）。",
+            ? "留空表示沿用现有加密凭证；填写新连接串会在保存时轮换凭证并递增版本号。连接串默认隐藏，点击“显示”可核对。"
+            : "直接填写该数据源的 PostgreSQL 连接串；服务端会立即加密保存，页面不会回显。连接串默认隐藏，点击“显示”可核对。请使用与该用途匹配的账号（查询用只读账号，写入用读写账号，建库用具备 CREATEDB 权限的管理账号）。",
         ),
         testResultEl,
       ),
@@ -3002,7 +3015,7 @@ function openProfileModal(sourceId, profile) {
       ),
       h(
         "div",
-        { class: "callout callout-warning" },
+        { class: "alert alert-warning" },
         "查询用途连接配置的实际只读性取决于数据库账号权限和连接只读设置；多个连接配置复用同一凭证不会产生数据库级隔离。",
       ),
       errorEl,
@@ -3011,7 +3024,7 @@ function openProfileModal(sourceId, profile) {
       "div",
       { class: "modal-foot" },
       testButton,
-      h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+      h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
       submit,
     ),
   );
@@ -3019,7 +3032,7 @@ function openProfileModal(sourceId, profile) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -3032,13 +3045,18 @@ function openProfileModal(sourceId, profile) {
   nameInput.focus();
 }
 
-function openRouteModal(sourceId, profiles, route) {
+function openRouteModal(sourceId, profile, allRoutes, route) {
   const editing = Boolean(route);
   let busy = false;
+  const availableTools = TOOLS.filter(
+    (tool) =>
+      TOOL_PURPOSE[tool] === profile.purpose &&
+      (editing ? route.tool === tool : !allRoutes.some((item) => item.tool === tool)),
+  );
   const toolSelect = h(
     "select",
-    { class: "select", id: "route-tool", disabled: editing },
-    TOOLS.map((tool) =>
+    { class: "select", id: "route-tool", disabled: editing || availableTools.length === 0 },
+    availableTools.map((tool) =>
       h(
         "option",
         { value: tool, selected: editing && route.tool === tool },
@@ -3046,7 +3064,6 @@ function openRouteModal(sourceId, profiles, route) {
       ),
     ),
   );
-  const profileSelect = h("select", { class: "select", id: "route-profile" });
   const policySelect = h(
     "select",
     { class: "select", id: "route-policy" },
@@ -3061,42 +3078,25 @@ function openRouteModal(sourceId, profiles, route) {
     editing ? "保存修改" : "添加工具路由",
   );
 
-  function renderProfiles() {
-    const purpose = TOOL_PURPOSE[toolSelect.value];
-    const matching = profiles.filter(
-      (profile) =>
-        profile.purpose === purpose &&
-        (profile.enabled || (editing && route.profile_id === profile.id)),
-    );
-    profileSelect.replaceChildren(
-      ...matching.map((profile) =>
-        h(
-          "option",
-          { value: String(profile.id), selected: editing && route.profile_id === profile.id },
-          `${profile.name} · #${profile.id}`,
-        ),
-      ),
-    );
-    profileSelect.disabled = matching.length === 0;
-    hint.textContent =
-      matching.length === 0
-        ? `该工具需要「${purposeLabel(purpose)}」用途的连接配置，请先添加。`
-        : `该工具固定使用「${purposeLabel(purpose)}」用途的连接配置。`;
+  function renderPolicy() {
     if (editing) {
       policySelect.value = route.min_approval_policy;
       policySelect.disabled = route.tool === "create_database";
       return;
     }
-    const requiresApproval = ["mutate_sql", "execute_ddl", "create_database"].includes(
-      toolSelect.value,
-    );
+    const tool = toolSelect.value;
+    const requiresApproval = ["mutate_sql", "execute_ddl", "create_database"].includes(tool);
     policySelect.value = requiresApproval ? "approval" : "direct";
-    policySelect.disabled = toolSelect.value === "create_database";
-    if (toolSelect.value === "create_database") policySelect.value = "approval";
+    policySelect.disabled = tool === "create_database";
+    if (tool === "create_database") policySelect.value = "approval";
   }
 
-  toolSelect.addEventListener("change", renderProfiles);
-  renderProfiles();
+  hint.textContent =
+    availableTools.length === 0
+      ? `没有可添加的工具：该用途（${purposeLabel(profile.purpose)}）的工具可能都已添加路由。`
+      : `工具固定使用当前连接配置「${profile.name}」（${purposeLabel(profile.purpose)}）。`;
+  toolSelect.addEventListener("change", renderPolicy);
+  renderPolicy();
 
   const form = h(
     "form",
@@ -3106,8 +3106,8 @@ function openRouteModal(sourceId, profiles, route) {
         event.preventDefault();
         if (busy) return;
         errorEl.classList.add("hidden");
-        if (!profileSelect.value) {
-          errorEl.textContent = "没有用途匹配的连接配置";
+        if (!toolSelect.value) {
+          errorEl.textContent = "没有可添加的工具";
           errorEl.classList.remove("hidden");
           return;
         }
@@ -3122,7 +3122,7 @@ function openRouteModal(sourceId, profiles, route) {
             method: editing ? "PUT" : "POST",
             body: {
               tool: toolSelect.value,
-              profile_id: Number(profileSelect.value),
+              profile_id: profile.id,
               min_approval_policy: policySelect.value,
             },
           });
@@ -3151,8 +3151,8 @@ function openRouteModal(sourceId, profiles, route) {
       h(
         "div",
         { class: "field" },
-        h("label", { class: "field-label", for: "route-profile" }, "连接配置"),
-        profileSelect,
+        h("label", { class: "field-label" }, "连接配置"),
+        h("div", { class: "profile-fixed" }, `${profile.name} · #${profile.id}`),
         hint,
       ),
       h(
@@ -3171,7 +3171,7 @@ function openRouteModal(sourceId, profiles, route) {
     h(
       "div",
       { class: "modal-foot" },
-      h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+      h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
       submit,
     ),
   );
@@ -3179,12 +3179,12 @@ function openRouteModal(sourceId, profiles, route) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
         h("h2", { class: "modal-title" }, editing ? "编辑工具路由" : "添加工具路由"),
-        h("p", { class: "modal-subtitle" }, sourceId),
+        h("p", { class: "modal-subtitle" }, `${sourceId} · ${profile.name}`),
       ),
       form,
     ),
@@ -3224,7 +3224,7 @@ function openEnvironmentModal(source) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -3237,7 +3237,7 @@ function openEnvironmentModal(source) {
         h("div", { class: "field" }, h("label", { class: "field-label", for: "source-environment" }, "环境"), select),
         h(
           "div",
-          { class: "callout callout-warning" },
+          { class: "alert alert-warning" },
           "标记为生产前必须先撤销该数据源上的 mutate_sql、execute_ddl 和 create_database 授权。",
         ),
         errorEl,
@@ -3245,7 +3245,7 @@ function openEnvironmentModal(source) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
         submit,
       ),
     ),
@@ -3257,7 +3257,7 @@ function openArchiveModal(source) {
   const submit = h(
     "button",
     {
-      class: "btn btn-danger",
+      class: "btn btn-ghost btn-error",
       type: "button",
       onClick: async () => {
         submit.disabled = true;
@@ -3283,7 +3283,7 @@ function openArchiveModal(source) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -3295,7 +3295,7 @@ function openArchiveModal(source) {
         { class: "modal-body" },
         h(
           "div",
-          { class: "callout callout-danger" },
+          { class: "alert alert-error" },
           "归档会阻止新请求、使待批请求失效，并从 agent 的数据源列表移除。配置、授权和审计保留，物理数据库不会被删除。",
         ),
         errorEl,
@@ -3303,7 +3303,7 @@ function openArchiveModal(source) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
         submit,
       ),
     ),
@@ -3341,7 +3341,7 @@ function openRestoreModal(source) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -3353,7 +3353,7 @@ function openRestoreModal(source) {
         { class: "modal-body" },
         h(
           "div",
-          { class: "callout" },
+          { class: "alert" },
           "恢复前会复核启用的连接配置、授权和适用建库配额。任一条件不满足时恢复失败。",
         ),
         errorEl,
@@ -3361,7 +3361,7 @@ function openRestoreModal(source) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
         submit,
       ),
     ),
@@ -3374,7 +3374,7 @@ function openSettleModal(reservation, target) {
   const submit = h(
     "button",
     {
-      class: `btn ${commit ? "btn-primary" : "btn-danger"}`,
+      class: `btn ${commit ? "btn-primary" : "btn-ghost btn-error"}`,
       type: "button",
       onClick: async () => {
         submit.disabled = true;
@@ -3398,7 +3398,7 @@ function openSettleModal(reservation, target) {
   openModal(
     h(
       "div",
-      { class: "modal" },
+      { class: "dialog" },
       h(
         "div",
         { class: "modal-head" },
@@ -3410,7 +3410,7 @@ function openSettleModal(reservation, target) {
         { class: "modal-body" },
         h(
           "div",
-          { class: "callout callout-warning" },
+          { class: "alert alert-warning" },
           commit
             ? "只有确认数据库已创建并完成本地登记时才提交；提交要求对应数据源处于启用状态。"
             : "只有确认数据库未创建或已由人工清理时才释放；释放会恢复该令牌 × 父数据源的配额。",
@@ -3420,7 +3420,7 @@ function openSettleModal(reservation, target) {
       h(
         "div",
         { class: "modal-foot" },
-        h("button", { class: "btn btn-secondary", type: "button", onClick: closeModal }, "取消"),
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
         submit,
       ),
     ),
@@ -3460,7 +3460,7 @@ function openModal(content, options = {}) {
       content,
     ),
   );
-  document.body.classList.add("modal-open");
+  document.body.classList.add("scroll-locked");
   const focusable = root.querySelector("input, select, textarea, button");
   if (focusable) focusable.focus();
 }
@@ -3470,7 +3470,7 @@ function closeModal() {
   if (!root) return;
   root.hidden = true;
   root.replaceChildren();
-  document.body.classList.remove("modal-open");
+  document.body.classList.remove("scroll-locked");
   modalDismissible = true;
 }
 
@@ -3502,7 +3502,7 @@ function showToast(message, type = "ok") {
   if (!root) return;
   const toast = h(
     "div",
-    { class: `toast${type === "error" ? " error" : ""}`, role: "status" },
+    { class: `notice${type === "error" ? " error" : ""}`, role: "status" },
     message,
   );
   root.appendChild(toast);

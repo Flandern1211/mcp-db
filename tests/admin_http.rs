@@ -626,6 +626,16 @@ async fn session_cookie_and_security_headers_cover_all_responses() {
     assert!(!page.contains("__MCPDB_LOGIN_CHALLENGE__"));
     assert!(page.contains("<script src=\"/admin/assets/app.js\" defer></script>"));
     assert!(!page.contains("<script>"));
+    let daisy_link = page
+        .find("<link rel=\"stylesheet\" href=\"/admin/assets/daisyui.css\" />")
+        .expect("daisyUI bundle must be loaded");
+    let app_link = page
+        .find("<link rel=\"stylesheet\" href=\"/admin/assets/app.css\" />")
+        .expect("app styles must be loaded");
+    assert!(
+        daisy_link < app_link,
+        "daisyUI base CSS must load before app overrides"
+    );
 
     let (status, headers, _) = send_text(
         fixture.admin.clone(),
@@ -634,11 +644,13 @@ async fn session_cookie_and_security_headers_cover_all_responses() {
     .await;
     assert_eq!(status, StatusCode::FOUND, "no session redirects to login");
 
+    let mut bodies = std::collections::HashMap::new();
     for (path, expected_type) in [
+        ("/admin/assets/daisyui.css", Some("text/css")),
         ("/admin/assets/app.css", Some("text/css")),
         ("/admin/assets/app.js", Some("javascript")),
     ] {
-        let (status, headers, _) = send_text(
+        let (status, headers, body) = send_text(
             fixture.admin.clone(),
             admin_request(Method::GET, path, None, None, None, None),
         )
@@ -653,8 +665,50 @@ async fn session_cookie_and_security_headers_cover_all_responses() {
             "{path}: {content_type}"
         );
         assert_security_headers(&headers);
+        bodies.insert(path, body);
     }
     assert_security_headers(&headers);
+
+    let daisy_css = &bodies["/admin/assets/daisyui.css"];
+    assert!(
+        daisy_css.len() > 20_000,
+        "generated daisyUI bundle is too small"
+    );
+    assert!(
+        daisy_css.contains("tailwindcss v4"),
+        "generated bundle is missing the Tailwind banner"
+    );
+    for component in [
+        ".btn{",
+        ".input{",
+        ".select{",
+        ".checkbox{",
+        ".badge{",
+        ".alert{",
+        ".menu{",
+        ".table{",
+    ] {
+        assert!(
+            daisy_css.contains(component),
+            "generated bundle is missing {component}"
+        );
+    }
+
+    let app_css = &bodies["/admin/assets/app.css"];
+    assert!(
+        app_css.contains("--line:"),
+        "app border colour token must not reuse daisyUI's --border width"
+    );
+    assert!(
+        !app_css.contains("--border: #"),
+        "app CSS must not shadow daisyUI's --border width with a colour"
+    );
+    for base_component in ["\n.btn {\n", "\n.input {\n", "\n.select {\n"] {
+        assert!(
+            !app_css.contains(base_component),
+            "app CSS must rely on daisyUI for {base_component}"
+        );
+    }
 
     let (status, headers, _) = send_text(
         fixture.admin.clone(),
@@ -684,6 +738,7 @@ fn assert_security_headers(headers: &HeaderMap) {
         "default-src 'none'",
         "script-src 'self'",
         "style-src 'self'",
+        "img-src 'self' data:",
         "connect-src 'self'",
         "form-action 'self'",
         "base-uri 'none'",
@@ -960,7 +1015,7 @@ async fn source_profile_route_and_environment_apis() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "restore needs a grant");
-    assert!(body["error"].as_str().unwrap_or_default().contains("grant"));
+    assert!(body["error"].as_str().unwrap_or_default().contains("授权"));
 }
 
 #[tokio::test]
