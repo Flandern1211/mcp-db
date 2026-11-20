@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_db::{
-    ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalStatus, Authorizer, ClaimOutcome,
-    DecisionOutcome, Driver, Environment, NewApprovalRequest, NewGrant, NewProfile, NewRoute,
-    NewSource, ProfilePurpose, Store, Tool,
+    ApprovalChannel, ApprovalDraft, ApprovalOutcome, ApprovalPolicy, ApprovalStatus, Authorizer,
+    ClaimOutcome, DecisionOutcome, Driver, Environment, NewApprovalRequest, NewGrant, NewProfile,
+    NewRoute, NewSource, ProfilePurpose, Store, Tool,
 };
 use rusqlite::Connection;
 use tempfile::TempDir;
@@ -247,6 +247,220 @@ fn route_change_invalidates_approved_request() {
         store.get_approval(record.id).expect("get").status,
         ApprovalStatus::Expired
     );
+}
+
+#[test]
+fn source_replacement_invalidates_only_changed_unconsumed_approvals_and_rolls_back() {
+    use ApprovalPolicy::{Approval, Direct};
+    let (dir, store, draft, token_id) = setup();
+    let ts = now();
+    let profile = store
+        .create_profile(&NewProfile {
+            source_id: "a".to_string(),
+            name: "schema".to_string(),
+            purpose: ProfilePurpose::Schema,
+            credential_ref: "keyring:test/schema".to_string(),
+            max_connections: None,
+            statement_timeout_ms: None,
+        })
+        .unwrap();
+    let ddl = store
+        .create_route(&NewRoute {
+            source_id: "a".to_string(),
+            tool: Tool::ExecuteDdl,
+            profile_id: profile.id,
+            min_approval_policy: Direct,
+        })
+        .unwrap();
+    store
+        .create_grant(&NewGrant {
+            token_id: token_id.clone(),
+            source_id: "a".to_string(),
+            tool: Tool::ExecuteDdl,
+            policy: Some(Approval),
+        })
+        .unwrap();
+    let ddl_draft = ApprovalDraft {
+        tool: Tool::ExecuteDdl,
+        profile_id: profile.id,
+        route_id: ddl.id,
+        ..draft.clone()
+    };
+    let pending_for = |draft: &ApprovalDraft| {
+        store
+            .insert_approval_request(&pending(draft, ts, ts + 60_000))
+            .unwrap()
+            .id
+    };
+    let removed = pending_for(&draft);
+    let changed = pending_for(&ddl_draft);
+    let consumed = pending_for(&draft);
+    for approval in [changed, consumed] {
+        assert_eq!(
+            store
+                .decide_approval(approval, true, "admin", ts, 60_000)
+                .unwrap(),
+            DecisionOutcome::Approved
+        );
+    }
+    assert!(matches!(
+        store
+            .claim_approval(consumed, &token_id, &draft.digest(), ts)
+            .unwrap(),
+        ClaimOutcome::Claimed(_)
+    ));
+    let same_agent = store.create_token(&draft.agent).unwrap();
+    let other_token = pending_for(&ApprovalDraft {
+        token_id: same_agent.token_id,
+        ..draft.clone()
+    });
+    let other_source = pending_for(&ApprovalDraft {
+        source_id: "b".to_string(),
+        ..draft.clone()
+    });
+    let unchanged_tool = pending_for(&ApprovalDraft {
+        tool: Tool::CreateDatabase,
+        ..draft.clone()
+    });
+    let expected = [(Tool::MutateSql, Approval), (Tool::ExecuteDdl, Approval)];
+    let desired = [(Tool::ExecuteDdl, Direct)];
+    let before = store.list_grants_for_token(&token_id).unwrap();
+    let audit_count = store.count_audit_events_all().unwrap();
+    let conn = Connection::open(dir.path().join("state.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER test_fail_last_grant_audit BEFORE INSERT ON audit_events
+         WHEN NEW.event = 'admin_grant_updated'
+         BEGIN SELECT RAISE(ABORT, 'test audit failure'); END;",
+    )
+    .unwrap();
+    let apply =
+        || store.replace_source_grants(&token_id, "a", &expected, &desired, "admin-web", ts + 1);
+    assert!(apply().is_err());
+    assert_eq!(store.list_grants_for_token(&token_id).unwrap(), before);
+    assert_eq!(store.count_audit_events_all().unwrap(), audit_count);
+    assert_eq!(
+        store.get_approval(removed).unwrap().status,
+        ApprovalStatus::Pending
+    );
+    assert_eq!(
+        store.get_approval(changed).unwrap().status,
+        ApprovalStatus::Approved
+    );
+    conn.execute_batch("DROP TRIGGER test_fail_last_grant_audit")
+        .unwrap();
+
+    assert_eq!(apply().unwrap()[0].policy, Direct);
+    for id in [removed, changed] {
+        let record = store.get_approval(id).unwrap();
+        assert_eq!(record.status, ApprovalStatus::Expired);
+        assert_eq!(record.reason_code.as_deref(), Some("GRANT_POLICY_CHANGED"));
+        assert!(store
+            .list_recent_audit(20)
+            .unwrap()
+            .iter()
+            .any(|event| event.approval_id == Some(id)
+                && event.event == "invalidated"
+                && event.reason_code.as_deref() == Some("GRANT_POLICY_CHANGED")));
+    }
+    for id in [other_source, other_token, unchanged_tool] {
+        assert_eq!(
+            store.get_approval(id).unwrap().status,
+            ApprovalStatus::Pending
+        );
+    }
+    assert_eq!(
+        store.get_approval(consumed).unwrap().status,
+        ApprovalStatus::Consumed
+    );
+    let events = store.list_recent_audit(20).unwrap();
+    for (name, tool) in [
+        ("admin_grant_revoked", "mutate_sql"),
+        ("admin_grant_updated", "execute_ddl"),
+    ] {
+        assert!(events.iter().any(|event| event.event == name
+            && event.tool == tool
+            && event.token_id.as_deref() == Some(&token_id)
+            && event.source_id.as_deref() == Some("a")));
+    }
+    assert_eq!(store.count_audit_events_all().unwrap(), audit_count + 4);
+    assert!(store
+        .replace_source_grants(&token_id, "a", &desired, &desired, "admin-web", ts + 2)
+        .is_ok());
+    assert_eq!(store.count_audit_events_all().unwrap(), audit_count + 4);
+}
+
+#[test]
+fn single_grant_revoke_then_source_regrant_does_not_revive_approval() {
+    let (dir, store, draft, token_id) = setup();
+    let ts = now();
+    let approval = store
+        .insert_approval_request(&pending(&draft, ts, ts + 60_000))
+        .unwrap();
+    assert_eq!(
+        store
+            .decide_approval(approval.id, true, "admin", ts, 60_000)
+            .unwrap(),
+        DecisionOutcome::Approved
+    );
+    let other = store.create_token(&draft.agent).unwrap().token_id;
+    store
+        .create_grant(&NewGrant {
+            token_id: other.clone(),
+            source_id: "a".to_string(),
+            tool: draft.tool,
+            policy: Some(draft.grant_policy),
+        })
+        .unwrap();
+    let other_draft = ApprovalDraft {
+        token_id: other.clone(),
+        ..draft.clone()
+    };
+    let untouched = store
+        .insert_approval_request(&pending(&other_draft, ts, ts + 60_000))
+        .unwrap();
+    let admin = Store::open_admin(dir.path().join("state.db")).unwrap();
+    admin
+        .revoke_grant(&token_id, "a", draft.tool, "admin-cli")
+        .unwrap();
+    store
+        .replace_source_grants(
+            &token_id,
+            "a",
+            &[],
+            &[(draft.tool, draft.grant_policy)],
+            "admin-web",
+            ts,
+        )
+        .unwrap();
+
+    assert_eq!(
+        store
+            .get_approval(approval.id)
+            .unwrap()
+            .reason_code
+            .as_deref(),
+        Some("GRANT_POLICY_CHANGED")
+    );
+    assert_eq!(
+        store
+            .claim_approval(approval.id, &token_id, &draft.digest(), ts)
+            .unwrap(),
+        ClaimOutcome::NotApproved
+    );
+    assert_eq!(
+        store.get_approval(untouched.id).unwrap().status,
+        ApprovalStatus::Pending
+    );
+    assert!(store.get_grant(&other, "a", draft.tool).is_ok());
+    let audit = store.list_recent_audit(20).unwrap();
+    let revoked: Vec<_> = audit
+        .iter()
+        .filter(|event| event.event == "admin_grant_revoked")
+        .collect();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].tool, draft.tool.as_str());
+    assert_eq!(revoked[0].token_id.as_deref(), Some(token_id.as_str()));
+    assert_eq!(revoked[0].actor, "admin-cli");
 }
 
 #[test]

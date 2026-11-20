@@ -502,7 +502,7 @@ fn revoked_grant_no_longer_authorizes_or_is_listed() {
         .is_ok());
 
     store
-        .revoke_grant(&token.token_id, "a", Tool::ListTables)
+        .revoke_grant(&token.token_id, "a", Tool::ListTables, "admin-cli")
         .expect("revoke");
     assert!(matches!(
         Authorizer::new(&store).authorize(&token.token_id, Some("a"), Tool::ListTables),
@@ -513,7 +513,7 @@ fn revoked_grant_no_longer_authorizes_or_is_listed() {
         .unwrap()
         .is_empty());
     assert!(matches!(
-        store.revoke_grant(&token.token_id, "a", Tool::ListTables),
+        store.revoke_grant(&token.token_id, "a", Tool::ListTables, "admin-cli"),
         Err(Error::NotFound(_))
     ));
 }

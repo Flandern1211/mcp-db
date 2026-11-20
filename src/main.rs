@@ -580,16 +580,9 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                 let tool = Tool::parse(&args.next().ok_or("grants revoke requires a tool name")?)
                     .map_err(|error| error.to_string())?;
                 store
-                    .revoke_grant(&token_id, &source_id, tool)
+                    .revoke_grant(&token_id, &source_id, tool, "admin-cli")
                     .map_err(|error| error.to_string())?;
                 println!("revoked {} {}/{}", token_id, source_id, tool.as_str());
-                record_admin_audit(
-                    &store,
-                    "admin_grant_revoked",
-                    "grant",
-                    Some(source_id.as_str()),
-                    Some(token_id.as_str()),
-                )?;
                 Ok(())
             }
             Some(token_id) => {

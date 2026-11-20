@@ -5,12 +5,13 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, Method, Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
+use mcp_db::state::{ProfileUpdate, RouteUpdate};
 use mcp_db::{
-    admin_app, AdminState, AppState, ApprovalChannel, ApprovalDraft, ApprovalStatus, Driver,
-    Environment, NewApprovalRequest, NewGrant, NewProfile, NewRoute, NewSource, PeerElicitation,
-    ProfilePurpose, ProvisionLimits, ReservationStatus, Store, TokenRateLimiter, Tool,
-    UnavailableExecutor, UnavailableMetadata, UnavailableProvisioner, ADMIN_LOGIN_TTL_MS,
-    DEFAULT_MAX_ROWS,
+    admin_app, AdminState, AppState, ApprovalChannel, ApprovalDraft, ApprovalPolicy,
+    ApprovalStatus, Driver, Environment, NewApprovalRequest, NewGrant, NewProfile, NewRoute,
+    NewSource, PeerElicitation, ProfilePurpose, ProvisionLimits, ReservationStatus, Store,
+    TokenRateLimiter, Tool, UnavailableExecutor, UnavailableMetadata, UnavailableProvisioner,
+    ADMIN_LOGIN_TTL_MS, DEFAULT_MAX_ROWS,
 };
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -1178,6 +1179,346 @@ async fn revoking_a_grant_takes_effect_for_the_next_mcp_call() {
         sources.is_empty(),
         "revoked grant must take effect: {sources:?}"
     );
+}
+
+fn grant_source(store: &Store, id: &str, driver: Driver, environment: Environment) {
+    store
+        .create_source(&NewSource {
+            id: id.to_string(),
+            driver,
+            environment,
+            parent_source_id: None,
+            created_token_id: None,
+            created_agent: None,
+            created_origin: None,
+        })
+        .expect("source");
+}
+
+fn grant_route(store: &Store, id: &str, tool: Tool, policy: ApprovalPolicy) -> mcp_db::Route {
+    let purpose = tool.purpose().expect("source tool");
+    let profile = store
+        .create_profile(&NewProfile {
+            source_id: id.to_string(),
+            name: tool.as_str().to_string(),
+            purpose,
+            credential_ref: if purpose == ProfilePurpose::Provision {
+                "keyring:provision/test"
+            } else {
+                "keyring:test/profile"
+            }
+            .to_string(),
+            max_connections: None,
+            statement_timeout_ms: None,
+        })
+        .expect("profile");
+    store
+        .create_route(&NewRoute {
+            source_id: id.to_string(),
+            tool,
+            profile_id: profile.id,
+            min_approval_policy: policy,
+        })
+        .expect("route")
+}
+
+#[tokio::test]
+async fn replace_source_grants_is_scoped_and_takes_effect_in_the_existing_mcp_session() {
+    use ApprovalPolicy::{Approval, Direct};
+    let fixture = setup();
+    let bearer = create_read_access(&fixture);
+    let (token_id, other) = {
+        let store = fixture.store.lock().unwrap();
+        let identity = store.authenticate(&bearer).unwrap();
+        let other = store.create_token(&identity.agent).unwrap().token_id;
+        grant_source(&store, "b", Driver::Postgres, Environment::NonProduction);
+        grant_route(&store, "a", Tool::QuerySql, Direct);
+        grant_route(&store, "a", Tool::MutateSql, Direct);
+        let ddl = grant_route(&store, "a", Tool::ExecuteDdl, Direct);
+        for (token_id, source, tool) in [
+            (&identity.token_id, "a", Tool::MutateSql),
+            (&identity.token_id, "a", Tool::ExecuteDdl),
+            (&identity.token_id, "b", Tool::QuerySql),
+            (&other, "a", Tool::ListTables),
+        ] {
+            store
+                .create_grant(&NewGrant {
+                    token_id: token_id.clone(),
+                    source_id: source.to_string(),
+                    tool,
+                    policy: Some(Direct),
+                })
+                .unwrap();
+        }
+        store
+            .update_route(
+                "a",
+                ddl.id,
+                &RouteUpdate {
+                    profile_id: ddl.profile_id,
+                    min_approval_policy: Approval,
+                },
+            )
+            .unwrap();
+        (identity.token_id, other)
+    };
+    let (cookie, csrf) = login(&fixture).await;
+    let path = format!("/admin/api/tokens/{token_id}/sources/a/grants");
+    let original = json!([
+        { "tool": "mutate_sql", "policy": "direct" },
+        { "tool": "list_tables", "policy": "direct" },
+        { "tool": "execute_ddl", "policy": "direct" },
+    ]);
+    let updated = json!([
+        { "tool": "query_sql", "policy": "direct" },
+        { "tool": "execute_ddl", "policy": "direct" },
+        { "tool": "mutate_sql", "policy": "approval" },
+    ]);
+    let change = json!({ "expected": original, "grants": updated });
+    let mcp = mcp_db::transport::http::app(fixture.state.clone());
+    let session = init_mcp_session(mcp.clone(), &bearer).await;
+    assert_eq!(mcp_sources(mcp.clone(), &bearer, &session).await.len(), 2);
+
+    let (status, _, response) = send_json(
+        fixture.admin.clone(),
+        write_request(Method::PUT, &path, Some(&change), &cookie, &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["grants"],
+        json!([
+            { "token_id": token_id, "source_id": "a", "tool": "execute_ddl", "policy": "direct" },
+            { "token_id": token_id, "source_id": "a", "tool": "mutate_sql", "policy": "approval" },
+            { "token_id": token_id, "source_id": "a", "tool": "query_sql", "policy": "direct" },
+        ])
+    );
+    {
+        let store = fixture.store.lock().unwrap();
+        assert!(store.get_grant(&token_id, "a", Tool::ListTables).is_err());
+        let call = mcp_db::Authorizer::new(&store)
+            .authorize(&token_id, Some("a"), Tool::ExecuteDdl)
+            .unwrap();
+        assert_eq!(call.grant_policy, Direct);
+        assert_eq!(call.policy, Approval);
+    }
+    let clear = json!({ "expected": updated, "grants": [] });
+    let (status, _, response) = send_json(
+        fixture.admin.clone(),
+        write_request(Method::PUT, &path, Some(&clear), &cookie, &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response, json!({ "grants": [] }));
+    let visible = mcp_sources(mcp.clone(), &bearer, &session).await;
+    assert_eq!(visible.len(), 1);
+    assert_eq!(visible[0]["id"], "b");
+    let mcp_query = r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"query_sql","arguments":{"source":"a","sql":"SELECT 1"}}}"#;
+    let (status, _, response) =
+        send_json(mcp, mcp_request(mcp_query, &bearer, Some(&session))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        response["result"]["structuredContent"]["code"],
+        "TOOL_NOT_GRANTED"
+    );
+    let store = fixture.store.lock().unwrap();
+    assert_eq!(store.list_grants_for_token(&token_id).unwrap().len(), 1);
+    assert!(store.get_grant(&other, "a", Tool::ListTables).is_ok());
+}
+
+#[tokio::test]
+async fn source_grant_put_checks_admin_boundary_and_rejects_whole_invalid_sets() {
+    use ApprovalPolicy::{Approval, Direct};
+    let fixture = setup();
+    let cookie_csrf = login(&fixture).await;
+    let (cookie, csrf) = (&cookie_csrf.0, &cookie_csrf.1);
+    let (token_id, before, audit_count) = {
+        let store = fixture.store.lock().unwrap();
+        let token_id = store.create_token("agent").unwrap().token_id;
+        grant_source(&store, "prod", Driver::Postgres, Environment::Production);
+        grant_source(&store, "file", Driver::Sqlite, Environment::NonProduction);
+        grant_route(&store, "prod", Tool::QuerySql, Direct);
+        grant_route(&store, "prod", Tool::MutateSql, Direct);
+        grant_route(&store, "prod", Tool::CreateDatabase, Approval);
+        grant_route(&store, "file", Tool::CreateDatabase, Approval);
+        for tool in [Tool::ListTables, Tool::DescribeTable] {
+            let disabled = grant_route(&store, "prod", tool, Direct);
+            store
+                .update_profile(
+                    "prod",
+                    disabled.profile_id,
+                    &ProfileUpdate {
+                        name: tool.as_str().to_string(),
+                        enabled: false,
+                        credential_ref: None,
+                        max_connections: None,
+                        statement_timeout_ms: None,
+                    },
+                )
+                .unwrap();
+        }
+        let before = store
+            .create_grant(&NewGrant {
+                token_id: token_id.clone(),
+                source_id: "prod".to_string(),
+                tool: Tool::ListTables,
+                policy: Some(Direct),
+            })
+            .unwrap();
+        (token_id, before, store.count_audit_events_all().unwrap())
+    };
+    let path = format!("/admin/api/tokens/{token_id}/sources/prod/grants");
+    let expected = json!([{ "tool": "list_tables", "policy": "direct" }]);
+    let query = json!({ "tool": "query_sql", "policy": "direct" });
+    let create = json!({ "tool": "create_database", "policy": "approval" });
+    let good = json!({ "expected": expected, "grants": [query, create, expected[0]] });
+    let clear = json!({ "expected": expected, "grants": [] });
+    for (session, origin, header, expected_status) in [
+        (None, ORIGIN, Some(csrf.as_str()), StatusCode::UNAUTHORIZED),
+        (Some(cookie.as_str()), ORIGIN, None, StatusCode::FORBIDDEN),
+        (
+            Some(cookie.as_str()),
+            ORIGIN,
+            Some("wrong"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            Some(cookie.as_str()),
+            "http://127.0.0.1:8787",
+            Some(csrf.as_str()),
+            StatusCode::FORBIDDEN,
+        ),
+    ] {
+        let (status, headers, _) = send_json(
+            fixture.admin.clone(),
+            admin_request(
+                Method::PUT,
+                &path,
+                Some(&clear),
+                session,
+                Some(origin),
+                header,
+            ),
+        )
+        .await;
+        assert_eq!(status, expected_status);
+        assert_security_headers(&headers);
+    }
+    for (request, expected_status) in [
+        (json!({ "grants": [] }), StatusCode::BAD_REQUEST),
+        (json!({ "expected": expected }), StatusCode::BAD_REQUEST),
+        (
+            json!({ "expected": [], "grants": [query] }),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({ "expected": [expected[0], expected[0]], "grants": [query] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, query] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, { "tool": "create_database" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, { "tool": "create_database", "policy": "direct" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, { "tool": "create_database", "policy": "never" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, { "tool": "mutate_sql", "policy": "approval" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, { "tool": "execute_ddl", "policy": "direct" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({ "expected": expected, "grants": [query, { "tool": "describe_table", "policy": "direct" }] }),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (status, _, body) = send_json(
+            fixture.admin.clone(),
+            write_request(Method::PUT, &path, Some(&request), cookie, csrf),
+        )
+        .await;
+        assert_eq!(status, expected_status, "{body}");
+    }
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::PUT,
+            &format!("/admin/api/tokens/{token_id}/sources/file/grants"),
+            Some(&json!({ "expected": [], "grants": [create] })),
+            cookie,
+            csrf,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/sources",
+            None,
+            Some(cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tools = body["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["id"] == "prod")
+        .unwrap()["grant_tools"]
+        .as_array()
+        .unwrap();
+    assert!(tools.contains(&json!({ "tool": "list_tables", "reason": "连接配置已停用" })));
+    assert!(tools.contains(&json!({ "tool": "create_database", "min_policy": "approval" })));
+    {
+        let store = fixture.store.lock().unwrap();
+        assert_eq!(
+            store.list_grants_for_token(&token_id).unwrap(),
+            vec![before]
+        );
+        assert_eq!(store.count_audit_events_all().unwrap(), audit_count);
+    }
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(Method::PUT, &path, Some(&good), cookie, csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["grants"].as_array().unwrap().len(), 3);
+
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .archive_source("prod", "test", now_ms())
+        .unwrap();
+    let archived_snapshot = json!([query, create, expected[0]]);
+    let invalid = json!({ "expected": archived_snapshot, "grants": [query, { "tool": "explain_query", "policy": "direct" }] });
+    let clear = json!({ "expected": archived_snapshot, "grants": [] });
+    for (body, expected_status) in [(invalid, StatusCode::BAD_REQUEST), (clear, StatusCode::OK)] {
+        let (status, _, response) = send_json(
+            fixture.admin.clone(),
+            write_request(Method::PUT, &path, Some(&body), cookie, csrf),
+        )
+        .await;
+        assert_eq!(status, expected_status, "{response}");
+    }
 }
 
 #[tokio::test]
