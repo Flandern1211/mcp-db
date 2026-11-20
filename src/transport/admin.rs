@@ -38,9 +38,10 @@ pub const SESSION_COOKIE: &str = "mcpdb_admin";
 const ADMIN_ACTOR: &str = "admin-web";
 const LOGIN_CHALLENGE_TTL_MS: i64 = 5 * 60 * 1000;
 const CSRF_HEADER: &str = "x-mcpdb-csrf";
-const SECURITY_HEADERS_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const SECURITY_HEADERS_CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 const INDEX_HTML: &str = include_str!("admin_assets/index.html");
+const DAISYUI_CSS: &str = include_str!("admin_assets/daisyui.css");
 const APP_CSS: &str = include_str!("admin_assets/app.css");
 const APP_JS: &str = include_str!("admin_assets/app.js");
 
@@ -120,6 +121,7 @@ pub fn admin_app(state: AdminState) -> Router {
     Router::new()
         .route("/admin", get(index))
         .route("/admin/login", get(login_page))
+        .route("/admin/assets/daisyui.css", get(daisyui_css))
         .route("/admin/assets/app.css", get(app_css))
         .route("/admin/assets/app.js", get(app_js))
         .route("/admin/api/login-challenge", get(login_challenge))
@@ -253,6 +255,15 @@ async fn login_page(State(state): State<AdminState>, headers: HeaderMap) -> Resp
         StatusCode::OK,
         &index_html(&state.issue_login_challenge(now_ms())),
     )
+}
+
+async fn daisyui_css() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        DAISYUI_CSS,
+    )
+        .into_response()
 }
 
 async fn app_css() -> Response {
