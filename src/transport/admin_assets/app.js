@@ -98,6 +98,8 @@ const state = {
 };
 
 let modalDismissible = true;
+let modalEpoch = 0;
+let tokenLoadSeq = 0;
 
 // ---------- DOM helpers ----------
 
@@ -290,7 +292,9 @@ async function loadSources() {
 }
 
 async function loadTokens() {
+  const seq = ++tokenLoadSeq;
   const data = await api("/admin/api/tokens");
+  if (seq !== tokenLoadSeq) return; // an older list response must not overwrite a newer one
   state.tokens = data.tokens || [];
 }
 
@@ -937,6 +941,7 @@ async function refreshTokensView() {
 }
 
 function openCreateTokenModal() {
+  if (!document.getElementById("modal-root").hidden) return;
   let busy = false;
   const agentInput = h("input", {
     class: "input",
@@ -946,6 +951,7 @@ function openCreateTokenModal() {
     autocomplete: "off",
   });
   const errorEl = h("p", { class: "form-error hidden" });
+  const cancel = h("button", { class: "btn", type: "button", onClick: closeModal }, "取消");
   const submit = h("button", { class: "btn btn-primary", type: "submit" }, "签发令牌");
 
   function setError(message) {
@@ -968,18 +974,24 @@ function openCreateTokenModal() {
           return;
         }
         busy = true;
+        modalDismissible = false;
+        cancel.disabled = true;
         submit.disabled = true;
         submit.textContent = "签发中…";
+        let data;
         try {
-          const data = await api("/admin/api/tokens", { method: "POST", body: { agent } });
-          await loadTokens();
-          showCreatedToken(data);
+          data = await api("/admin/api/tokens", { method: "POST", body: { agent } });
         } catch (error) {
+          if (!form.isConnected) return;
           busy = false;
+          modalDismissible = true;
+          cancel.disabled = false;
           submit.disabled = false;
           submit.textContent = "签发令牌";
           setError(errorMessage(error));
+          return;
         }
+        if (state.session) showCreatedToken(data);
       },
     },
     h(
@@ -1001,7 +1013,7 @@ function openCreateTokenModal() {
     h(
       "div",
       { class: "modal-foot" },
-      h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
+      cancel,
       submit,
     ),
   );
@@ -1030,6 +1042,17 @@ function showCreatedToken(data) {
   const plaintext = data.plaintext;
   const token = data.token;
   const snippet = `Authorization: Bearer ${plaintext}`;
+  // Read-only fields keep the one-time value reachable by keyboard when both copy paths fail.
+  const tokenField = h(
+    "textarea",
+    { class: "code-block", readonly: true, rows: "2", spellcheck: "false", "aria-label": "令牌明文" },
+    plaintext,
+  );
+  const headerField = h(
+    "textarea",
+    { class: "code-block", readonly: true, rows: "2", spellcheck: "false", "aria-label": "Authorization 请求头" },
+    snippet,
+  );
 
   openModal(
     h(
@@ -1053,7 +1076,7 @@ function showCreatedToken(data) {
           "div",
           { class: "detail-block" },
           h("div", { class: "detail-block-title" }, "令牌明文"),
-          h("code", { class: "code-block" }, plaintext),
+          tokenField,
           h(
             "div",
             { class: "copy-row" },
@@ -1062,7 +1085,7 @@ function showCreatedToken(data) {
               {
                 class: "btn btn-sm",
                 type: "button",
-                onClick: () => void copyText(plaintext),
+                onClick: () => void copyText(plaintext, tokenField),
               },
               icon("copy", 15),
               "复制令牌",
@@ -1073,7 +1096,7 @@ function showCreatedToken(data) {
           "div",
           { class: "detail-block" },
           h("div", { class: "detail-block-title" }, "Authorization 请求头"),
-          h("code", { class: "code-block" }, snippet),
+          headerField,
           h(
             "div",
             { class: "copy-row" },
@@ -1082,7 +1105,7 @@ function showCreatedToken(data) {
               {
                 class: "btn btn-sm",
                 type: "button",
-                onClick: () => void copyText(snippet),
+                onClick: () => void copyText(snippet, headerField),
               },
               icon("copy", 15),
               "复制请求头",
@@ -1105,7 +1128,9 @@ function showCreatedToken(data) {
             type: "button",
             onClick: () => {
               closeModal();
-              void refreshTokensView();
+              void refreshTokensView().catch(() => {
+                showToast("令牌列表刷新失败，请重新加载页面", "error");
+              });
             },
           },
           "我已保存，关闭",
@@ -1117,15 +1142,19 @@ function showCreatedToken(data) {
 }
 
 async function openGrantsModal(token) {
+  // T-18-only guard: a slow grants response must not replace a dialog opened meanwhile.
+  const epoch = modalEpoch;
   let data;
   try {
     data = await api(`/admin/api/tokens/${encodeURIComponent(token.id)}/grants`);
   } catch (error) {
-    showToast(errorMessage(error), "error");
+    if (epoch === modalEpoch) showToast(errorMessage(error), "error");
     return;
   }
   const grants = data.grants || [];
+  if (epoch !== modalEpoch) return;
   if (state.sources.length === 0) await loadSources();
+  if (epoch !== modalEpoch) return;
   const sources = state.sources.filter((source) => source.status === "active");
 
   const sourceSelect = h(
@@ -3446,6 +3475,7 @@ function emptyState(iconName, title, description, action) {
 
 function openModal(content, options = {}) {
   modalDismissible = options.dismissible !== false;
+  modalEpoch += 1;
   const root = document.getElementById("modal-root");
   root.hidden = false;
   root.replaceChildren(
@@ -3481,20 +3511,34 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
-async function copyText(text) {
+async function copyText(text, field) {
+  let copied = false;
   try {
     await navigator.clipboard.writeText(text);
+    copied = true;
   } catch {
+    // The dialog may have closed while the browser asked for clipboard permission.
+    if (!field.isConnected) return;
     const area = document.createElement("textarea");
-    area.value = text;
-    area.setAttribute("readonly", "");
-    area.className = "clipboard-area";
-    document.body.appendChild(area);
-    area.select();
-    document.execCommand("copy");
-    area.remove();
+    try {
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.className = "clipboard-area";
+      document.body.appendChild(area);
+      area.select();
+      copied = document.execCommand("copy") === true;
+    } catch {
+      copied = false;
+    } finally {
+      area.remove();
+      field.focus();
+    }
   }
-  showToast("已复制到剪贴板");
+  if (copied) showToast("已复制到剪贴板");
+  else {
+    field.select();
+    showToast("复制失败，请手动选中并复制完整内容", "error");
+  }
 }
 
 function showToast(message, type = "ok") {

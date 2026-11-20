@@ -791,6 +791,12 @@ tbody tr.row-revoked .cell-title {
   word-break: break-all;
 }
 
+/* Read-only token fields stay keyboard-selectable. */
+textarea.code-block {
+  width: 100%;
+  resize: none;
+}
+
 .copy-row {
   display: flex;
   align-items: center;
