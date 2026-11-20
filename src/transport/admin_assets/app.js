@@ -843,7 +843,7 @@ function tokenTable(rows) {
             "tr",
             {},
             h("th", {}, "Agent / 令牌"),
-            h("th", {}, "授权"),
+            h("th", {}, "授权数据源"),
             h("th", {}, "状态"),
             h("th", {}, "签发时间"),
             h("th", { class: "th-actions" }, "操作"),
@@ -857,7 +857,15 @@ function tokenTable(rows) {
 
 function tokenRow(token) {
   const revoked = token.status !== "active";
-  const grants = token.grants || [];
+  const sources = new Map();
+  for (const grant of token.grants || []) {
+    const routes = state.sources.find((source) => source.id === grant.source_id)?.grant_tools;
+    const usable = !revoked && routes?.some((route) => route.tool === grant.tool && route.min_policy);
+    const counts = sources.get(grant.source_id) || { total: 0, usable: 0 };
+    counts.total += 1;
+    if (usable) counts.usable += 1;
+    sources.set(grant.source_id, counts);
+  }
   return h(
     "tr",
     { class: revoked ? "row-revoked" : "" },
@@ -878,13 +886,14 @@ function tokenRow(token) {
       h(
         "div",
         { class: "perm-badges" },
-        grants.length === 0
+        sources.size === 0
           ? "—"
-          : grants.map((grant) =>
+          : Array.from(sources, ([id, counts]) =>
               h(
                 "span",
-                { class: "badge badge-sm badge-soft tool-badge" },
-                `${grant.source_id} · ${grant.tool} · ${policyLabel(grant.policy)}`,
+                { class: `badge badge-sm badge-soft tool-badge${counts.usable < counts.total ? " badge-warning" : ""}` },
+                id,
+                counts.usable === counts.total ? "" : counts.usable === 0 ? " · 当前不可用" : " · 部分不可用",
               ),
             ),
       ),
@@ -911,6 +920,7 @@ function tokenRow(token) {
             class: "btn btn-sm",
             type: "button",
             disabled: revoked,
+            id: `manage-grants-${token.id}`,
             onClick: () => void openGrantsModal(token),
           },
           "管理授权",
@@ -1142,371 +1152,312 @@ function showCreatedToken(data) {
 }
 
 async function openGrantsModal(token) {
-  // T-18-only guard: a slow grants response must not replace a dialog opened meanwhile.
-  const epoch = modalEpoch;
-  let data;
-  try {
-    data = await api(`/admin/api/tokens/${encodeURIComponent(token.id)}/grants`);
-  } catch (error) {
-    if (epoch === modalEpoch) showToast(errorMessage(error), "error");
-    return;
-  }
-  const grants = data.grants || [];
-  if (epoch !== modalEpoch) return;
-  if (state.sources.length === 0) await loadSources();
-  if (epoch !== modalEpoch) return;
-  const sources = state.sources.filter((source) => source.status === "active");
-
-  const sourceSelect = h(
-    "select",
-    { class: "select", "aria-label": "数据源" },
-    sources.map((source) => h("option", { value: source.id }, sourceLabel(source))),
+  const path = `/admin/api/tokens/${encodeURIComponent(token.id)}`;
+  const content = h("div", { class: "modal-body" });
+  const cards = h("div", { class: "grant-list" });
+  const empty = h("p", { class: "field-hint" }, "该令牌没有数据源授权，仅能使用基础发现工具 list_sources。");
+  const notice = h("p", { class: "field-hint", role: "status", tabindex: "-1", hidden: true });
+  const picker = h("select", { class: "select", id: "new-grant-source" });
+  const addCard = h("button", { class: "btn", type: "button", disabled: true }, "选择数据源");
+  const close = h("button", { class: "btn", type: "button", onClick: () => {
+    closeModal();
+    document.getElementById(`manage-grants-${token.id}`)?.focus();
+  } }, "关闭");
+  const retry = h("button", { class: "btn", type: "button", hidden: true }, "重新读取授权");
+  const dialog = h("div", {
+    class: "dialog dialog-wide", role: "dialog", "aria-modal": "true", "aria-labelledby": "grant-title", tabindex: "-1",
+  },
+    h("div", { class: "modal-head" },
+      h("h2", { class: "modal-title", id: "grant-title" }, "管理授权"),
+      h("p", { class: "modal-subtitle" }, `${token.agent} · ${shortId(token.id, 12)}`),
+    ),
+    content,
+    h("div", { class: "modal-foot" }, retry, close),
   );
-  const toolSelect = h("select", { class: "select", "aria-label": "工具" });
-  const policyHint = h("p", { class: "field-hint" });
-  const tightenInput = h("input", { class: "checkbox checkbox-sm", type: "checkbox" });
-  const tightenLabel = h(
-    "label",
-    { class: "check-row hidden" },
-    tightenInput,
-    "添加授权时要求逐次审批（比工具路由更严格）",
-  );
-  const addError = h("p", { class: "form-error hidden" });
-  const availabilityNote = h("p", { class: "field-hint hidden" });
-  const submitButton = h(
-    "button",
-    { class: "btn btn-primary", type: "submit", disabled: true },
-    "添加授权",
-  );
-  const availability = new Map();
-  const loadSeq = new Map();
-  let inheritedPolicy = "direct";
+  const editors = new Map();
+  let grants = [];
+  let sources = [];
+  let busy = false;
+  let reading = false;
+  let mustRead = true;
 
-  function selectedSource() {
-    return sources.find((source) => source.id === sourceSelect.value);
+  function setNotice(message, error = false) {
+    notice.textContent = message;
+    notice.hidden = !message;
+    notice.className = error ? "form-error" : "field-hint";
   }
 
-  function showNote(message, className) {
-    availabilityNote.className = className;
-    availabilityNote.textContent = message;
+  function refreshControls() {
+    if (!dialog.isConnected) return;
+    modalDismissible = !busy;
+    close.disabled = busy;
+    retry.hidden = !mustRead || busy || reading;
+    picker.disabled = mustRead || busy || picker.options.length < 2;
+    addCard.disabled = picker.disabled || !picker.value;
+    for (const editor of editors.values()) editor.update();
+    if (busy && (!dialog.contains(document.activeElement) || document.activeElement.disabled)) dialog.focus();
   }
 
-  function hideNote() {
-    availabilityNote.className = "field-hint hidden";
-    availabilityNote.textContent = "";
+  function refreshPicker() {
+    const choices = sources.filter((source) => source.status === "active" && !editors.has(source.id));
+    picker.replaceChildren(
+      h("option", { value: "" }, choices.length ? "请选择未授权的数据源" : "没有其他启用中的未授权数据源"),
+      choices.map((source) => h("option", { value: source.id }, sourceLabel(source))),
+    );
+    empty.hidden = grants.length !== 0;
+    refreshControls();
   }
 
-  function toolAvailability(source, detail) {
-    const production = source.environment === "production";
-    const routes = new Map();
-    for (const route of detail.routes || []) {
-      if (!routes.has(route.tool)) routes.set(route.tool, route);
-    }
-    const profiles = new Map((detail.profiles || []).map((profile) => [profile.id, profile]));
-    return TOOLS.filter(
-      (tool) => !(production && (tool === "mutate_sql" || tool === "execute_ddl")),
-    ).map((tool) => {
-      const route = routes.get(tool);
-      if (!route) return { tool, usable: false, reason: "（未配置工具路由）" };
-      const profile = profiles.get(route.profile_id);
-      if (!profile || !profile.enabled) {
-        return { tool, usable: false, reason: "（连接配置已停用）" };
-      }
-      return { tool, usable: true, reason: "", route };
-    });
+  function checkedGrants(data, id) {
+    if (!Array.isArray(data.grants) || data.grants.some((grant) =>
+      grant?.token_id !== token.id || typeof grant.source_id !== "string" || (id && grant.source_id !== id) ||
+      !TOOLS.includes(grant.tool) || !["direct", "approval"].includes(grant.policy)
+    )) throw new Error("服务返回的授权数据无效。");
+    return data.grants;
   }
 
-  async function loadAvailability(sourceId) {
-    const seq = (loadSeq.get(sourceId) || 0) + 1;
-    loadSeq.set(sourceId, seq);
-    availability.set(sourceId, { status: "loading" });
+  function renderList() {
+    const root = document.getElementById("view-root");
+    if (root && state.view === "tokens") renderTokens(root);
+  }
+
+  function updateList() {
+    const row = state.tokens.find((item) => item.id === token.id);
+    if (row) row.grants = grants;
+    renderList();
+  }
+
+  async function syncList(message) {
     try {
-      const detail = await api(`/admin/api/sources/${encodeURIComponent(sourceId)}`);
-      if (loadSeq.get(sourceId) !== seq) return;
-      const source = sources.find((item) => item.id === sourceId);
-      availability.set(sourceId, {
-        status: "ready",
-        options: source ? toolAvailability(source, detail) : [],
-      });
+      await loadTokens();
+      if (dialog.isConnected) renderList();
+    } catch {
+      if (dialog.isConnected) setNotice(`${message} 列表同步失败；可关闭后刷新。`, true);
+    }
+  }
+
+  function snapshot(id) {
+    return grants.filter((grant) => grant.source_id === id).map(({ tool, policy }) => ({ tool, policy }));
+  }
+
+  function sameGrants(a, b) {
+    return a.length === b.length && a.every(({ tool, policy }) =>
+      b.some((item) => item.tool === tool && item.policy === policy));
+  }
+
+  async function readState(context) {
+    if (reading) return;
+    reading = mustRead = true;
+    refreshControls();
+    setNotice(context?.conflict ? "授权已变更，正在重新读取…" : context ? "保存结果未知，正在读取核对…" : "正在读取授权和路由…");
+    try {
+      const [grantData, sourceData] = await Promise.all([api(`${path}/grants`), api("/admin/api/sources")]);
+      const read = checkedGrants(grantData);
+      if (!Array.isArray(sourceData.sources) || sourceData.sources.some((source) => !Array.isArray(source?.grant_tools))) {
+        throw new Error("服务返回的数据源路由信息无效。");
+      }
+      if (!dialog.isConnected) return;
+      grants = read;
+      state.sources = sources = sourceData.sources;
+      mustRead = false;
+      editors.clear();
+      cards.replaceChildren();
+      for (const id of new Set(grants.map((grant) => grant.source_id))) putEditor(id, id === context?.id);
+      updateList();
+      refreshPicker();
+      if (context) {
+        const result = context.conflict ? "授权在读取后已变更。" :
+          sameGrants(snapshot(context.id), context.desired) ? "当前授权与本次提交一致。" : "当前授权与本次提交不同。";
+        setNotice(`${result} 已读取当前状态，请核对后重新编辑。`);
+        notice.focus();
+      } else setNotice("");
     } catch (error) {
-      if (loadSeq.get(sourceId) !== seq) return;
-      availability.set(sourceId, { status: "error", error: errorMessage(error) });
-    }
-    if (sourceSelect.value === sourceId) renderTools();
-  }
-
-  function renderLoading() {
-    toolSelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "加载中…"));
-    toolSelect.disabled = true;
-    submitButton.disabled = true;
-    policyHint.textContent = "";
-    tightenLabel.classList.add("hidden");
-    showNote("正在加载该数据源的可用工具…", "field-hint");
-  }
-
-  function renderAvailabilityError(message) {
-    toolSelect.replaceChildren(h("option", { value: "", disabled: true, selected: true }, "加载失败"));
-    toolSelect.disabled = true;
-    submitButton.disabled = true;
-    policyHint.textContent = "";
-    tightenLabel.classList.add("hidden");
-    showNote(message, "form-error");
-  }
-
-  function currentOption() {
-    const entry = availability.get(sourceSelect.value);
-    if (!entry || entry.status !== "ready") return null;
-    return entry.options.find((option) => option.tool === toolSelect.value) || null;
-  }
-
-  function renderPolicy() {
-    const option = currentOption();
-    tightenInput.checked = false;
-    tightenLabel.classList.add("hidden");
-    if (!option || !option.usable) {
-      inheritedPolicy = "direct";
-      policyHint.textContent = "";
-      return;
-    }
-    inheritedPolicy = option.route.min_approval_policy;
-    if (inheritedPolicy === "approval") {
-      policyHint.textContent = "执行策略继承自工具路由：逐次审批。";
-    } else {
-      policyHint.textContent = "执行策略继承自工具路由：直接执行。";
-      tightenLabel.classList.remove("hidden");
+      if (dialog.isConnected) {
+        mustRead = true;
+        setNotice(`无法读取授权和路由；重新读取成功前不可保存。${errorMessage(error)}`, true);
+      }
+    } finally {
+      reading = false;
+      refreshControls();
     }
   }
 
-  function renderTools() {
-    const source = selectedSource();
-    if (!source) {
-      toolSelect.replaceChildren();
-      toolSelect.disabled = true;
-      submitButton.disabled = true;
-      policyHint.textContent = "";
-      tightenLabel.classList.add("hidden");
-      hideNote();
-      return;
-    }
-    const entry = availability.get(source.id);
-    if (!entry) {
-      renderLoading();
-      void loadAvailability(source.id);
-      return;
-    }
-    if (entry.status === "loading") {
-      renderLoading();
-      return;
-    }
-    if (entry.status === "error") {
-      renderAvailabilityError(entry.error);
-      return;
-    }
-    const usable = entry.options.filter((option) => option.usable);
-    const granted = new Set(
-      grants
-        .filter((grant) => grant.source_id === source.id)
-        .map((grant) => grant.tool),
+  function putEditor(id, expanded = false) {
+    const source = sources.find((item) => item.id === id);
+    const expected = snapshot(id);
+    const original = new Map(expected.map(({ tool, policy }) => [tool, policy]));
+    const routes = new Map(source?.grant_tools.map((item) => [item.tool, item]));
+    const rows = TOOLS.map((tool) => grantToolRow(tool, original.get(tool), routes.get(tool)));
+    const save = h("button", { class: "btn btn-sm btn-primary", type: "submit" }, "保存此数据源");
+    const discard = h("button", { class: "btn btn-sm", type: "button", onClick: () => {
+      card.remove();
+      editors.delete(id);
+      refreshPicker();
+      picker.focus();
+    } }, "移除未保存的卡片");
+    const warning = h("p", { class: "alert alert-warning", role: "status", hidden: true });
+    const form = h("form", { class: "grant-editor" }, rows.map((row) => row.element), warning,
+      h("div", { class: "actions" }, expected.length === 0 ? discard : null, save));
+    const unavailable = expected.filter(({ tool }) => !routes.get(tool)?.min_policy).length;
+    const summary = h("summary", { class: "grant-summary" },
+      h("span", { class: "mono" }, id),
+      h("span", { class: "field-hint" }, [
+        source ? environmentLabel(source.environment) : "数据源不可用",
+        `${expected.length} 项已授权`,
+        unavailable ? `${unavailable} 项当前不可用` : "",
+      ].filter(Boolean).join(" · ")),
     );
-    toolSelect.replaceChildren(
-      ...entry.options.map((option) =>
-        h(
-          "option",
-          { value: option.tool, disabled: !option.usable || granted.has(option.tool) },
-          granted.has(option.tool)
-            ? `${TOOL_LABELS[option.tool]}（已授权）`
-            : option.usable
-              ? TOOL_LABELS[option.tool]
-              : `${TOOL_LABELS[option.tool]}${option.reason}`,
-        ),
-      ),
-    );
-    const available = usable.filter((option) => !granted.has(option.tool));
-    toolSelect.disabled = available.length === 0;
-    if (available.length === 0) {
-      submitButton.disabled = true;
-      policyHint.textContent = "";
-      tightenLabel.classList.add("hidden");
-      showNote(
-        usable.length === 0
-          ? "该数据源还没有可用的工具路由，请先到数据源页配置。"
-          : "这个数据源上所有可用的工具都已经授权了。",
-        "field-hint",
-      );
-      return;
-    }
-    toolSelect.value = available[0].tool;
-    submitButton.disabled = false;
-    hideNote();
-    renderPolicy();
-  }
+    const card = h("details", { class: "grant-item", open: expanded }, summary, form);
+    let confirmClear = false;
+    let saving = false;
 
-  sourceSelect.addEventListener("change", () => {
-    const source = selectedSource();
-    const entry = source ? availability.get(source.id) : null;
-    if (entry && entry.status === "error") availability.delete(source.id);
-    renderTools();
-  });
-  toolSelect.addEventListener("change", renderPolicy);
-  renderTools();
-  const form = h(
-    "form",
-    {
-      class: "modal-form",
-      onSubmit: async (event) => {
-        event.preventDefault();
-        addError.classList.add("hidden");
-        if (sources.length === 0) {
-          addError.textContent = "请先创建处于启用状态的数据源";
-          addError.classList.remove("hidden");
-          return;
-        }
-        const source = selectedSource();
-        const tool = toolSelect.value;
-        const entry = source ? availability.get(source.id) : null;
-        const option =
-          entry && entry.status === "ready"
-            ? entry.options.find((item) => item.usable && item.tool === tool)
-            : null;
-        if (!source || !tool || !option) {
-          addError.textContent = "该数据源还没有可用的工具路由，请先到数据源页配置。";
-          addError.classList.remove("hidden");
-          return;
-        }
+    function selection() {
+      return rows.filter(({ check }) => check.checked).map(({ tool, policy }) => ({ tool, policy: policy() }));
+    }
+
+    function update() {
+      const desired = selection();
+      const locked = busy || mustRead;
+      for (const row of rows) row.update(locked);
+      save.disabled = locked || sameGrants(expected, desired);
+      discard.disabled = locked;
+      save.textContent = saving ? "保存中…" : confirmClear ? "确认清空并保存" : "保存此数据源";
+      warning.hidden = expected.length === 0 || desired.length !== 0;
+      warning.textContent = warning.hidden ? "" : `保存后将撤销此令牌在 ${id} 的最后一项授权，Agent 将无法再访问该数据源。`;
+    }
+
+    form.addEventListener("change", () => { confirmClear = false; update(); });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      if (save.disabled || busy || mustRead) return;
+      const desired = selection();
+      if (expected.length && !desired.length && !confirmClear) {
+        confirmClear = true;
+        update();
+        return;
+      }
+      busy = saving = true;
+      refreshControls();
+      setNotice("");
+      try {
+        let updated;
         try {
-          await api(`/admin/api/tokens/${encodeURIComponent(token.id)}/grants`, {
-            method: "POST",
-            body: {
-              source_id: source.id,
-              tool,
-              policy:
-                option.route.min_approval_policy === "approval" || tightenInput.checked
-                  ? "approval"
-                  : "direct",
-            },
-          });
-          showToast("已添加授权");
-          closeModal();
-          await openGrantsModal(token);
+          updated = checkedGrants(await api(`${path}/sources/${encodeURIComponent(id)}/grants`, {
+            method: "PUT", body: { expected, grants: desired },
+          }), id);
         } catch (error) {
-          addError.textContent = errorMessage(error);
-          addError.classList.remove("hidden");
+          if (!dialog.isConnected) return;
+          if (error.status === 409 || !error.status || error.status >= 500) {
+            recovery = { id, desired, conflict: error.status === 409 };
+            await readState(recovery);
+          } else {
+            setNotice(errorMessage(error), true);
+            notice.focus();
+          }
+          return;
         }
-      },
-    },
-    h(
-      "div",
-      { class: "modal-body" },
-      h(
-        "div",
-        { class: "alert" },
-        "授权表示「令牌 + 数据源 + 工具」的允许关系。每条授权精确绑定一个数据源和一个工具：查询权限不隐含写入，写入权限不隐含查询。生产数据源不能授予写入或结构变更。",
-      ),
-      grants.length === 0
-        ? h("div", { class: "alert" }, "该令牌还没有授权，agent 只能看到 list_sources。")
-        : h(
-            "div",
-            { class: "grant-list" },
-            grants.map((grant) =>
-              h(
-                "div",
-                { class: "grant-item" },
-                h(
-                  "div",
-                  { class: "grant-main" },
-                  h("span", { class: "badge badge-sm badge-soft tool-badge" }, grant.source_id),
-                  h("span", { class: "badge badge-sm badge-soft tool-badge" }, grant.tool),
-                  h(
-                    "span",
-                    { class: `badge badge-sm badge-soft policy-${grant.policy}` },
-                    policyLabel(grant.policy),
-                  ),
-                ),
-                h(
-                  "button",
-                  {
-                    class: "btn btn-circle btn-ghost btn-sm btn-error",
-                    type: "button",
-                    title: "移除授权",
-                    "aria-label": `移除 ${grant.source_id}/${grant.tool}`,
-                    onClick: async () => {
-                      try {
-                        const params = new URLSearchParams({
-                          source: grant.source_id,
-                          tool: grant.tool,
-                        });
-                        await api(
-                          `/admin/api/tokens/${encodeURIComponent(token.id)}/grants?${params.toString()}`,
-                          { method: "DELETE" },
-                        );
-                        showToast("已移除授权");
-                        closeModal();
-                        await openGrantsModal(token);
-                      } catch (error) {
-                        showToast(errorMessage(error), "error");
-                      }
-                    },
-                  },
-                  icon("trash", 16),
-                ),
-              ),
-            ),
-          ),
-      h(
-        "div",
-        { class: "detail-section" },
-        h("div", { class: "detail-block-title" }, "添加授权"),
-        sources.length === 0
-          ? h("div", { class: "alert alert-warning" }, "没有启用中的数据源。")
-          : h(
-              "div",
-              { class: "perm-row perm-row-two" },
-              h(
-                "div",
-                { class: "field" },
-                h("label", { class: "field-label" }, "数据源"),
-                sourceSelect,
-              ),
-              h(
-                "div",
-                { class: "field" },
-                h("label", { class: "field-label" }, "工具"),
-                toolSelect,
-              ),
-            ),
-        policyHint,
-        tightenLabel,
-        h(
-          "div",
-          { class: "field-hint" },
-          "工具还需要该数据源上存在用途匹配的工具路由才能被调用。list_sources 是所有有效令牌的基础发现工具，无需授权。",
-        ),
-        availabilityNote,
-        addError,
-      ),
-    ),
-    h(
-      "div",
-      { class: "modal-foot" },
-      h("button", { class: "btn", type: "button", onClick: closeModal }, "关闭"),
-      submitButton,
-    ),
-  );
+        if (!dialog.isConnected) return;
+        grants = grants.filter((grant) => grant.source_id !== id).concat(updated);
+        updateList();
+        const message = updated.length ? "已保存该数据源的授权。" : "已移除该数据源的全部授权。";
+        setNotice(message);
+        if (updated.length) putEditor(id, true).focus();
+        else {
+          card.remove();
+          editors.delete(id);
+          notice.focus();
+        }
+        refreshPicker();
+        void syncList(message);
+      } finally {
+        busy = saving = false;
+        refreshControls();
+      }
+    });
 
-  openModal(
-    h(
-      "div",
-      { class: "dialog dialog-wide" },
-      h(
-        "div",
-        { class: "modal-head" },
-        h("h2", { class: "modal-title" }, "管理授权"),
-        h("p", { class: "modal-subtitle" }, `${token.agent} · ${shortId(token.id, 12)}`),
-      ),
-      form,
+    const previous = editors.get(id);
+    if (previous) previous.card.replaceWith(card);
+    else cards.append(card);
+    editors.set(id, { card, update });
+    update();
+    return summary;
+  }
+
+  picker.addEventListener("change", refreshControls);
+  addCard.addEventListener("click", () => {
+    if (addCard.disabled) return;
+    const summary = putEditor(picker.value, true);
+    refreshPicker();
+    summary.focus();
+  });
+  let recovery;
+  retry.addEventListener("click", async () => {
+    if (busy) return;
+    busy = true;
+    try { await readState(recovery); } finally { busy = false; refreshControls(); }
+  });
+  dialog.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !busy) {
+      close.click();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    if (busy) { event.preventDefault(); return; }
+    const controls = [...dialog.querySelectorAll("summary, input, select, button")]
+      .filter((node) => !node.disabled && node.getClientRects().length);
+    const first = controls[0];
+    const last = controls.at(-1);
+    if (first && (!controls.includes(document.activeElement) ||
+      (event.shiftKey ? document.activeElement === first : document.activeElement === last))) {
+      event.preventDefault();
+      (event.shiftKey ? last : first).focus();
+    }
+  });
+  content.append(
+    h("div", { class: "alert" }, "授权按令牌、数据源和工具分别生效；同名 Agent 的令牌互不影响。每张卡片独立保存。"),
+    notice, empty, cards,
+    h("div", { class: "field" },
+      h("label", { class: "field-label", for: "new-grant-source" }, "添加数据源授权"),
+      h("div", { class: "perm-row perm-row-two" }, picker, addCard),
+      h("p", { class: "field-hint" }, "选择数据源不会自动授权，请勾选所需工具后保存。"),
     ),
   );
-  if (sources.length === 0) sourceSelect.disabled = true;
+  empty.hidden = true;
+  picker.disabled = true;
+  openModal(dialog);
+  close.focus();
+  await readState();
+}
+
+function grantToolRow(tool, original, route) {
+  const minimum = route?.min_policy;
+  const available = minimum === "direct" || minimum === "approval";
+  const write = tool === "mutate_sql" || tool === "execute_ddl";
+  const editable = available && write && (minimum === "direct" || original === "direct");
+  const check = h("input", { class: "checkbox checkbox-sm", type: "checkbox", checked: !!original });
+  const select = editable ? h("select", { class: "select select-sm", "aria-label": `${tool} 的授权策略` },
+    h("option", { value: "direct" }, minimum === "approval" ? "保留原策略：直接执行" : policyLabel("direct")),
+    h("option", { value: "approval" }, policyLabel("approval")),
+  ) : null;
+  const fixed = original || minimum;
+  if (select) select.value = fixed;
+  const policy = () => select?.value || fixed;
+  const hint = h("p", { class: "field-hint grant-policy-hint" });
+  const element = h("div", { class: "grant-tool" },
+    h("label", { class: "check-row" }, check, TOOL_LABELS[tool]), select, hint,
+  );
+  function update(locked) {
+    check.disabled = locked || (!available && !original);
+    if (select) select.disabled = locked || !check.checked;
+    if (!available) {
+      hint.textContent = `${route?.reason || "数据源或工具路由不可用"}${original ? ` · 已存策略：${policyLabel(original)}（当前不可用）` : ""}`;
+      return;
+    }
+    const effective = minimum === "approval" || policy() === "approval" || tool === "create_database" ? "approval" : "direct";
+    const rule = write ? "；高危 SQL 始终由管理员审批" : tool === "create_database" ? "；建库始终由管理员审批" : "（只读固定）";
+    hint.textContent = `路由最低：${policyLabel(minimum)} · ${check.checked ? "有效策略" : "勾选后策略"}：${policyLabel(effective)}${rule}`;
+  }
+  return { tool, check, element, policy, update };
 }
 
 function openRevokeTokenModal(token) {

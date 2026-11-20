@@ -142,6 +142,20 @@ pub enum Tool {
 }
 
 impl Tool {
+    pub(crate) const SOURCE_TOOLS: [Self; 7] = [
+        Self::ListTables,
+        Self::DescribeTable,
+        Self::ExplainQuery,
+        Self::QuerySql,
+        Self::MutateSql,
+        Self::ExecuteDdl,
+        Self::CreateDatabase,
+    ];
+
+    pub(crate) fn supported_by(self, driver: Driver) -> bool {
+        self != Self::CreateDatabase || driver == Driver::Postgres
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ListSources => "list_sources",

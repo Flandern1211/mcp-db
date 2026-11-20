@@ -158,18 +158,25 @@ impl McpDbServer {
         source: Option<&str>,
         tool: Tool,
     ) -> std::result::Result<AuthorizedCall, CallToolResult> {
-        let store = match self.state.store.lock() {
-            Ok(store) => store,
-            Err(_) => {
-                return Err(CallToolResult::structured_error(json!({
-                    "code": "STATE_UNAVAILABLE",
-                    "message": "state store lock poisoned",
-                })))
-            }
-        };
+        let store = self.state.store.lock().map_err(|_| state_unavailable())?;
         Authorizer::new(&store)
             .authorize(&identity.token_id, source, tool)
             .map_err(tool_error)
+    }
+
+    fn authorize_write(
+        &self,
+        identity: &TokenIdentity,
+        source: Option<&str>,
+        tool: Tool,
+    ) -> std::result::Result<(AuthorizedCall, i64), CallToolResult> {
+        let store = self.state.store.lock().map_err(|_| state_unavailable())?;
+        // The marker must precede authorization even if a separate CLI connection is writing.
+        let marker = store.audit_marker().map_err(tool_error)?;
+        let call = Authorizer::new(&store)
+            .authorize(&identity.token_id, source, tool)
+            .map_err(tool_error)?;
+        Ok((call, marker))
     }
 
     fn build_approval_draft(
@@ -203,6 +210,7 @@ impl McpDbServer {
         status: ApprovalStatus,
         now: i64,
         decided_by: Option<&str>,
+        marker: i64,
     ) -> std::result::Result<ApprovalRecord, CallToolResult> {
         let expires_at = if status == ApprovalStatus::Pending {
             now + self.state.approval_timeout_ms
@@ -224,7 +232,9 @@ impl McpDbServer {
             Ok(store) => store,
             Err(_) => return Err(state_unavailable()),
         };
-        store.insert_approval_request(&request).map_err(tool_error)
+        store
+            .insert_current_approval_request(&request, marker)
+            .map_err(tool_error)
     }
 
     async fn execute_claimed(
@@ -332,6 +342,7 @@ impl McpDbServer {
         validated: ValidatedSql,
         params: Vec<Value>,
         approval_id: Option<i64>,
+        marker: i64,
     ) -> Result<CallToolResult, McpError> {
         let draft = self.build_approval_draft(&call, &validated, &params);
         let now = now_ms();
@@ -351,6 +362,10 @@ impl McpDbServer {
         }
 
         if call.policy == ApprovalPolicy::Direct && !validated.high_risk {
+            let current = self.lock_store()?.recheck_execution_draft(&draft, marker);
+            if let Err(error) = current {
+                return Ok(tool_error(error));
+            }
             let result = tokio::select! {
                 biased;
                 _ = context.ct.cancelled() => Err(Error::ExecutionUnknown),
@@ -421,6 +436,7 @@ impl McpDbServer {
                         ApprovalStatus::Approved,
                         now,
                         Some("mcp-client"),
+                        marker,
                     ) {
                         Ok(record) => record,
                         Err(result) => return Ok(result),
@@ -434,6 +450,7 @@ impl McpDbServer {
                         ApprovalStatus::Denied,
                         now,
                         Some("mcp-client"),
+                        marker,
                     );
                     return Ok(CallToolResult::structured_error(json!({
                         "code": "APPROVAL_DENIED",
@@ -457,6 +474,7 @@ impl McpDbServer {
                 ApprovalStatus::Pending,
                 now,
                 None,
+                marker,
             ) {
                 Ok(record) => record,
                 Err(result) => return Ok(result),
@@ -832,17 +850,25 @@ impl McpDbServer {
         Parameters(args): Parameters<SqlArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = request_identity(&context)?;
-        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::MutateSql) {
-            Ok(call) => call,
-            Err(result) => return Ok(result),
-        };
+        let (call, marker) =
+            match self.authorize_write(&identity, args.source.as_deref(), Tool::MutateSql) {
+                Ok(call) => call,
+                Err(result) => return Ok(result),
+            };
         let validated =
             match validate_for_driver_tool(&args.sql, Tool::MutateSql, call.source.driver) {
                 Ok(validated) => validated,
                 Err(error) => return Ok(tool_error(error)),
             };
-        self.execute_write(&context, call, validated, args.params, args.approval_id)
-            .await
+        self.execute_write(
+            &context,
+            call,
+            validated,
+            args.params,
+            args.approval_id,
+            marker,
+        )
+        .await
     }
 
     #[tool(description = "Execute one database-local DDL statement.")]
@@ -852,17 +878,25 @@ impl McpDbServer {
         Parameters(args): Parameters<SqlArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = request_identity(&context)?;
-        let call = match self.authorize_call(&identity, args.source.as_deref(), Tool::ExecuteDdl) {
-            Ok(call) => call,
-            Err(result) => return Ok(result),
-        };
+        let (call, marker) =
+            match self.authorize_write(&identity, args.source.as_deref(), Tool::ExecuteDdl) {
+                Ok(call) => call,
+                Err(result) => return Ok(result),
+            };
         let validated =
             match validate_for_driver_tool(&args.sql, Tool::ExecuteDdl, call.source.driver) {
                 Ok(validated) => validated,
                 Err(error) => return Ok(tool_error(error)),
             };
-        self.execute_write(&context, call, validated, args.params, args.approval_id)
-            .await
+        self.execute_write(
+            &context,
+            call,
+            validated,
+            args.params,
+            args.approval_id,
+            marker,
+        )
+        .await
     }
 
     #[tool(description = "Request creation of a new database; always requires admin approval.")]
@@ -872,8 +906,8 @@ impl McpDbServer {
         Parameters(args): Parameters<CreateDatabaseArgs>,
     ) -> Result<CallToolResult, McpError> {
         let identity = request_identity(&context)?;
-        let call =
-            match self.authorize_call(&identity, args.source.as_deref(), Tool::CreateDatabase) {
+        let (call, marker) =
+            match self.authorize_write(&identity, args.source.as_deref(), Tool::CreateDatabase) {
                 Ok(call) => call,
                 Err(result) => return Ok(result),
             };
@@ -920,6 +954,7 @@ impl McpDbServer {
             ApprovalStatus::Pending,
             now_ms(),
             None,
+            marker,
         ) {
             Ok(record) => record,
             Err(result) => return Ok(result),
@@ -1135,6 +1170,9 @@ fn store_error(error: Error) -> McpError {
 }
 
 fn tool_error(error: Error) -> CallToolResult {
+    if let Error::ApprovalStale(reason) = error {
+        return claim_error(ClaimOutcome::Stale(reason.to_string()));
+    }
     let code = match error {
         Error::SourceRequired => "SOURCE_REQUIRED",
         Error::SourceNotGranted(_) => "SOURCE_NOT_GRANTED",

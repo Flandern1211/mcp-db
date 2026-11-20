@@ -23,6 +23,7 @@ pub enum Error {
     SqlRejected(String),
     NotFound(String),
     Conflict(String),
+    ApprovalStale(&'static str),
     Database(rusqlite::Error),
 }
 
@@ -62,6 +63,9 @@ impl fmt::Display for Error {
             Self::SqlRejected(reason) => write!(f, "SQL rejected: {reason}"),
             Self::NotFound(what) => write!(f, "not found: {what}"),
             Self::Conflict(message) => write!(f, "conflict: {message}"),
+            Self::ApprovalStale(reason) => {
+                write!(f, "authorization changed before execution: {reason}")
+            }
             Self::Database(error) => write!(f, "state database error: {error}"),
         }
     }
