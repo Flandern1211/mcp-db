@@ -294,10 +294,10 @@ async fn login(
     let now = now_ms();
     let Some(challenge) = header_text(&headers, header::HeaderName::from_static(CSRF_HEADER))
     else {
-        return error_response(StatusCode::FORBIDDEN, "missing login page CSRF challenge");
+        return error_response(StatusCode::FORBIDDEN, "登录页面已过期，请刷新页面后重试。");
     };
     if !state.login_challenge_valid(challenge, now) {
-        return error_response(StatusCode::FORBIDDEN, "invalid login page CSRF challenge");
+        return error_response(StatusCode::FORBIDDEN, "登录页面已过期，请刷新页面后重试。");
     }
     let auth_reason = match state.store.lock() {
         Ok(store) => {
@@ -393,7 +393,7 @@ async fn session_info(State(state): State<AdminState>, headers: HeaderMap) -> Re
 
 async fn overview(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     let result = store_call(&state, |store| {
         let sources = store.list_all_sources()?;
@@ -433,7 +433,7 @@ async fn overview(State(state): State<AdminState>, headers: HeaderMap) -> Respon
 
 async fn list_sources(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     match store_call(&state, |store| {
         let sources = store.list_all_sources()?;
@@ -454,7 +454,7 @@ async fn source_detail(
     headers: HeaderMap,
 ) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     match store_call(&state, |store| source_detail_json(store, &id)) {
         Ok(value) => json_response(StatusCode::OK, value),
@@ -805,7 +805,7 @@ async fn test_connection(
     Json(body): Json<TestConnectionBody>,
 ) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     let dsn = body.dsn.trim();
     if dsn.is_empty() {
@@ -820,7 +820,7 @@ async fn test_profile(
     headers: HeaderMap,
 ) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     let credential_ref = match store_call(&state, |store| {
         let profile = store.get_profile(profile_id)?;
@@ -998,7 +998,7 @@ async fn delete_route(
 
 async fn list_tokens(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     match store_call(&state, |store| {
         let tokens = store.list_tokens()?;
@@ -1078,7 +1078,7 @@ async fn list_grants(
     headers: HeaderMap,
 ) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     match store_call(&state, |store| {
         store.get_token_identity(&id)?;
@@ -1182,7 +1182,7 @@ async fn remove_grant(
 
 async fn list_approvals(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     match store_call(&state, |store| {
         let approvals = store.list_pending_approvals(200)?;
@@ -1232,13 +1232,17 @@ fn decide(state: &AdminState, headers: &HeaderMap, id: i64, approve: bool) -> Re
         Ok(DecisionOutcome::Denied) => {
             json_response(StatusCode::OK, json!({ "id": id, "status": "denied" }))
         }
-        Ok(DecisionOutcome::AlreadyDecided) => {
-            error_response(StatusCode::CONFLICT, "approval was already decided")
+        Ok(DecisionOutcome::AlreadyDecided) => error_response(
+            StatusCode::CONFLICT,
+            "这个审批已经被处理过了，请刷新后查看结果。",
+        ),
+        Ok(DecisionOutcome::Expired) => {
+            error_response(StatusCode::CONFLICT, "这个审批已过期，请重新发起。")
         }
-        Ok(DecisionOutcome::Expired) => error_response(StatusCode::CONFLICT, "approval expired"),
-        Ok(DecisionOutcome::NotFound) => {
-            error_response(StatusCode::NOT_FOUND, "approval not found")
-        }
+        Ok(DecisionOutcome::NotFound) => error_response(
+            StatusCode::NOT_FOUND,
+            "没有找到这个审批，可能已被处理或删除。",
+        ),
         Err(response) => *response,
     }
 }
@@ -1258,7 +1262,7 @@ async fn audit(
     Query(query): Query<AuditQuery>,
 ) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     let limit = query.limit.unwrap_or(50).clamp(1, 200) as usize;
     let offset = query.offset.unwrap_or(0).max(0) as usize;
@@ -1296,7 +1300,7 @@ async fn list_reservations(
     Query(query): Query<ReservationQuery>,
 ) -> Response {
     let Some(_) = read_guard(&state, &headers) else {
-        return error_response(StatusCode::UNAUTHORIZED, "admin session is required");
+        return error_response(StatusCode::UNAUTHORIZED, "请先登录管理台，再执行这个操作。");
     };
     let quarantined_only = query.status.as_deref() == Some("quarantined");
     match store_call(&state, |store| {
@@ -1356,7 +1360,7 @@ fn settle(state: &AdminState, headers: &HeaderMap, id: i64, target: ReservationS
 }
 
 async fn fallback() -> Response {
-    error_response(StatusCode::NOT_FOUND, "not found")
+    error_response(StatusCode::NOT_FOUND, "没有找到对应的页面。")
 }
 
 fn read_guard(state: &AdminState, headers: &HeaderMap) -> Option<(String, AdminSession)> {
@@ -1370,7 +1374,7 @@ fn write_guard(
     let Some((session_id, session)) = session(state, headers, now_ms()) else {
         return Err(reject(
             StatusCode::UNAUTHORIZED,
-            "admin session is required",
+            "请先登录管理台，再执行这个操作。",
         ));
     };
     let Some(csrf) = header_text(headers, header::HeaderName::from_static(CSRF_HEADER)) else {
@@ -1742,29 +1746,116 @@ fn clear_cookie_header(name: &str) -> HeaderValue {
 
 fn map_store_error(error: Error) -> Response {
     match error {
-        Error::NotFound(message) => {
-            error_response(StatusCode::NOT_FOUND, &format!("not found: {message}"))
-        }
+        Error::NotFound(_) => error_response(
+            StatusCode::NOT_FOUND,
+            "没有找到对应的数据，可能已被删除，请刷新页面后重试。",
+        ),
         Error::Conflict(message) => {
-            error_response(StatusCode::CONFLICT, &format!("conflict: {message}"))
+            error_response(StatusCode::CONFLICT, &humanize_conflict(&message))
         }
-        Error::InvalidInput(message) => error_response(
-            StatusCode::BAD_REQUEST,
-            &format!("invalid input: {message}"),
-        ),
-        Error::TokenRevoked => error_response(StatusCode::CONFLICT, "token is revoked"),
-        Error::Unauthenticated => error_response(
-            StatusCode::UNAUTHORIZED,
-            "login token is invalid, expired or already used",
-        ),
-        Error::ResourceLimit(message) => {
-            error_response(StatusCode::CONFLICT, &format!("resource limit: {message}"))
+        Error::InvalidInput(message) => {
+            error_response(StatusCode::BAD_REQUEST, &humanize_input(&message))
         }
+        Error::TokenRevoked => {
+            error_response(StatusCode::CONFLICT, "该令牌已被撤销，无法继续操作。")
+        }
+        Error::Unauthenticated => {
+            error_response(StatusCode::UNAUTHORIZED, "登录已失效，请重新登录。")
+        }
+        Error::ResourceLimit(message) => error_response(
+            StatusCode::CONFLICT,
+            &format!("已达到资源限制：{}", humanize_conflict(&message)),
+        ),
         Error::ProvisionBlocked(message) => error_response(
             StatusCode::CONFLICT,
-            &format!("provisioning blocked: {message}"),
+            &format!("建库操作没有完成：{}", humanize_conflict(&message)),
         ),
-        other => error_response(StatusCode::INTERNAL_SERVER_ERROR, &other.to_string()),
+        _ => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "服务暂时无法完成这个操作，请稍后重试；如果持续失败，请查看服务日志。",
+        ),
+    }
+}
+
+fn has_chinese(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+}
+
+fn humanize_conflict(message: &str) -> String {
+    if has_chinese(message) {
+        return message.to_string();
+    }
+    match message {
+        "constraint violation" => {
+            "这次修改与已有数据冲突。可能是名称重复，或这条记录刚刚被其他操作改过，请刷新后重试。"
+                .to_string()
+        }
+        "source is not active" => "这个数据源已归档或停用，当前操作不可用。".to_string(),
+        "source is not archived" => "只有已归档的数据源才能执行这个操作。".to_string(),
+        "source environment can only change while archived" => {
+            "只有归档状态的数据源才能修改环境类型。".to_string()
+        }
+        "archived source has no enabled profile" => {
+            "这个数据源还没有启用的连接配置，请先启用一个再恢复。".to_string()
+        }
+        "reservation is not reserved" | "reservation is not in a settleable state" => {
+            "这条建库预留已经处理过或状态已变化，请刷新后查看。".to_string()
+        }
+        "database name is already reserved" => {
+            "这个数据库名已经被预留，请换一个名字或等待预留释放。".to_string()
+        }
+        "reservation was settled concurrently" => {
+            "这条建库预留刚刚被其他操作处理过，请刷新后查看。".to_string()
+        }
+        "approval belongs to another token" => {
+            "这个审批不属于当前令牌，无法在这里处理。".to_string()
+        }
+        "token is revoked" => "该令牌已被撤销，无法继续操作。".to_string(),
+        _ => "当前数据状态不允许这个操作，请刷新页面后重试。".to_string(),
+    }
+}
+
+fn humanize_input(message: &str) -> String {
+    if has_chinese(message) {
+        return message.to_string();
+    }
+    if message.contains("must not be empty") {
+        return "名称不能为空。".to_string();
+    }
+    if message.contains("must start with a lowercase ASCII letter") {
+        return "名称必须以小写字母开头。".to_string();
+    }
+    if message.contains("may contain only lowercase letters, digits") {
+        return "名称只能包含小写字母、数字、下划线和连字符。".to_string();
+    }
+    if message.contains("must be ") && message.contains(" characters") {
+        return "名称长度不符合要求，请检查后重试。".to_string();
+    }
+    if message.contains("credential_ref") {
+        return "凭证引用无效，请重新填写数据库连接串。".to_string();
+    }
+    match message {
+        "cannot grant access to an archived source" => "已归档的数据源不能添加授权。".to_string(),
+        "list_sources is available to every authenticated token" => {
+            "list_sources 是所有有效令牌自带的基础工具，不需要单独授权。".to_string()
+        }
+        "production sources cannot grant write tools" => {
+            "生产数据源不能授予写入或结构变更权限。".to_string()
+        }
+        "archived source has no enabled profile" => {
+            "这个数据源还没有启用的连接配置，请先启用一个再恢复。".to_string()
+        }
+        "archived source has no grants to restore" => {
+            "这个数据源还没有任何授权，恢复前请先添加授权。".to_string()
+        }
+        "cannot add profile to an archived source" => {
+            "已归档的数据源不能新增连接配置，请先恢复数据源。".to_string()
+        }
+        "reservation does not match the database name" => {
+            "预留记录与数据库名不匹配，请重新发起建库。".to_string()
+        }
+        _ => "填写内容不符合要求，请检查后重试。".to_string(),
     }
 }
 

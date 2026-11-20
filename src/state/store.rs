@@ -883,6 +883,14 @@ impl Store {
             ));
         }
         crate::postgres::validate_limits(profile.max_connections, profile.statement_timeout_ms)?;
+        let duplicate: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM connection_profiles WHERE source_id = ? AND name = ?",
+            params![profile.source_id, profile.name],
+            |row| row.get(0),
+        )?;
+        if duplicate > 0 {
+            return Err(Error::Conflict("该数据源已存在同名连接配置。".to_string()));
+        }
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO connection_profiles
@@ -1090,6 +1098,11 @@ impl Store {
             )));
         }
         validate_route_policy(route.tool, route.min_approval_policy)?;
+        if self.get_route(&route.source_id, route.tool).is_ok() {
+            return Err(Error::Conflict(
+                "这个数据源已经为该工具配置了工具路由。".to_string(),
+            ));
+        }
         let now = now_ms();
         self.conn.execute(
             "INSERT INTO source_tool_routes
@@ -1299,6 +1312,18 @@ impl Store {
         }
         let policy = grant.policy.unwrap_or_else(|| default_policy(grant.tool));
         validate_grant_policy(grant.tool, policy)?;
+        let exists: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tool_grants
+              WHERE token_id = ? AND source_id = ? AND tool = ?",
+            params![grant.token_id, grant.source_id, grant.tool.as_str()],
+            |row| row.get(0),
+        )?;
+        if exists > 0 {
+            return Err(Error::Conflict(
+                "该令牌已经拥有这个数据源与工具的授权，请直接调整已有授权，或先移除再重新添加。"
+                    .to_string(),
+            ));
+        }
         self.conn.execute(
             "INSERT INTO tool_grants (token_id, source_id, tool, policy, created_at)
              VALUES (?, ?, ?, ?, ?)",

@@ -1269,26 +1269,39 @@ async function openGrantsModal(token) {
       return;
     }
     const usable = entry.options.filter((option) => option.usable);
+    const granted = new Set(
+      grants
+        .filter((grant) => grant.source_id === source.id)
+        .map((grant) => grant.tool),
+    );
     toolSelect.replaceChildren(
       ...entry.options.map((option) =>
         h(
           "option",
-          { value: option.tool, disabled: !option.usable },
-          option.usable
-            ? TOOL_LABELS[option.tool]
-            : `${TOOL_LABELS[option.tool]}${option.reason}`,
+          { value: option.tool, disabled: !option.usable || granted.has(option.tool) },
+          granted.has(option.tool)
+            ? `${TOOL_LABELS[option.tool]}（已授权）`
+            : option.usable
+              ? TOOL_LABELS[option.tool]
+              : `${TOOL_LABELS[option.tool]}${option.reason}`,
         ),
       ),
     );
-    toolSelect.disabled = usable.length === 0;
-    if (usable.length === 0) {
+    const available = usable.filter((option) => !granted.has(option.tool));
+    toolSelect.disabled = available.length === 0;
+    if (available.length === 0) {
       submitButton.disabled = true;
       policyHint.textContent = "";
       tightenLabel.classList.add("hidden");
-      showNote("该数据源还没有可用的工具路由，请先到数据源页配置。", "field-hint");
+      showNote(
+        usable.length === 0
+          ? "该数据源还没有可用的工具路由，请先到数据源页配置。"
+          : "这个数据源上所有可用的工具都已经授权了。",
+        "field-hint",
+      );
       return;
     }
-    toolSelect.value = usable[0].tool;
+    toolSelect.value = available[0].tool;
     submitButton.disabled = false;
     hideNote();
     renderPolicy();

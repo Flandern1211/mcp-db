@@ -960,7 +960,7 @@ async fn source_profile_route_and_environment_apis() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "restore needs a grant");
-    assert!(body["error"].as_str().unwrap_or_default().contains("grant"));
+    assert!(body["error"].as_str().unwrap_or_default().contains("授权"));
 }
 
 #[tokio::test]
