@@ -1,6 +1,6 @@
 # T-17 按数据源管理令牌授权
 
-- 状态：🟡 待验收；完整档（管理写入、权限、跨模块及管理 API）。依赖 T-13、T-16 已集成代码。未关闭项：1 非阻塞。
+- 状态：🟢 已完成；完整档（管理写入、权限、跨模块及管理 API）。依赖 T-13、T-16 已集成代码。未关闭项：0。
 - 起点 `3d4e3d1`（`develop`）；合并目标 `develop`；分支 `feat/zcode/t-17-source-grants`。
 - UI 基线：用户在 2026-11-20 提供两张 Nexus 截图、批准「只改令牌页和弹窗、保留 Nexus 样式」的方案。隔离启动 `MSYS_NO_PATHCONV=1 docker run -d --name mcpdb-t17-baseline --tmpfs /data:uid=10001,gid=10001,mode=0700 -p 127.0.0.1:29787:8787 -p 127.0.0.1:29788:8788 mcp-db:t13-nexus1`，用 CLI 准备两源三授权，IAB 实际登录回环管理页并打开访问令牌；镜像不宣称与源码起点完全一致。基线判定：旧列表 `qa-nonprod` 随工具出现两次，旧弹窗按单条 grant 展开；新版同源只出现在一张卡片和一个列表标签，截图中其余风格保持。基线截图：`.plan/evidence/baseline-token-list.png`、`.plan/evidence/baseline-grants-modal.png`（本地忽略目录）。
 
@@ -48,6 +48,20 @@ MSYS_NO_PATHCONV=1 docker run -d --name mcpdb-t17-t18-preview --user 10001:10001
 - 联合快照执行 `bash scripts/verify.sh fast`：锁定 Rust 1.89 的 Docker 入口；fmt、clippy、139 项常规测试通过，11 项真实外部集成测试按默认门禁忽略。`node --check src/transport/admin_assets/app.js` 与两工作区 `git diff --check` 通过。日志位置见 `.plan/T-17.md`。静态安全复核独立于实现；不替代界面验收。
 - 集成提交与状态见 [`TASK.md`](../TASK.md)。本地合并不代替界面验收。
 
+### 2026-11-22 独立 Ego Lite 验收
+
+- 验收人：非原实现者的会话。环境：Windows Ego Lite 0.6.3.17（`ego-browser` 2.2.1），从 `51cfc25` 同镜像启动的隔离真实 HTTP 服务、空 tmpfs、虚构令牌和源、不接外部数据库。启动命令和输出见本地 `.plan/ego-t13-t18-20261122/README.md` 与 `t17-*.json`。
+- **已有授权通过**：同名令牌分开计，四条夹具授权只形成三张源卡片与三个列表标签；390px 下页面和弹窗无横向溢出，Enter / Tab / Space 可操作卡片和工具。一次保存同源取消工具、添加工具、修改策略，只发一个 `PUT`，HTTP 200，重读完全一致；不串源或同名令牌。停用连接配置后，已有不可用授权仍可取消，未授权工具不可新增；生产源普通写入及 DDL 禁用。
+- **清空联动通过**：第一次操作只出现确认、零写入；确认后仅一个空集合 `PUT`（200），对应卡片及列表标签消失；同一 MCP 会话 `list_sources` 不再返回该源，同一工具调用返回 `TOOL_NOT_GRANTED`，其它源仍存在。原自动化中的审批失效等分支本轮没有重新执行；未触发外部写入。
+- **新增源失败（已修复）**：服务端返回 4 个启用源，未授权令牌下拉框只有占位项，选择按钮禁用，0 个授权 `PUT`。根因依据：Ego Lite 读取 `<select>` 时发现子节点是 `[object HTMLOptionElement]` 文本而非选项 → `src/transport/admin_assets/app.js:1203–1206` 将 `choices.map(...)` 返回的数组整体传给原生 `replaceChildren`，原生按 DOM IDL 把非 Node 参数字符串化 → 应逐个传入 `<option>`。
+
+### 2026-11-22 修复与复验
+
+- 修复：`src/transport/admin_assets/app.js:1205` 改为 `...choices.map(...)`，其余 12 处 `replaceChildren` 调用未动；新增 `tests/admin_grants_picker.test.cjs`，夹具按 DOM IDL 把非 Node 参数转成文本节点、`options` 只返回 option 子节点、`select.value` 由 option 的 `selected` 推导，`node --test` 4/4 通过（含「设置选中值后按钮可用、点击生成卡片且无写请求」的正向用例）；把 `value` 访问器改成恒 `undefined` 后该用例失败，确认断言不恒真。既有 `tests/admin_token_copy.test.cjs` 12/12 无回归。
+- 复验环境：`bash scripts/verify.sh full` 通过后构建的 `mcp-db:dev`（`883f5321d065`），同名隔离容器、空 tmpfs、回环端口 30787/30788，CLI 准备 `qa-a`（非生产，路由 list_tables/describe_table）、`qa-b`（生产，路由 list_tables）、`qa-c`（非生产，无路由）。验收人：本次独立会话（非实现者）。
+- 结果：界面签发的零授权令牌打开「管理授权」后，下拉框为占位项 + 3 个启用源，无游离文本节点；选源零写入、焦点到卡片；qa-a 勾两个工具一次 `PUT`（`expected` 为空、`grants` 2 项）返回 200；生产 qa-b 的 `mutate_sql`/`execute_ddl` 置灰并提示「生产数据源禁止普通写入和结构变更」；390px 下 document/dialog 均无横向溢出；Enter 折叠、Tab 到首个复选框；清空首击仅「确认清空并保存」零写入，第二击一个空集合 `PUT` 200。同一 MCP 会话 `list_sources`：空 → `qa-a` → `qa-a,qa-b` → `qa-b`，撤权后 `list_tables` 返回 `TOOL_NOT_GRANTED`，三次管理写请求恰为 3 个 `PUT`。
+- 证据：本地 `.plan/ego-t13-t18-20261122/` 的 `t17-fixed-picker.json`、`t17-fixed-flow.json`、`round-03-add-grants.mjs`。外部写调用数：0（仅隔离状态库）。
+
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未验收 | 数据源分组、保存/撤销联动、键盘和窄屏（验收 1、2 的界面部分及 4） | 内置浏览器打开本地登录页后，点击及键盘提交未进入管理台；同实例独立 HTTP 登录与 MCP 验证成功，未认定为产品登录缺陷。 | 范围：管理台权限编辑界面；对象：管理员；后果：无法独立确认布局、交互及点击只发一次保存请求。 | 由用户在本机浏览器进入预览的「访问令牌 → 管理授权」，检查同名令牌隔离、源去重、单次请求、清空联动、Tab 和窄屏；按验收例子通过并留证后关闭。 | 否 |
+| 🔴 无 | — | — | — | — | — |

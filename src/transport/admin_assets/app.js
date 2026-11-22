@@ -1202,7 +1202,7 @@ async function openGrantsModal(token) {
     const choices = sources.filter((source) => source.status === "active" && !editors.has(source.id));
     picker.replaceChildren(
       h("option", { value: "" }, choices.length ? "请选择未授权的数据源" : "没有其他启用中的未授权数据源"),
-      choices.map((source) => h("option", { value: source.id }, sourceLabel(source))),
+      ...choices.map((source) => h("option", { value: source.id }, sourceLabel(source))),
     );
     empty.hidden = grants.length !== 0;
     refreshControls();
