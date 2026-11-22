@@ -3,8 +3,8 @@
 | 项目 | 内容 |
 | --- | --- |
 | 档位 | 完整：治理规则、工程入口与跨任务流程变更 |
-| 状态 | 🟡 待验收 |
-| 验收人 | 待用户复核（实现者未自签） |
+| 状态 | 🟢 已完成 |
+| 验收人 | 独立验收会话（2026-11-22；未编写本次脚本修复），按用户要求复验通过后回填 |
 | 依赖 | T-14（统一入口与收口检查） |
 | AC | 流程基线：UI 基线、诊断顺序、资源预算、文件归属、声明证据、删除授权 |
 | 基线 | `develop`（T-14 合并后） |
@@ -80,14 +80,23 @@
 | 预检集成 | 6 | `bash scripts/verify.sh fast` | 同上，Rust 1.89 容器 | 通过；`OK fast (423s)`，退出 0；fmt/clippy/test 全部通过 | — |
 | 规则一致性 | 1～4 | 核对 `AGENTS.md`、`project-conventions.md` 编号与交叉引用 | 仓库 | 通过；UI 基线见 §3.1，删除授权见 §4.6，文件归属见 §5.4，声明证据见 §9.11，诊断/资源见 §2.1/§2.2 | — |
 
+**2026-11-22 第一轮独立复核（Windows Git Bash + Docker Desktop）**：默认阈值通过，强制提高阈值则退出 1；发现旧提示写错了 `--prune` 的范围、`MCPDB_PRUNE_CONFIRM=1` 可跳过确认，以及只读报告在 75 秒内未完成 target 扫描。以上为修复前结果。
+
+**同日修复后独立复验**：
+
+- `--prune` 仅列出已创建未启动或已退出、名为 `mcpdb-*` 且有 `mcpdb.project=mcp-db` 标签的容器；列出完整 ID、Docker SIZE、影响和可恢复性。未标记的旧容器和其他项目标签默认排除。确认后按已列完整 ID 执行非强制删除，不带卷删除参数。`--prune-cache` 单独显示共享构建缓存的聚合占用与可回收量，清理范围限于 Docker 默认可清理缓存。
+- 两个入口均需输入本次清单生成的确认码；遗留环境变量不能绕过确认，确认码也不替代操作者取得明确授权。`bash tests/disk_guard.test.sh` 退出 0，191 项断言通过：无有效确认时不发删除调用；替身收到有效确认后，各只发对应的精确命令。未执行真实容器或缓存清理。
+- 真实只读报告在 35 秒内退出 0，主机、Docker 和工作区三节均返回，一个慢 target 被标注超时；用 `MCPDB_DU_TIMEOUT=120` 重跑后 5 个 target 均返回大小。`--check` 以 30.9 GiB 可用空间、5 GiB 默认阈值通过；强制提高阈值后，`scripts/verify.sh fast` 在执行 Rust 步骤前退出 1，提示准确区分两种清理。`--help` 不启动任何验证，仍可查看。真实 `scripts/verify.sh full` 退出 0（含 fast 的三个步骤）。
+- 本机私有证据：`.plan/ego-t13-t18-20261122/` 下的 `t15-disk-guard-final.log`、`t15-disk-report-after-fix.txt`、`t15-disk-report-long-budget.txt`、`t15-preflight-final.log`、`verify-full-final.log`。
+
 ## 6. 交付
 
-- 变更文件：`AGENTS.md`、`project-conventions.md`、`scripts/disk-guard.sh`、`scripts/verify.sh`、`TASK.md`、本文件。
-- 缺口：
+- 原变更文件：`AGENTS.md`、`project-conventions.md`、`scripts/disk-guard.sh`、`scripts/verify.sh`、`TASK.md`、本文件。本次修复涉及 `scripts/disk-guard.sh`、`tests/disk_guard.test.sh` 和验收记录；低空间预检与 T-14 的 `verify.sh` 联合复验。
+- 已依据第 5 节独立证据关闭规则措辞、报告超时与清理边界问题。验收通过不构成对任何真实删除的授权。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
-| 🔴 未验收 | 规则措辞与清理边界 | 实现者不能自签，待用户复核 | 只影响 T-15 完成判定；不影响产品代码与既有验收 | 用户确认规则或提出修改；确认后改为无缺口并标 🟢 | 否 |
+| 🔴 无 | — | — | — | — | — |
 
 - 回滚：还原上述文件即可；脚本无持久状态。
 
