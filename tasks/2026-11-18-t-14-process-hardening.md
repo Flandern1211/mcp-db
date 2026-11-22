@@ -4,7 +4,7 @@
 | --- | --- |
 | 档位 | 完整：治理规则、工程入口与跨任务流程变更 |
 | 状态 | 🟢 已完成 |
-| 验收人 | 主会话独立复跑（2026-11-18，未参与实现） |
+| 验收人 | 非原实现者独立复核与复验（2026-11-22，两轮）；原复跑：主会话（2026-11-18，未参与实现） |
 | 依赖 | 无（复盘对象为 T-02～T-13） |
 | AC | 流程基线：完成门禁、失败关闭、验收独立性、命令固化、收口检查 |
 | 基线 | `970521e` |
@@ -120,8 +120,11 @@
 
 ## 6. 交付
 
-- 提交与 `TASK.md`：`f30d9b4`、`f25869a`、`abb3e61`；🟢 已完成，未关闭项 0。
-- 验收复跑（2026-11-18）：`bash scripts/closeout.sh` → 0 FAIL、9 WARN（均为其他任务 worktree/容器，符合设计）；`bash scripts/verify.sh fast` → OK；`bash scripts/pgtest.sh` → 9 passed、容器已删除。已接受风险：无。
+- 实现提交见 `TASK.md`：`f30d9b4`、`f25869a`、`abb3e61`。已接受风险：无。
+- 历史验收复跑（2026-11-18）：`bash scripts/closeout.sh` → 0 FAIL、9 WARN；`bash scripts/verify.sh fast` → OK；`bash scripts/pgtest.sh` → 9 passed、容器已删除。这些成功命令不检验超时语义。
+- 2026-11-22 第一轮独立复核（Windows Git Bash + Docker Desktop）：5 个入口脚本逐一 `bash -n` 均通过；回填前 `GIT_OPTIONAL_LOCKS=0 bash scripts/closeout.sh` 退出 0，0 FAIL、10 WARN。发现 [`scripts/verify.sh`](../scripts/verify.sh) 只给整组计时，组内步骤只记耗时，后续 `docker build` 也没有超时，不符合 AC-2。
+- 同日修复：fmt、clippy、test、release build、`docker build` 各自使用 `MCPDB_STEP_TIMEOUT`（默认 900 秒）；容器整组仍有 `MCPDB_GROUP_TIMEOUT` 上限（默认 1800 秒，未设置时兼容 `MCPDB_TIMEOUT`）。0、显式空值和非法值在调用 Docker 前拒绝；`--help` 无需 Docker。失败时只查询并报告本次调用遗留的容器，不主动清理。
+- 修复后独立复验（AC-2）：`bash tests/verify_timeouts.test.sh` 退出 0，24/24 通过。隔离替身验证单步超时后不运行后续步骤、镜像构建超时退出非零、退出 137 单独报告而不误报为超时、残留只读查询。`bash scripts/verify.sh full` 在真实 Docker/Rust 1.89 环境退出 0：fmt、clippy、test、release build、镜像构建全通过；Rust 139 通过、0 失败、11 个外部集成测试按默认配置忽略。未故意让真实镜像构建超时或制造 OOM；`pgtest.sh` 未改动，AC-3 沿用历史实测。私有本机证据：`.plan/ego-t13-t18-20261122/t14-timeouts-final.log`、`verify-full-final.log`。
 
 | 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
 | --- | --- | --- | --- | --- | --- |
