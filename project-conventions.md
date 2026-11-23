@@ -22,6 +22,7 @@
 | `cargo build --release --locked` | 发布构建；`Cargo.lock` 必须同步提交。 |
 | `docker build -t mcp-db:dev .` | 构建首版 OCI 容器镜像。 |
 | `docker run --rm -p 127.0.0.1:8787:8787 mcp-db:dev` | 本机启动与健康检查冒烟；管理端口后续按设计单独发布。 |
+| `.github/workflows/ci.yml` | PR 和推送自动执行脚本回归、fmt、clippy、locked 测试、镜像构建与容器冒烟；`main` 推送额外发布 GHCR 摘要并部署，见 [docs/deploy.md](docs/deploy.md)。 |
 
 日常修改运行受影响检查和测试；涉及入口、镜像或运行时依赖时验证构建和容器启动。发布前核对 PRD 门禁和 AC，不能以 Mock 结果替代真实集成和人工验收。
 
