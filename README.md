@@ -189,3 +189,7 @@ node --test tests/*.test.cjs    # 管理台前端回归
 ```
 
 架构、契约和验收标准见 [SPEC.md](SPEC.md)；产品意图与用户场景见 [docs/PRD.md](docs/PRD.md)；任务状态与证据见 [TASK.md](TASK.md)；变更记录见 [CHANGELOG.md](CHANGELOG.md)。
+
+## 许可证
+
+[MIT](LICENSE)
