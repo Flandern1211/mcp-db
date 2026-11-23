@@ -69,16 +69,18 @@ flock -w "$LOCK_TIMEOUT" 9 || fail "another deployment holds the lock; not start
 key_meta=$(stat -c '%a %u %s' keys/master.key) || fail "cannot stat keys/master.key"
 read -r key_mode key_uid key_size <<<"$key_meta"
 [ "$key_size" -gt 0 ] || fail "keys/master.key is empty; run bootstrap as root once"
-[ "$key_mode" = 400 ] && [ "$key_uid" = 10001 ] ||
+if [ "$key_mode" != 400 ] || [ "$key_uid" != 10001 ]; then
   fail "keys/master.key must be mode 0400 owned by uid 10001; run bootstrap as root"
+fi
 
 keys_mode=$(stat -c '%a' keys) || fail "cannot stat keys directory"
 [ "$keys_mode" = 755 ] || fail "keys/ must be mode 0755 (found $keys_mode)"
 
 data_meta=$(stat -c '%a %u' data) || fail "cannot stat data directory"
 read -r data_mode data_uid <<<"$data_meta"
-[ "$data_mode" = 700 ] && [ "$data_uid" = 10001 ] ||
+if [ "$data_mode" != 700 ] || [ "$data_uid" != 10001 ]; then
   fail "data/ must be mode 0700 owned by uid 10001; run bootstrap as root"
+fi
 
 COMPOSE=(docker compose --project-name mcp-db --file "$DIR/docker-compose.yml")
 export MCPDB_IMAGE="$IMAGE_REF"

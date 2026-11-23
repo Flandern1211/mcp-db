@@ -26,6 +26,8 @@ if [[ ! $request =~ $EXPECTED ]]; then
 fi
 
 image_ref=${request#deploy }
-[ -f "$DIR/deploy.sh" ] && [ ! -L "$DIR/deploy.sh" ] ||
-  { echo "run-deploy: deploy.sh is missing or a symlink" >&2; exit 1; }
+if [ ! -f "$DIR/deploy.sh" ] || [ -L "$DIR/deploy.sh" ]; then
+  echo "run-deploy: deploy.sh is missing or a symlink" >&2
+  exit 1
+fi
 exec bash "$DIR/deploy.sh" "$image_ref"

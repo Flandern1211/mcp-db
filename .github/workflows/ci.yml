@@ -33,6 +33,10 @@ jobs:
           for script in deploy/*.sh tests/deploy*.sh scripts/verify.sh; do
             bash -n "$script"
           done
+          # shellcheck ships on ubuntu-24.04 runners; keep the deploy entry points
+          # statically checked so a local daemon outage is never the reason a
+          # shell regression goes unverified.
+          shellcheck deploy/*.sh tests/deploy*.sh
           for test in tests/deploy*.test.sh; do
             bash "$test"
           done
@@ -115,7 +119,8 @@ jobs:
     needs: publish
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # pull alone may take up to 900s; plus lock 60s, compose wait 240s and SSH/probe overhead.
+    timeout-minutes: 25
     environment: production
     concurrency:
       group: deploy-production
