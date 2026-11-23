@@ -119,7 +119,8 @@ jobs:
     needs: publish
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # pull alone may take up to 900s; plus lock 60s, compose wait 240s and SSH/probe overhead.
+    timeout-minutes: 25
     environment: production
     concurrency:
       group: deploy-production
