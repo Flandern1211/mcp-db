@@ -1,0 +1,169 @@
+name: ci
+
+on:
+  pull_request:
+    branches: [develop, main]
+  push:
+    branches: [develop, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Rust checks and image smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Deploy script regressions
+        run: |
+          for script in deploy/*.sh tests/deploy*.sh scripts/verify.sh; do
+            bash -n "$script"
+          done
+          for test in tests/deploy*.test.sh; do
+            bash "$test"
+          done
+          # Tracked suites for the scripts this task touches; they stub Docker
+          # and the toolchain, so they run on the bare runner.
+          bash tests/verify_timeouts.test.sh
+          bash tests/disk_guard.test.sh
+
+      - name: fmt, locked clippy and locked tests
+        run: bash scripts/verify.sh fast
+
+      - name: Build Linux amd64 image
+        run: |
+          docker build --platform linux/amd64 --tag mcp-db:ci \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" .
+
+      - name: Smoke test the image
+        run: bash tests/deploy-smoke.sh mcp-db:ci
+
+      # Keep the exact tested image; the publisher never checks out or rebuilds.
+      - name: Export tested image
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: docker save --output "$RUNNER_TEMP/mcp-db-image.tar" mcp-db:ci
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        with:
+          name: mcp-db-image
+          path: ${{ runner.temp }}/mcp-db-image.tar
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: Publish image to GHCR
+    needs: verify
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: mcp-db-image
+          path: ${{ runner.temp }}/image
+
+      - name: Push the tested image and record its manifest digest
+        id: push
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          tag="sha-$GITHUB_SHA"
+          docker load --input "$RUNNER_TEMP/image/mcp-db-image.tar"
+          docker tag mcp-db:ci "$image:$tag"
+          printf '%s\n' "$GHCR_TOKEN" |
+            docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          # Take the manifest digest from this push, not from an anonymous
+          # lookup or a subsequent lookup by mutable tag. RepoDigests is set by
+          # the push itself and does not depend on the CLI's human-readable
+          # progress output, which differs between Docker versions.
+          docker push "$image:$tag"
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image:$tag" |
+            awk -v prefix="$image@" 'index($0, prefix) == 1 { print substr($0, length(prefix) + 1) }' |
+            head -n 1)
+          if [[ ! $digest =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '::error::Push did not record one canonical manifest digest; inspect the registry before retrying.\n'
+            exit 1
+          fi
+          printf 'digest=%s@%s\n' "$image" "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published %s@%s\n' "$image" "$digest"
+
+  deploy:
+    name: Deploy digest to production
+    needs: publish
+    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      # Repository administrators must restrict production to the main branch
+      # and put the DEPLOY_* secrets in that environment, not at repo scope.
+      - name: Deploy through the restricted SSH key
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          IMAGE_REF: ${{ needs.publish.outputs.digest }}
+        run: |
+          if [[ ! $DEPLOY_USER =~ ^[a-zA-Z_][a-zA-Z0-9._-]*$ ||
+                ! $DEPLOY_HOST =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ||
+                -z $DEPLOY_SSH_KEY || -z $DEPLOY_KNOWN_HOSTS ]]; then
+            printf '::error::Production SSH settings are missing or invalid.\n'
+            exit 1
+          fi
+          if [[ ${IMAGE_REF%@*} != "ghcr.io/${GITHUB_REPOSITORY,,}" ||
+                ! ${IMAGE_REF##*@} =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            printf '::error::Expected an immutable image digest for this repository.\n'
+            exit 1
+          fi
+          umask 077
+          ssh_files=$(mktemp -d "$RUNNER_TEMP/mcpdb-ssh.XXXXXXXX")
+          trap 'rm -f -- "$ssh_files/key" "$ssh_files/known_hosts"; rmdir -- "$ssh_files"' EXIT
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_files/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_files/known_hosts"
+          unset DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS
+
+          # A queued or manually re-run job must not knowingly replace a newer main.
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')
+          if [[ $tip != "$GITHUB_SHA" ]]; then
+            printf '::error::This run no longer targets the main tip; nothing sent to the host.\n'
+            exit 1
+          fi
+          if ! ssh-keygen -F "$DEPLOY_HOST" -f "$ssh_files/known_hosts" >/dev/null; then
+            printf '::error::DEPLOY_KNOWN_HOSTS has no pinned entry for DEPLOY_HOST.\n'
+            exit 1
+          fi
+          ssh -F /dev/null -T -n -i "$ssh_files/key" \
+            -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none \
+            -o StrictHostKeyChecking=yes -o UpdateHostKeys=no \
+            -o UserKnownHostsFile="$ssh_files/known_hosts" -o GlobalKnownHostsFile=/dev/null \
+            -o ClearAllForwardings=yes -o ConnectTimeout=20 \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" deploy "$IMAGE_REF"
