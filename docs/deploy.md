@@ -129,7 +129,7 @@ restrict,command="/path/to/mcp-db/run-deploy.sh" ssh-ed25519 AAAA... github-acti
 
 2. `deploy.sh` 再次校验摘要格式，确认 `docker-compose.yml`、`keys/master.key` 和 `data/` 存在且不是符号链接，检查主密钥 `0400`/uid `10001`、`keys/` `0755`、`data/` `0700`/uid `10001`。任何一项不满足都失败关闭。
 3. 对部署目录持只读文件描述符并用 `flock` 串行化；已有部署运行时直接拒绝。
-4. 先 `docker compose pull` 该摘要；拉取失败立即退出，**不触碰**当前运行容器。
+4. 先 `docker compose pull` 该摘要；拉取失败立即退出，**不触碰**当前运行容器。拉取默认超时 900 秒（`MCPDB_DEPLOY_PULL_TIMEOUT`），因为首次拉取整个镜像受出口带宽影响可能超过 5 分钟；超时同样按失败处理，不重试。
 5. 再执行 `docker compose up -d --wait --wait-timeout 180 --pull never`。启动失败或健康超时直接失败，不自动重试、不自动回滚。
 6. 要求端口映射恰好是上述两个回环映射，并直接请求 `http://127.0.0.1:8787/healthz` 和 `http://127.0.0.1:8788/admin/login`，两者都必须是 200。
 7. 不写部署戳记，不输出业务日志。结果不确定时停止自动化，由管理员检查。
