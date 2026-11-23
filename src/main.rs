@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -75,8 +75,7 @@ fn run(mut args: impl Iterator<Item = String>) -> Result<(), String> {
             let admin_resolver: Option<Arc<dyn mcp_db::credentials::CredentialResolver>>;
             match (&config.credential_store, &config.master_key_file) {
                 (Some(store_path), Some(key_path)) => {
-                    let resolver = EncryptedFileResolver::open(store_path, key_path)
-                        .map_err(|error| format!("credential init failed: {error}"))?;
+                    let resolver = open_credential_resolver(store_path, key_path)?;
                     let resolver = Arc::new(resolver);
                     credentials = Some(resolver.clone());
                     admin_resolver = Some(resolver.clone());
@@ -200,6 +199,16 @@ fn run_recover(mut args: impl Iterator<Item = String>) -> Result<(), String> {
     };
     println!("migration recovery: {label}");
     Ok(())
+}
+
+/// Opens the service credential store, creating an empty one on first use. The
+/// master key file must already exist and parse; anything else fails startup.
+fn open_credential_resolver(
+    store_path: &Path,
+    key_path: &Path,
+) -> Result<EncryptedFileResolver, String> {
+    EncryptedFileResolver::open_or_create(store_path, key_path)
+        .map_err(|error| format!("credential init failed: {error}"))
 }
 
 fn print_help() {
@@ -771,6 +780,8 @@ fn default_policy(tool: Tool) -> ApprovalPolicy {
 mod tests {
     use super::*;
     use mcp_db::auth::hash_token;
+    use mcp_db::{CredentialResolver, CredentialSink};
+    use std::fs;
 
     #[test]
     fn unknown_argument_is_rejected() {
@@ -782,6 +793,49 @@ mod tests {
     fn version_and_help_succeed() {
         assert!(run(["--version".to_string()].into_iter()).is_ok());
         assert!(run(["--help".to_string()].into_iter()).is_ok());
+    }
+
+    #[test]
+    fn credential_resolver_is_created_from_a_clean_directory() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = dir.path().join("credentials.enc");
+        let key = dir.path().join("master.key");
+        fs::write(&key, "07".repeat(32)).expect("write key");
+
+        let resolver = open_credential_resolver(&store, &key).expect("open or create");
+        assert!(store.is_file());
+        assert!(matches!(
+            resolver.resolve("keyring:mcp-db/test/query"),
+            Err(mcp_db::Error::CredentialUnavailable)
+        ));
+
+        let reference = "keyring:mcp-db/test/query";
+        let dsn = "postgres://reader:not-a-real-password@db.example:5432/app";
+        resolver.store(reference, dsn).expect("store credential");
+        assert_eq!(resolver.resolve(reference).expect("resolve"), dsn);
+
+        let reopened = open_credential_resolver(&store, &key).expect("reopen");
+        assert_eq!(reopened.resolve(reference).expect("resolve"), dsn);
+    }
+
+    #[test]
+    fn missing_or_invalid_master_key_fails_credential_init() {
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let store = dir.path().join("credentials.enc");
+        let missing = dir.path().join("missing.key");
+        let error = open_credential_resolver(&store, &missing)
+            .err()
+            .expect("missing key must fail");
+        assert!(error.starts_with("credential init failed: "), "{error}");
+        assert!(!store.exists(), "failed init must not create a store");
+
+        let invalid = dir.path().join("invalid.key");
+        fs::write(&invalid, "not-a-master-key").expect("write invalid key");
+        let error = open_credential_resolver(&store, &invalid)
+            .err()
+            .expect("invalid key must fail");
+        assert!(error.starts_with("credential init failed: "), "{error}");
+        assert!(!store.exists(), "failed init must not create a store");
     }
 
     #[test]

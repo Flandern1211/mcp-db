@@ -68,6 +68,58 @@ fn encrypted_store_round_trips_without_plaintext() {
 }
 
 #[test]
+fn open_or_create_creates_an_empty_store_from_a_clean_directory() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+    fs::write(&key_file, key_hex(&[7_u8; 32])).expect("write key");
+    assert!(!store.exists());
+
+    let resolver =
+        EncryptedFileResolver::open_or_create(&store, &key_file).expect("open or create");
+    assert!(store.is_file());
+    assert!(matches!(
+        resolver.resolve("keyring:mcp-db/test/query"),
+        Err(Error::CredentialUnavailable)
+    ));
+
+    let reference = "keyring:provision/mcpdb_np_test/query";
+    let dsn = "postgres://mcpdb_np_test_ro:s3cret-pw@db.example:5432/mcpdb_np_test";
+    resolver.store(reference, dsn).expect("store credential");
+    assert_eq!(resolver.resolve(reference).expect("resolve"), dsn);
+
+    let reopened = EncryptedFileResolver::open(&store, &key_file).expect("reopen");
+    assert_eq!(reopened.resolve(reference).expect("resolve"), dsn);
+}
+
+#[test]
+fn open_or_create_still_requires_a_valid_master_key() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+
+    assert!(matches!(
+        EncryptedFileResolver::open_or_create(&store, &key_file),
+        Err(Error::CredentialUnavailable)
+    ));
+    assert!(!store.exists(), "missing key must not create a store");
+
+    fs::write(&key_file, "not-a-master-key").expect("write invalid key");
+    assert!(matches!(
+        EncryptedFileResolver::open_or_create(&store, &key_file),
+        Err(Error::CredentialUnavailable)
+    ));
+    assert!(!store.exists(), "invalid key must not create a store");
+
+    EncryptedFileResolver::seal(&store, &[7_u8; 32], &entries()).expect("seal");
+    fs::write(&key_file, key_hex(&[8_u8; 32])).expect("write wrong key");
+    assert!(matches!(
+        EncryptedFileResolver::open_or_create(&store, &key_file),
+        Err(Error::CredentialUnavailable)
+    ));
+}
+
+#[test]
 fn wrong_or_missing_key_fails_closed() {
     let dir = TempDir::new().expect("temp dir");
     let store = dir.path().join("credentials.enc");
