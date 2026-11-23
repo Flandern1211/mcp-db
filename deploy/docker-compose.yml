@@ -1,0 +1,45 @@
+name: mcp-db
+
+# Production unit, provisioned by an administrator and never uploaded by CI.
+# deploy.sh runs:
+#   MCPDB_IMAGE=ghcr.io/...@sha256:... docker compose pull
+#   docker compose up -d --wait --pull never
+#
+# Ports are published on the host loopback only: MCP and the admin UI are
+# reached through an SSH tunnel (SPEC.md "management plane is local only").
+# Do not change these to 0.0.0.0.
+#
+# Bind mounts use long syntax with create_host_path: false: a missing data/ or
+# keys/ directory is an error instead of an implicitly created empty host path.
+# Only the key mount is read-only; /data persists across upgrades.
+
+services:
+  mcp-db:
+    image: ${MCPDB_IMAGE:?MCPDB_IMAGE is required (set by deploy.sh)}
+    container_name: mcp-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:8788:8788"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./keys
+        target: /keys
+        read_only: true
+        bind:
+          create_host_path: false
+    environment:
+      MCPDB_CREDENTIAL_STORE: /data/credentials.enc
+      MCPDB_MASTER_KEY_FILE: /keys/master.key
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

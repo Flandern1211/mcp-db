@@ -47,7 +47,15 @@ case "$MODE" in
 esac
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-ROOT_WIN=$(cd "$ROOT" && pwd -W 2>/dev/null || cygpath -w "$ROOT")
+# Git Bash exposes a Windows path through `pwd -W`; Linux and other POSIX
+# environments do not implement that flag and must fall back to the plain path.
+if ROOT_WIN=$(cd "$ROOT" && pwd -W 2>/dev/null); then
+  :
+elif command -v cygpath >/dev/null 2>&1; then
+  ROOT_WIN=$(cygpath -w "$ROOT")
+else
+  ROOT_WIN=$ROOT
+fi
 HASH=$(printf '%s' "$ROOT" | cksum | awk '{print $1}')
 IMAGE=${MCPDB_RUST_IMAGE:-rust:1.89-slim-bookworm}
 TOOLCHAIN=${MCPDB_RUST_TOOLCHAIN:-1.89.0}
