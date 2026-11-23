@@ -24,7 +24,7 @@ set -euo pipefail
 readonly IMAGE_RE='^ghcr\.io/flandern1211/mcp-db@sha256:[0-9a-f]{64}$'
 readonly CONTAINER=mcp-db
 readonly HEALTH_TIMEOUT=${MCPDB_DEPLOY_HEALTH_TIMEOUT:-180}
-readonly PULL_TIMEOUT=${MCPDB_DEPLOY_PULL_TIMEOUT:-300}
+readonly PULL_TIMEOUT=${MCPDB_DEPLOY_PULL_TIMEOUT:-900}
 readonly LOCK_TIMEOUT=${MCPDB_DEPLOY_LOCK_TIMEOUT:-60}
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
