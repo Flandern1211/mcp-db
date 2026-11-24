@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Run one deployment on the target host.
 #
-# CI invokes this through the forced-command wrapper:
-#   bash run-deploy.sh   (SSH_ORIGINAL_COMMAND="deploy ghcr.io/...@sha256:...")
-# Administrators may run it directly for a manual rollback:
-#   bash deploy.sh 'ghcr.io/flandern1211/mcp-db@sha256:<known digest>'
+# CI syncs this file and docker-compose.yml from the deployed commit, then runs:
+#   bash deploy.sh 'ghcr.io/flandern1211/mcp-db@sha256:<digest>'
+# Administrators may run the same command for a manual rollback.
 #
 # Contract:
 #   - only an immutable digest for this repository is accepted;
-#   - the compose file, master key and data directory are provisioned by an
-#     administrator and are never uploaded or rewritten here;
+#   - docker-compose.yml is synced from the deployed commit before this runs, so
+#     the running unit always matches the source; keys/ and data/ are host-owned
+#     and are never addressed by the deploy step;
 #   - the new image is pulled before the live container is touched; a failed
 #     pull exits without changing the running service;
 #   - the service must become healthy, publish exactly both loopback ports and

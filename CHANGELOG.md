@@ -2,7 +2,7 @@
 
 ## 2026-11-23
 
-- 新增 GitHub Actions 交付流水线：PR 与推送执行脚本回归、fmt、clippy、locked 测试、镜像构建和容器冒烟；`main` 推送把冒烟通过的镜像以不可变摘要发布到 GHCR，并通过只接受单一部署请求的 SSH 密钥滚动到目标主机。部署单元只把 MCP 与管理端口发布到宿主回环地址，运维手册见 [docs/deploy.md](docs/deploy.md)。
+- 新增 GitHub Actions 交付流水线：PR 与推送执行脚本回归、fmt、clippy、locked 测试、镜像构建和容器冒烟；`main` 推送把冒烟通过的镜像以不可变摘要发布到 GHCR，每次部署从该提交同步 `deploy/` 到目标主机再按摘要滚动。部署单元只把 MCP 与管理端口发布到宿主回环地址，运维手册见 [docs/deploy.md](docs/deploy.md)。
 - 服务启动时若配置了 `MCPDB_CREDENTIAL_STORE` 与 `MCPDB_MASTER_KEY_FILE` 而凭证库文件尚不存在，现在会创建空凭证库，使全新部署可以直接在管理页录入连接串；主密钥缺失或非法仍在启动阶段失败。此前只有 legacy 迁移会创建该文件，干净环境无法保存 DSN。
 - README 重写为面向使用者的入口：能力与边界、快速开始、MCP 客户端接入、工具与审批策略、配置参考、CLI、安全边界与已知限制；移除只适用于 Bun/TypeScript v1 的历史说明。
 

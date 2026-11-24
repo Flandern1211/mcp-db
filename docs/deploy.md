@@ -18,8 +18,9 @@
 - 冒烟使用临时目录中的合成主密钥和干净的临时数据挂载，由 Docker 分配回环临时端口，在有限超时内等待健康检查，然后直接请求 `/healthz` 和 `/admin/login`，两者都必须是 200。不输出业务日志，不连接任何外部系统。
 - 只有 `main` 推送才把**冒烟通过的那个镜像** `docker save` 成 artifact 交给 `publish`；发布 job 不 checkout、不重新构建。
 - `publish` 只有 `packages: write` 权限，只在 `main` 推送运行；镜像名使用全小写 `ghcr.io/<owner>/mcp-db`，标签是 `sha-<完整提交号>`，不推送 `latest`。构建时写入 OCI `source` 和 `revision` 标签。推送后只输出本次推送的 `ghcr.io/<owner>/mcp-db@sha256:<64 位小写十六进制>` 摘要。
-- `deploy` 只在 `main` 推送运行，绑定 `production` environment，job 级并发组 `deploy-production` 且 `cancel-in-progress: false`，不会取消正在进行的部署。它不 checkout，不使用 scp，不向主机上传 compose 文件、脚本或配置，也不在服务器上做 registry 登录；只把摘要交给固定 forced command。
-- 手动 `workflow_dispatch` 只做检查和冒烟，**不是部署入口**。需要手工部署时，在主机上用已发布的摘要直接运行 `deploy.sh`（见第 4 节）。
+- `deploy` 只在 `main` 推送运行，绑定 `production` environment，job 级并发组 `deploy-production` 且 `cancel-in-progress: false`，不会取消正在进行的部署。它先 checkout 该次提交，用 `rsync` 把 `deploy/` 下的 `docker-compose.yml`、`deploy.sh`、`bootstrap.sh` 同步到部署目录（`keys/` 与 `data/` 不在同步范围内），再通过 SSH 执行 `deploy.sh`。
+- **主机不自带任何仓库配置**：compose 与部署脚本每次都由 CI 从当次提交覆盖写入，所以线上运行单元始终等于已部署的源码，不存在“服务器上的文件和仓库不一致”的情况。只有主密钥和数据目录是主机自己的。
+- 手动 `workflow_dispatch` 只做检查和冒烟，**不是部署入口**。需要手工部署时，按第 4 节在主机上执行同样的 `deploy.sh <摘要>`。
 - 部署开始前会确认该提交仍是 `main` 的最新提交；已落后的排队或手动重跑不会发送到主机。
 
 ## 2. GitHub 配置
@@ -29,13 +30,14 @@
 在仓库 Settings → Environments 新建 `production`：
 
 1. 把 Deployment branches 限制为 `main`，其他分支不能使用该环境。
-2. 把下表四个值保存为 **environment secrets**（不是 repository secrets）。工作流只在 `production` job 内引用它们。
+2. 把下表五个值保存为 **environment secrets**（不是 repository secrets）。工作流只在 `production` job 内引用它们。
 3. 可按需增加 required reviewers，让部署在发布后等待人工批准。
 
 | Secret | 内容 |
 | --- | --- |
 | `DEPLOY_HOST` | 目标主机名或 IPv4 地址，不含端口 |
 | `DEPLOY_USER` | 只负责部署的账号 |
+| `DEPLOY_PATH` | 部署目录绝对路径，例如 `/path/to/mcp-db` |
 | `DEPLOY_SSH_KEY` | 专用部署私钥全文 |
 | `DEPLOY_KNOWN_HOSTS` | 目标主机的已知主机公钥行 |
 
@@ -59,19 +61,20 @@
 
 ### 3.2 部署目录
 
-部署目录（示例 `/path/to/mcp-db`）由管理员手工创建并维护，CI 不会上传任何文件：
+部署目录（示例 `/path/to/mcp-db`）由管理员创建一次，之后其中的仓库文件由 CI 每次部署覆盖：
 
 ```text
 /path/to/mcp-db/
-  docker-compose.yml
-  deploy.sh
-  run-deploy.sh
-  bootstrap.sh
-  keys/master.key       # bootstrap 生成，0400，uid 10001
-  data/                 # 0700，uid 10001，升级时保留
+  docker-compose.yml    # CI 同步（来自仓库）
+  deploy.sh             # CI 同步（来自仓库）
+  bootstrap.sh          # CI 同步，仅手工执行
+  keys/master.key       # 主机自有，bootstrap 生成，0400，uid 10001
+  data/                 # 主机自有，0700，uid 10001，升级时保留
 ```
 
-把仓库 `deploy/` 下的四个文件复制到该目录。脚本和 compose 归管理员所有并保持只读（脚本 `0755`、compose `0644`，属主为 root 或管理员），部署账号只有读取和执行权限。不要在部署目录里存放业务配置或明文凭据。
+`keys/` 和 `data/` 不属于同步范围，CI 不会读、写或删除它们；同步只覆盖上面三个文件，不做 `--delete`。所以服务器不需要手工维护任何仓库文件——改 compose 或部署脚本只需改仓库并推 `main`。
+
+部署账号需要该目录的写权限（用于接收同步文件）。不要在部署目录里存放业务配置或明文凭据。
 
 ### 3.3 初始化主密钥和目录
 
@@ -104,35 +107,33 @@ sudo bash bootstrap.sh
 
 ### 3.5 部署密钥
 
-为 CI 生成专用密钥，把公钥写入部署账号的 `authorized_keys`，必须带 `restrict` 和固定的 forced command。路径使用绝对路径：
+为 CI 生成专用密钥，把公钥写入部署账号的 `authorized_keys`。仍建议加 `restrict`，关掉 PTY、端口转发、agent 转发和 X11：
 
 ```text
-restrict,command="/path/to/mcp-db/run-deploy.sh" ssh-ed25519 AAAA... github-actions-mcp-db-deploy
+restrict ssh-ed25519 AAAA... github-actions-mcp-db-deploy
 ```
 
 - 先独立核对主机指纹，再把 `DEPLOY_KNOWN_HOSTS` 写入 environment secret。
-- `restrict` 关闭 PTY、端口转发、agent 转发和 X11；该密钥不能执行 shell、上传文件或转发端口。
-- 该密钥只用于 forced command。SSH 隧道和日常管理使用另一把普通管理员密钥，不要复用部署密钥。
+- 该密钥的权限边界是"部署账号能做的事"：可以写部署目录并执行 `deploy.sh`。部署账号若在 `docker` 组内，本身就等价于主机 root，因此真正的控制点是 `production` 环境限制为 `main`、可选的 required reviewers，以及固定的主机指纹，而不是这条 SSH 项。
+- SSH 隧道和日常管理使用另一把普通管理员密钥，不要复用部署密钥。
 - 怀疑泄露时立即移除该公钥并轮换 `DEPLOY_SSH_KEY`。
 
 ## 4. 部署与回滚
 
-推送到 `main` 后流水线自动执行。主机侧行为：
+推送到 `main` 后流水线自动执行。CI 侧行为：
 
-1. `run-deploy.sh` 用 Bash 整串锚定正则只接受这一种请求：
+1. checkout 该次提交，校验 `DEPLOY_*` 配置、`main` 最新提交和固定主机指纹。
+2. `rsync` 把 `deploy/docker-compose.yml`、`deploy/deploy.sh`、`deploy/bootstrap.sh` 同步到 `DEPLOY_PATH`（无 `--delete`，不涉及 `keys/` 与 `data/`）。
+3. 通过 SSH 执行 `bash deploy.sh <摘要>`。
 
-   ```text
-   deploy ghcr.io/flandern1211/mcp-db@sha256:<64 位小写十六进制>
-   ```
+主机侧 `deploy.sh` 依次执行：
 
-   其他 owner、其他仓库、标签、额外参数、前后空白、多行输入和 shell 语法全部拒绝；通过后只把校验过的镜像引用作为单个参数交给 `deploy.sh`，不使用 `eval`。
-
-2. `deploy.sh` 再次校验摘要格式，确认 `docker-compose.yml`、`keys/master.key` 和 `data/` 存在且不是符号链接，检查主密钥 `0400`/uid `10001`、`keys/` `0755`、`data/` `0700`/uid `10001`。任何一项不满足都失败关闭。
-3. 对部署目录持只读文件描述符并用 `flock` 串行化；已有部署运行时直接拒绝。
-4. 先 `docker compose pull` 该摘要；拉取失败立即退出，**不触碰**当前运行容器。拉取默认超时 900 秒（`MCPDB_DEPLOY_PULL_TIMEOUT`），因为首次拉取整个镜像受出口带宽影响可能超过 5 分钟；超时同样按失败处理，不重试。
-5. 再执行 `docker compose up -d --wait --wait-timeout 180 --pull never`。启动失败或健康超时直接失败，不自动重试、不自动回滚。
-6. 要求端口映射恰好是上述两个回环映射，并直接请求 `http://127.0.0.1:8787/healthz` 和 `http://127.0.0.1:8788/admin/login`，两者都必须是 200。
-7. 不写部署戳记，不输出业务日志。结果不确定时停止自动化，由管理员检查。
+1. 校验摘要格式，确认 `docker-compose.yml`、`keys/master.key` 和 `data/` 存在且不是符号链接，检查主密钥 `0400`/uid `10001`、`keys/` `0755`、`data/` `0700`/uid `10001`。任何一项不满足都失败关闭。
+2. 对部署目录持只读文件描述符并用 `flock` 串行化；已有部署运行时直接拒绝。
+3. 先 `docker compose pull` 该摘要；拉取失败立即退出，**不触碰**当前运行容器。拉取默认超时 900 秒（`MCPDB_DEPLOY_PULL_TIMEOUT`），因为首次拉取整个镜像受出口带宽影响可能超过 5 分钟；超时同样按失败处理，不重试。
+4. 再执行 `docker compose up -d --wait --wait-timeout 180 --pull never`。启动失败或健康超时直接失败，不自动重试、不自动回滚。
+5. 要求端口映射恰好是上述两个回环映射，并直接请求 `http://127.0.0.1:8787/healthz` 和 `http://127.0.0.1:8788/admin/login`，两者都必须是 200。
+6. 不写部署戳记，不输出业务日志。结果不确定时停止自动化，由管理员检查。
 
 手工回滚只使用已发布的已知摘要，并先确认当前 `data/` 的状态与目标版本兼容（数据库结构/迁移方向）：
 
@@ -177,10 +178,10 @@ docker inspect --format '{{.Config.Image}}' mcp-db   # 当前运行的摘要
 
 compose 文件里的 `image` 是必填变量，直接运行 `docker compose ps` 会因缺少 `MCPDB_IMAGE` 失败；查状态用上面的 `docker ps`。
 
-- 当前镜像以 `docker inspect` / `docker compose ps` 为准，没有 `.deployed-image` 戳记。
+- 当前镜像以 `docker inspect` 为准，没有 `.deployed-image` 戳记。
 - 需要排查容器时由管理员在主机上按需查看日志；CI 不打印业务日志。
 - 更新镜像只通过 `main` 流水线或管理员手工执行已知摘要的 `deploy.sh`；不要使用 `latest` 或可移动标签。
-- 端口、卷、环境变量和 compose 属于主机配置，由管理员修改后手工 `docker compose up -d`；CI 不下发配置。
+- compose、环境变量和端口定义都在仓库的 `deploy/` 里，改完推 `main` 即生效；不要直接在服务器上改这些文件，否则下次部署会被覆盖。
 - 备份 `data/` 和 `keys/master.key`，两者必须成对保存。
 
 ## 7. 已知限制
