@@ -25,4 +25,5 @@ mcp-db.toml
 
 # 系统文件
 .DS_Store
-Thumbs.db
+Thumbs.db# 工具缓存（preflight.sh 自动下载）
+.tools/

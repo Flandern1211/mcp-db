@@ -2,7 +2,10 @@ name: cd
 
 # CD：交付与部署。验证工作（CI）在 ci.yml；
 # 本工作流只把已验证的镜像发布为不可变摘要并部署到生产主机，
-# 只有 main 推送才运行。
+# 只有 main 的推送才会被 ci 的完成事件触发。
+#
+# 没有镜像相关改动时（纯文档、任务记账、治理变更），scope job 会跳过
+# publish 与 deploy：不必为一次 README 改动重建镜像、滚动生产。
 on:
   workflow_run:
     workflows: [ci]
@@ -17,9 +20,36 @@ defaults:
     shell: bash
 
 jobs:
+  scope:
+    name: Decide whether an image release is needed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      rebuild: ${{ steps.check.outputs.rebuild }}
+    steps:
+      - name: Check whether the commit can change the image
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          files=$(gh api "repos/$GITHUB_REPOSITORY/commits/$HEAD_SHA" --paginate --jq '.files[].filename')
+          relevant=$(printf '%s\n' "$files" |
+            grep -E '^(src/|tests/|frontend/|Cargo\.|rust-toolchain\.toml|Dockerfile|\.dockerignore|deploy/|scripts/(verify|disk-guard)\.sh)' || true)
+          if [ -n "$relevant" ]; then
+            printf '%s\n' "$relevant" | sed 's/^/  image-relevant: /'
+            echo "rebuild=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No image-relevant changes in this commit; skipping publish and deploy."
+            echo "rebuild=false" >> "$GITHUB_OUTPUT"
+          fi
+
   publish:
     name: Publish image to GHCR
-    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_sha == github.sha && github.event.workflow_run.event == 'push'
+    needs: scope
+    if: github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_sha == github.sha && github.event.workflow_run.event == 'push' && needs.scope.outputs.rebuild == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
