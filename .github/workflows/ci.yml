@@ -33,6 +33,10 @@ jobs:
           for script in deploy/*.sh tests/deploy*.sh scripts/verify.sh; do
             bash -n "$script"
           done
+          # shellcheck ships on ubuntu-24.04 runners; keep the deploy entry points
+          # statically checked so a local daemon outage is never the reason a
+          # shell regression goes unverified.
+          shellcheck deploy/*.sh tests/deploy*.sh
           for test in tests/deploy*.test.sh; do
             bash "$test"
           done
@@ -115,7 +119,8 @@ jobs:
     needs: publish
     if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # pull alone may take up to 900s; plus lock 60s, compose wait 240s and SSH/probe overhead.
+    timeout-minutes: 25
     environment: production
     concurrency:
       group: deploy-production
@@ -123,17 +128,27 @@ jobs:
     steps:
       # Repository administrators must restrict production to the main branch
       # and put the DEPLOY_* secrets in that environment, not at repo scope.
-      - name: Deploy through the restricted SSH key
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      # The host keeps no deploy configuration of its own: deploy/ is synced
+      # from this commit on every run, so the running unit always matches the
+      # deployed source. Only keys/ and data/ stay host-owned, and rsync never
+      # addresses them.
+      - name: Sync deploy files and run deploy.sh
         env:
           GH_TOKEN: ${{ github.token }}
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
           IMAGE_REF: ${{ needs.publish.outputs.digest }}
         run: |
           if [[ ! $DEPLOY_USER =~ ^[a-zA-Z_][a-zA-Z0-9._-]*$ ||
                 ! $DEPLOY_HOST =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ||
+                ! $DEPLOY_PATH =~ ^/[A-Za-z0-9._/-]+$ ||
                 -z $DEPLOY_SSH_KEY || -z $DEPLOY_KNOWN_HOSTS ]]; then
             printf '::error::Production SSH settings are missing or invalid.\n'
             exit 1
@@ -160,10 +175,18 @@ jobs:
             printf '::error::DEPLOY_KNOWN_HOSTS has no pinned entry for DEPLOY_HOST.\n'
             exit 1
           fi
-          ssh -F /dev/null -T -n -i "$ssh_files/key" \
-            -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none \
-            -o StrictHostKeyChecking=yes -o UpdateHostKeys=no \
-            -o UserKnownHostsFile="$ssh_files/known_hosts" -o GlobalKnownHostsFile=/dev/null \
-            -o ClearAllForwardings=yes -o ConnectTimeout=20 \
+
+          ssh_opts=(-F /dev/null -i "$ssh_files/key"
+            -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none
+            -o StrictHostKeyChecking=yes -o UpdateHostKeys=no
+            -o UserKnownHostsFile="$ssh_files/known_hosts" -o GlobalKnownHostsFile=/dev/null
+            -o ClearAllForwardings=yes -o ConnectTimeout=20)
+          rsync -rlpt -e "ssh ${ssh_opts[*]}" \
+            deploy/docker-compose.yml deploy/deploy.sh deploy/bootstrap.sh \
+            "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
+          ssh "${ssh_opts[@]}" -T -n \
             -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
-            "${DEPLOY_USER}@${DEPLOY_HOST}" deploy "$IMAGE_REF"
+            "${DEPLOY_USER}@${DEPLOY_HOST}" \
+            "chmod 0755 '${DEPLOY_PATH}/deploy.sh' '${DEPLOY_PATH}/bootstrap.sh' &&
+             chmod 0644 '${DEPLOY_PATH}/docker-compose.yml' &&
+             bash '${DEPLOY_PATH}/deploy.sh' '${IMAGE_REF}'"

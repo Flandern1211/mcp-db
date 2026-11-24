@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Run one deployment on the target host.
 #
-# CI invokes this through the forced-command wrapper:
-#   bash run-deploy.sh   (SSH_ORIGINAL_COMMAND="deploy ghcr.io/...@sha256:...")
-# Administrators may run it directly for a manual rollback:
-#   bash deploy.sh 'ghcr.io/flandern1211/mcp-db@sha256:<known digest>'
+# CI syncs this file and docker-compose.yml from the deployed commit, then runs:
+#   bash deploy.sh 'ghcr.io/flandern1211/mcp-db@sha256:<digest>'
+# Administrators may run the same command for a manual rollback.
 #
 # Contract:
 #   - only an immutable digest for this repository is accepted;
-#   - the compose file, master key and data directory are provisioned by an
-#     administrator and are never uploaded or rewritten here;
+#   - docker-compose.yml is synced from the deployed commit before this runs, so
+#     the running unit always matches the source; keys/ and data/ are host-owned
+#     and are never addressed by the deploy step;
 #   - the new image is pulled before the live container is touched; a failed
 #     pull exits without changing the running service;
 #   - the service must become healthy, publish exactly both loopback ports and
@@ -24,7 +24,7 @@ set -euo pipefail
 readonly IMAGE_RE='^ghcr\.io/flandern1211/mcp-db@sha256:[0-9a-f]{64}$'
 readonly CONTAINER=mcp-db
 readonly HEALTH_TIMEOUT=${MCPDB_DEPLOY_HEALTH_TIMEOUT:-180}
-readonly PULL_TIMEOUT=${MCPDB_DEPLOY_PULL_TIMEOUT:-300}
+readonly PULL_TIMEOUT=${MCPDB_DEPLOY_PULL_TIMEOUT:-900}
 readonly LOCK_TIMEOUT=${MCPDB_DEPLOY_LOCK_TIMEOUT:-60}
 
 DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -69,16 +69,18 @@ flock -w "$LOCK_TIMEOUT" 9 || fail "another deployment holds the lock; not start
 key_meta=$(stat -c '%a %u %s' keys/master.key) || fail "cannot stat keys/master.key"
 read -r key_mode key_uid key_size <<<"$key_meta"
 [ "$key_size" -gt 0 ] || fail "keys/master.key is empty; run bootstrap as root once"
-[ "$key_mode" = 400 ] && [ "$key_uid" = 10001 ] ||
+if [ "$key_mode" != 400 ] || [ "$key_uid" != 10001 ]; then
   fail "keys/master.key must be mode 0400 owned by uid 10001; run bootstrap as root"
+fi
 
 keys_mode=$(stat -c '%a' keys) || fail "cannot stat keys directory"
 [ "$keys_mode" = 755 ] || fail "keys/ must be mode 0755 (found $keys_mode)"
 
 data_meta=$(stat -c '%a %u' data) || fail "cannot stat data directory"
 read -r data_mode data_uid <<<"$data_meta"
-[ "$data_mode" = 700 ] && [ "$data_uid" = 10001 ] ||
+if [ "$data_mode" != 700 ] || [ "$data_uid" != 10001 ]; then
   fail "data/ must be mode 0700 owned by uid 10001; run bootstrap as root"
+fi
 
 COMPOSE=(docker compose --project-name mcp-db --file "$DIR/docker-compose.yml")
 export MCPDB_IMAGE="$IMAGE_REF"
