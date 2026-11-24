@@ -146,7 +146,18 @@ bash deploy.sh 'ghcr.io/flandern1211/mcp-db@sha256:<已知摘要>'
 
 ## 5. 访问
 
-两个端口都只在主机回环地址。用普通管理员密钥建立 SSH 隧道：
+部署单元里有一个 Caddy 服务在 443 终止 TLS（自签证书，因为主机按 IP 访问），把 `/admin` 转发到 8788、`/mcp` 转发到 8787；mcp-db 本身仍只发布到宿主回环。公网入口（需在云防火墙放行 443）：
+
+- 管理台：`https://<host-ip>/admin`（首次访问会有自签证书警告，加密强度不受影响）
+- MCP：`https://<host-ip>/mcp`，带 `Authorization: Bearer <agent-token>`
+
+首次登录的一次性令牌在主机上生成：
+
+```bash
+docker exec mcp-db mcp-db admin-login-token
+```
+
+不想开公网时，两个端口也支持 SSH 隧道直接访问回环端口：
 
 ```bash
 ssh -N \
@@ -155,18 +166,7 @@ ssh -N \
   <管理员账号>@<host>
 ```
 
-然后使用：
-
-- MCP：`http://127.0.0.1:8787/mcp`，带 `Authorization: Bearer <agent-token>`
-- 管理台：`http://127.0.0.1:8788/admin`
-
-首次登录的一次性令牌在主机上生成：
-
-```bash
-docker exec mcp-db mcp-db admin-login-token
-```
-
-跨主机直接访问、TLS 和反向代理不在当前范围内。
+应用侧边界（AC2-10）：`/admin` 只接受经受信代理的 HTTPS 请求（按 `X-Forwarded-Proto`/`X-Forwarded-Host` 校验 Origin，HTTPS 下会话 cookie 带 `Secure`）；直连回环端口时保持回环 Host 强制。若只想公开管理页、MCP 保持隧道，删除 `deploy/Caddyfile` 里的 `/mcp` handle 块并推 `main`。
 
 ## 6. 日常运维
 
@@ -187,7 +187,7 @@ compose 文件里的 `image` 是必填变量，直接运行 `docker compose ps` 
 ## 7. 已知限制
 
 - 单机部署，不支持多实例或高可用。
-- 没有 TLS 终止和反向代理，因此只支持回环访问。
+- 公网入口是自签证书（无域名时），浏览器会显示一次性信任警告；换域名只需把 `deploy/Caddyfile` 的站点地址改成域名并推 `main`，即可自动换成 Let's Encrypt 证书。
 - 健康门禁只证明容器启动、端口和两个 HTTP 端点可达；数据库连通性和业务调用仍需管理员人工验证。
 - 主机匿名拉取要求 GHCR 包为 public；首次发布需要按 2.2 节手工切换可见性。
 - 部署可能遇到 GHCR 或主机网络抖动；失败时保留现场，不自动重试。
