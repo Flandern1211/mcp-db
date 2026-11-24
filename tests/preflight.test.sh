@@ -35,13 +35,20 @@ if [ "${STUB_DOCKER_UP:-0}" != 1 ]; then
 fi
 exit 0
 STUB
-# actionlint stub: controllable verdict.
+# actionlint stub: -version probe always works; linting verdict is controllable.
 cat > "$bin/actionlint" <<'STUB'
 #!/usr/bin/env bash
+if [ "${1:-}" = "-version" ]; then exit 0; fi
 printf 'actionlint %s\n' "$*" >> "$STUB_AL_LOG"
 if [ "${STUB_AL_RC:-0}" = 0 ]; then exit 0; fi
 echo "workflow: bad action reference"
 exit 1
+STUB
+# gh stub: never reach the network from tests.
+cat > "$bin/gh" <<'STUB'
+#!/usr/bin/env bash
+echo "gh must not be called from tests: $*" >&2
+exit 99
 STUB
 # shellcheck stub: controllable verdict.
 cat > "$bin/shellcheck" <<'STUB'
@@ -58,7 +65,7 @@ cat > "$bin/git" <<'STUB'
 echo "git should not be called when PREFLIGHT_CHANGED is set: $*" >&2
 exit 99
 STUB
-chmod +x "$bin/docker" "$bin/actionlint" "$bin/shellcheck" "$bin/git"
+chmod +x "$bin/docker" "$bin/actionlint" "$bin/shellcheck" "$bin/git" "$bin/gh"
 
 export PATH="$bin:$PATH"
 export STUB_VERIFY_LOG="$work/verify.log"
@@ -165,6 +172,49 @@ elif [ -s "$STUB_VERIFY_LOG" ]; then
 else
   pass "docs-only change passes without toolchain"
 fi
+
+# 6b. Shell tests living under tests/ must not trigger the Rust gate.
+export STUB_DOCKER_UP=0
+run_preflight 'tests/preflight.test.sh'
+if [ "$rc" -ne 0 ]; then
+  fail_case "shell test under tests/ triggered the Rust gate: $(cat "$work/out")"
+elif [ -s "$STUB_VERIFY_LOG" ]; then
+  fail_case "shell test under tests/ invoked verify.sh"
+else
+  pass "shell test under tests/: not treated as Rust"
+fi
+
+# 6c. Dockerfile change requires the full gate (release build + docker build).
+export STUB_DOCKER_UP=1 STUB_VERIFY_RC=0
+run_preflight 'Dockerfile'
+if [ "$rc" -ne 0 ]; then
+  fail_case "Dockerfile change with passing verify failed: $(cat "$work/out")"
+elif ! grep -q '^verify full' "$STUB_VERIFY_LOG"; then
+  fail_case "Dockerfile change did not run verify.sh full (got: $(cat "$STUB_VERIFY_LOG"))"
+else
+  pass "Dockerfile change runs verify.sh full"
+fi
+
+# 7. Truncated/unusable cached binary must not be reported as an actionlint
+# finding: probe before trust, degrade to a warning instead of a bogus BLOCK.
+export STUB_AL_RC=1   # if the broken binary were trusted, linting would fail
+mkdir -p "$app/.tools"
+printf 'garbage not an executable' > "$app/.tools/actionlint.exe"
+chmod +x "$app/.tools/actionlint.exe"
+mv "$bin/actionlint" "$bin/actionlint.hidden"
+run_preflight '.github/workflows/ci.yml'
+mv "$bin/actionlint.hidden" "$bin/actionlint"
+if grep -q 'actionlint reported issues' "$work/out"; then
+  fail_case "unusable cached binary produced a bogus actionlint failure"
+elif [ "$rc" -ne 0 ]; then
+  fail_case "unusable cached binary blocked instead of warning: $(cat "$work/out")"
+elif ! grep -q 'actionlint unavailable' "$work/out"; then
+  fail_case "unusable cached binary did not produce the fallback warning"
+else
+  pass "unusable cached binary: warned, not a bogus failure"
+fi
+rm -rf "$app/.tools"
+export STUB_AL_RC=0
 
 if [ "$failures" -ne 0 ]; then
   printf '%d preflight case(s) failed\n' "$failures" >&2

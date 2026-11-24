@@ -96,23 +96,31 @@ fi
 # --- workflow files: actionlint ---------------------------------------------
 if has '^\.github/workflows/.+\.ya?ml$'; then
   lint=''
-  if command -v actionlint >/dev/null 2>&1; then lint=actionlint
-  elif [ -x "$TOOLS/actionlint.exe" ]; then lint="$TOOLS/actionlint.exe"
-  elif [ -x "$TOOLS/actionlint" ]; then lint="$TOOLS/actionlint"
+  probe_lint() {
+    # A truncated or wrong-platform binary from an interrupted download passes
+    # -x but fails to run; treat that as "absent" so we re-provision instead of
+    # reporting a bogus actionlint failure.
+    [ -n "$1" ] || return 1
+    timeout 15 "$1" -version >/dev/null 2>&1
+  }
+  if command -v actionlint >/dev/null 2>&1 && probe_lint actionlint; then lint=actionlint
+  elif probe_lint "$TOOLS/actionlint.exe"; then lint="$TOOLS/actionlint.exe"
+  elif probe_lint "$TOOLS/actionlint"; then lint="$TOOLS/actionlint"
   else
-    # A previous download may have left the archive; extract from it before
+    # Drop unusable binaries, then extract from any cached archive before
     # trying the network.
+    rm -f "$TOOLS/actionlint.exe" "$TOOLS/actionlint"
     ( cd "$TOOLS" && { unzip -o -q actionlint_*.zip 2>/dev/null || tar xzf actionlint_*.tar.gz 2>/dev/null; } ) || true
-    [ -x "$TOOLS/actionlint.exe" ] && lint="$TOOLS/actionlint.exe"
-    [ -z "$lint" ] && [ -x "$TOOLS/actionlint" ] && lint="$TOOLS/actionlint"
+    probe_lint "$TOOLS/actionlint.exe" && lint="$TOOLS/actionlint.exe"
+    [ -z "$lint" ] && probe_lint "$TOOLS/actionlint" && lint="$TOOLS/actionlint"
   fi
   if [ -z "$lint" ] && command -v gh >/dev/null 2>&1; then
     echo "provisioning actionlint into .tools/ ..."
     ( cd "$TOOLS" && timeout 180 gh release download --repo rhysd/actionlint \
         --pattern "*windows_amd64.zip" --pattern "*linux_x86_64.tar.gz" --clobber >/dev/null 2>&1 \
       && { unzip -o -q actionlint_*.zip 2>/dev/null || tar xzf actionlint_*.tar.gz 2>/dev/null; } ) || true
-    [ -x "$TOOLS/actionlint.exe" ] && lint="$TOOLS/actionlint.exe"
-    [ -z "$lint" ] && [ -x "$TOOLS/actionlint" ] && lint="$TOOLS/actionlint"
+    probe_lint "$TOOLS/actionlint.exe" && lint="$TOOLS/actionlint.exe"
+    [ -z "$lint" ] && probe_lint "$TOOLS/actionlint" && lint="$TOOLS/actionlint"
   fi
   if [ -n "$lint" ]; then
     if "$lint" >/tmp/preflight-al.out 2>&1; then
@@ -127,19 +135,28 @@ if has '^\.github/workflows/.+\.ya?ml$'; then
 fi
 
 # --- Rust source: must be verified locally, CI is not a compiler ------------
-if has '^(src/|tests/|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml|Dockerfile)'; then
+# tests/*.test.sh are shell mocks and are covered by the shell gate above; only
+# tests/*.rs compile with the crate.
+need_rust=0
+need_image=0
+has '^(src/|tests/[^/]*\.rs$|Cargo\.toml|Cargo\.lock|rust-toolchain\.toml)' && need_rust=1
+has '^(Dockerfile|\.dockerignore)' && need_image=1
+
+if [ "$need_rust" = 1 ] || [ "$need_image" = 1 ]; then
   if command -v docker >/dev/null 2>&1 && timeout 20 docker info >/dev/null 2>&1; then
-    if bash scripts/verify.sh fast >/tmp/preflight-verify.out 2>&1; then
-      ok "scripts/verify.sh fast (fmt + clippy + locked tests)"
+    mode=fast
+    [ "$need_image" = 1 ] && mode=full
+    if bash scripts/verify.sh "$mode" >/tmp/preflight-verify.out 2>&1; then
+      ok "scripts/verify.sh $mode (fmt + clippy + locked tests$([ "$need_image" = 1 ] && echo ' + release build + docker build'))"
     else
-      fail "scripts/verify.sh fast failed:"
+      fail "scripts/verify.sh $mode failed:"
       tail -15 /tmp/preflight-verify.out | sed 's/^/       /'
     fi
   else
     # This is the exact gap that produced the HeaderName compile failure: local
     # verification was impossible, so the change was pushed and CI discovered
     # the error at the cost of a full round-trip.
-    fail "Docker is unavailable but Rust/test/build files changed. Start Docker Desktop (or fix the daemon) and rerun; do not push unverified source and let CI compile it."
+    fail "Docker is unavailable but Rust/image files changed. Start Docker Desktop (or fix the daemon) and rerun; do not push unverified source and let CI compile it."
   fi
 fi
 
