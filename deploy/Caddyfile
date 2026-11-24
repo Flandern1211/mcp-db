@@ -4,6 +4,10 @@
 # self-signed certificate; browsers show a one-time trust warning. mcp-db
 # itself stays loopback-only: everything public terminates here on 443.
 #
+# `tls internal` is applied per-host via a catch-all site with an explicit
+# subject so that Caddy provisions a certificate even when clients connect
+# by IP and send no SNI at all.
+#
 # Forwarded headers are mandatory for the admin UI: the app validates
 # X-Forwarded-Proto + X-Forwarded-Host against Origin and issues Secure
 # cookies only when they are present and consistent.
@@ -13,22 +17,25 @@
 
 {
 	admin off
+	servers {
+		protocols h1 h2
+	}
 }
 
 https://:443 {
 	# MCP endpoint (Streamable HTTP, Bearer auth at the app layer).
 	handle /mcp* {
-		reverse_proxy mcp-db:8787 {
-			header_up X-Forwarded-Proto https
-			header_up X-Forwarded-Host {host}
-		}
+		reverse_proxy mcp-db:8787
 	}
 
 	# Admin UI and its JSON API (session cookie + CSRF at the app layer).
+	# Caddy sets X-Forwarded-Proto/-For itself, but NOT X-Forwarded-Host;
+	# the app needs it to match Origin against the public host, so set it
+	# from the client request host explicitly ({http.request.host} is the
+	# pre-rewrite value; {host} would be the upstream address).
 	handle /admin* {
 		reverse_proxy mcp-db:8788 {
-			header_up X-Forwarded-Proto https
-			header_up X-Forwarded-Host {host}
+			header_up X-Forwarded-Host {http.request.host}
 		}
 	}
 
@@ -37,5 +44,10 @@ https://:443 {
 		respond 404
 	}
 
-	tls internal
+	tls {
+		issuer internal {
+			ca local
+		}
+		on_demand
+	}
 }
