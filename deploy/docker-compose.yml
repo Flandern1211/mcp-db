@@ -1,13 +1,16 @@
 name: mcp-db
 
-# Production unit, provisioned by an administrator and never uploaded by CI.
-# deploy.sh runs:
+# Production unit, synced from the repository by the cd pipeline on every
+# deploy; deploy.sh runs:
 #   MCPDB_IMAGE=ghcr.io/...@sha256:... docker compose pull
 #   docker compose up -d --wait --pull never
 #
-# Ports are published on the host loopback only: MCP and the admin UI are
-# reached through an SSH tunnel (SPEC.md "management plane is local only").
-# Do not change these to 0.0.0.0.
+# mcp-db itself is published on the host loopback only. Public access goes
+# through the caddy service below, which terminates TLS on 443 and forwards
+# /admin to 8788 and /mcp to 8787 with X-Forwarded-* headers set (SPEC.md
+# AC2-10: the app validates the forwarded origin and issues Secure cookies).
+# Caddy serves an internal (self-signed) certificate because the host is
+# addressed by IP; browsers will show a one-time trust warning.
 #
 # Bind mounts use long syntax with create_host_path: false: a missing data/ or
 # keys/ directory is an error instead of an implicitly created empty host path.
@@ -43,3 +46,32 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  caddy:
+    image: caddy:2.10.2-alpine
+    container_name: mcp-db-caddy
+    restart: unless-stopped
+    depends_on:
+      - mcp-db
+    ports:
+      - "443:443"
+    volumes:
+      - type: bind
+        source: ./Caddyfile
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        bind:
+          create_host_path: false
+      - caddy-data:/data
+      - caddy-config:/config
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  caddy-data:
+  caddy-config:

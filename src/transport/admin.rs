@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{FromRequest, Path as AxumPath, Query, Request, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -198,6 +198,12 @@ async fn security_headers(request: Request, next: Next) -> Response {
 /// Rejects non-loopback hosts, cross-origin requests and any Bearer credential.
 /// `Origin: null` is not trusted by itself; login and writes additionally require a
 /// page/session CSRF challenge, so an opaque-space request cannot act without one.
+///
+/// A trusted reverse proxy may forward the admin UI to a public HTTPS entry point.
+/// When the request carries consistent proxy headers (`X-Forwarded-Proto: https`
+/// plus `X-Forwarded-Host`), the boundary is evaluated against the forwarded
+/// values instead of the loopback requirement. Without them the direct-access
+/// loopback rule applies unchanged.
 async fn guard(request: Request, next: Next) -> Response {
     if request.headers().contains_key(header::AUTHORIZATION) {
         return error_response(
@@ -211,25 +217,48 @@ async fn guard(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
-fn request_boundary(headers: &HeaderMap) -> Result<(), Box<Response>> {
-    let Some(host) = header_text(headers, header::HOST) else {
-        return Err(reject(StatusCode::BAD_REQUEST, "missing Host header"));
-    };
-    if !host_is_loopback(host) {
-        return Err(reject(
-            StatusCode::FORBIDDEN,
-            "admin is only available on a loopback host",
-        ));
+/// Effective request origin as seen through optional proxy headers.
+///
+/// Returns `None` when the headers are absent or inconsistent: a proxy must set
+/// both `X-Forwarded-Proto: https` and `X-Forwarded-Host`; one without the other
+/// is treated as absent rather than half-trusted.
+fn forwarded_origin(headers: &HeaderMap) -> Option<(bool, &'_ str)> {
+    let proto = header_text(headers, HeaderName::from_static("x-forwarded-proto"))?;
+    if !proto.eq_ignore_ascii_case("https") {
+        return None;
     }
+    let host = header_text(headers, HeaderName::from_static("x-forwarded-host"))?;
+    if host.trim().is_empty() || host.contains(',') {
+        return None;
+    }
+    Some((true, host))
+}
+
+fn request_boundary(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    let (https, host) = match forwarded_origin(headers) {
+        Some((https, host)) => (https, host),
+        None => {
+            let host = header_text(headers, header::HOST)
+                .ok_or_else(|| reject(StatusCode::BAD_REQUEST, "missing Host header"))?;
+            if !host_is_loopback(host) {
+                return Err(reject(
+                    StatusCode::FORBIDDEN,
+                    "admin is only available on a loopback host",
+                ));
+            }
+            (false, host)
+        }
+    };
     let Some(origin) = header_text(headers, header::ORIGIN) else {
         return Ok(());
     };
     if origin == "null" {
         return Ok(());
     }
-    // Scheme, host and port must all match the request's Host header. There is no
-    // wildcard or port-insensitive comparison; `null` is handled separately above.
-    let expected = format!("http://{host}");
+    // Scheme, host and port must all match the effective request host. There is
+    // no wildcard or port-insensitive comparison; `null` is handled separately above.
+    let scheme = if https { "https" } else { "http" };
+    let expected = format!("{scheme}://{host}");
     if expected.eq_ignore_ascii_case(origin) {
         Ok(())
     } else {
@@ -373,7 +402,9 @@ async fn login(
     );
     response.headers_mut().append(
         header::SET_COOKIE,
-        set_cookie_header(SESSION_COOKIE, &session_id, true, ADMIN_SESSION_TTL_MS),
+        set_cookie_header(SESSION_COOKIE, &session_id, true, ADMIN_SESSION_TTL_MS, {
+            forwarded_origin(&headers).is_some()
+        }),
     );
     response
 }
@@ -387,9 +418,10 @@ async fn logout(State(state): State<AdminState>, headers: HeaderMap) -> Response
         sessions.remove(&session_id);
     }
     let mut response = json_response(StatusCode::OK, json!({ "ok": true }));
-    response
-        .headers_mut()
-        .append(header::SET_COOKIE, clear_cookie_header(SESSION_COOKIE));
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        clear_cookie_header(SESSION_COOKIE, forwarded_origin(&headers).is_some()),
+    );
     response
 }
 
@@ -1801,7 +1833,13 @@ fn found(location: &str) -> Response {
     (StatusCode::FOUND, [(header::LOCATION, location)]).into_response()
 }
 
-fn set_cookie_header(name: &str, value: &str, http_only: bool, max_age_ms: i64) -> HeaderValue {
+fn set_cookie_header(
+    name: &str,
+    value: &str,
+    http_only: bool,
+    max_age_ms: i64,
+    secure: bool,
+) -> HeaderValue {
     let mut cookie = format!(
         "{name}={value}; Path=/admin; SameSite=Strict; Max-Age={}",
         max_age_ms / 1000
@@ -1809,12 +1847,19 @@ fn set_cookie_header(name: &str, value: &str, http_only: bool, max_age_ms: i64) 
     if http_only {
         cookie.push_str("; HttpOnly");
     }
+    // Sessions must never ride over plain HTTP once a TLS entry point exists.
+    if secure {
+        cookie.push_str("; Secure");
+    }
     HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
-fn clear_cookie_header(name: &str) -> HeaderValue {
-    HeaderValue::from_str(&format!("{name}=; Path=/admin; SameSite=Strict; Max-Age=0"))
-        .unwrap_or_else(|_| HeaderValue::from_static(""))
+fn clear_cookie_header(name: &str, secure: bool) -> HeaderValue {
+    let mut cookie = format!("{name}=; Path=/admin; SameSite=Strict; Max-Age=0");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
 }
 
 fn map_store_error(error: Error) -> Response {
@@ -1972,6 +2017,92 @@ mod tests {
         assert!(constant_time_eq("abc", "abc"));
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "ab"));
+    }
+
+    #[test]
+    fn forwarded_https_origin_is_accepted_with_matching_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("db.example.net"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://db.example.net"),
+        );
+        assert!(request_boundary(&headers).is_ok());
+    }
+
+    #[test]
+    fn forwarded_origin_requires_both_proto_and_host() {
+        // Proto without host: treated as a direct request, so the public host
+        // is rejected by the loopback rule instead of being half-trusted.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("db.example.net"));
+        assert!(request_boundary(&headers).is_err());
+
+        // Host without proto: same.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("db.example.net"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("db.example.net"));
+        assert!(request_boundary(&headers).is_err());
+
+        // Comma-chained hosts (multi-proxy) are not accepted either.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("a.example.net, b.example.net"),
+        );
+        headers.insert(header::HOST, HeaderValue::from_static("a.example.net"));
+        assert!(request_boundary(&headers).is_err());
+    }
+
+    #[test]
+    fn forwarded_origin_still_rejects_cross_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-forwarded-proto"),
+            HeaderValue::from_static("https"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-forwarded-host"),
+            HeaderValue::from_static("db.example.net"),
+        );
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example.net"),
+        );
+        assert!(request_boundary(&headers).is_err());
+
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://db.example.net"),
+        );
+        assert!(request_boundary(&headers).is_err());
+    }
+
+    #[test]
+    fn direct_access_still_requires_loopback() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_static("43.1.2.3:8788"));
+        assert!(request_boundary(&headers).is_err());
+        headers.insert(header::HOST, HeaderValue::from_static("127.0.0.1:8788"));
+        assert!(request_boundary(&headers).is_ok());
     }
 
     #[test]

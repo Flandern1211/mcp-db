@@ -130,11 +130,11 @@ jobs:
             -o UserKnownHostsFile="$ssh_files/known_hosts" -o GlobalKnownHostsFile=/dev/null
             -o ClearAllForwardings=yes -o ConnectTimeout=20)
           rsync -rlpt -e "ssh ${ssh_opts[*]}" \
-            deploy/docker-compose.yml deploy/deploy.sh deploy/bootstrap.sh \
+            deploy/docker-compose.yml deploy/deploy.sh deploy/bootstrap.sh deploy/Caddyfile \
             "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_PATH}/"
           ssh "${ssh_opts[@]}" -T -n \
             -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
             "${DEPLOY_USER}@${DEPLOY_HOST}" \
             "chmod 0755 '${DEPLOY_PATH}/deploy.sh' '${DEPLOY_PATH}/bootstrap.sh' &&
-             chmod 0644 '${DEPLOY_PATH}/docker-compose.yml' &&
+             chmod 0644 '${DEPLOY_PATH}/docker-compose.yml' '${DEPLOY_PATH}/Caddyfile' &&
              bash '${DEPLOY_PATH}/deploy.sh' '${IMAGE_REF}'"
