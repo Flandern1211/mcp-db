@@ -14,8 +14,8 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 
 - 单实例、多数据源的 Streamable HTTP MCP 服务；不要求与数据库同机，不要求全年常驻。
 - 首版正式交付形态为 OCI 容器镜像（Docker 服务）。MCP 端口默认只发布到宿主回环地址或受控网络。
-- 首版管理面仅限本机：管理页使用发布到宿主回环地址的独立端口，并要求 CLI 生成的登录凭证（一次性令牌或永久管理员密钥）；agent token 不能访问管理面。跨主机远程管理、TLS 终止和受信反向代理属于后续阶段，启用前必须同时具备认证和网络访问控制，不能裸露管理接口。
-- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次；管理员密钥永不过期但可随时吊销，`last_used_at` 记录最近使用。两类凭证服务端都只存其 SHA-256 hash，明文仅 CLI 输出一次；admin 会话保存在进程内，1 小时过期，重启即失效。本机 HTTP 下 `mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin 但不设 Secure；启用 TLS 后必须加 Secure。所有 admin 请求校验 Host 为回环地址；Origin 存在且非 `null` 时必须与请求 scheme、host、port 严格同源，跨端口拒绝；`null` 不获得同源信任，登录 POST 需要页面发放的随机 CSRF challenge，后续写请求需要会话绑定 CSRF，未持有对应 challenge 的 `null` 请求拒绝。
+- 管理面访问边界：默认仅限宿主回环（`127.0.0.1:8788`），并要求 CLI 生成的登录凭证（一次性令牌或永久管理员密钥）；agent token 不能访问管理面。可选启用公网 HTTPS 入口：由受信反向代理（如 Caddy）终止 TLS 后转发到仅回环发布的管理端口；启用前必须同时具备有效 TLS、代理层传递真实 scheme/host、应用按代理信息校验 Origin 与发放 Secure cookie，不能裸露管理接口。
+- 实现约定：管理监听默认 `127.0.0.1:8788`（`MCPDB_ADMIN_ADDR`），MCP 监听不变；容器内绑定 `0.0.0.0:8788` 时必须用 `-p 127.0.0.1:8788:8788` 发布，不能用 `-p 8788:8788` 暴露到非回环地址。一次性登录令牌有效期 5 分钟、只能消费一次；管理员密钥永不过期但可随时吊销，`last_used_at` 记录最近使用。两类凭证服务端都只存其 SHA-256 hash，明文仅 CLI 输出一次；admin 会话保存在进程内，1 小时过期，重启即失效。`mcpdb_admin` cookie 设 HttpOnly、SameSite=Strict、Path=/admin；HTTPS 下（由代理头判定）必须加 Secure。admin 请求校验 Host：直接访问时必须是回环地址，经受信代理时使用代理传递的原始 host；Origin 存在且非 `null` 时必须与请求 scheme、host、port 严格同源，跨端口拒绝；`null` 不获得同源信任，登录 POST 需要页面发放的随机 CSRF challenge，后续写请求需要会话绑定 CSRF，未持有对应 challenge 的 `null` 请求拒绝。
 - 管理页是内嵌静态中文 SPA（概览 / 访问令牌 / 待批请求 / 审计日志 / 数据源），由 admin listener 同源提供，不使用 CDN、外部字体或前端框架；数据经 `/admin/api/*` JSON 接口读写。所有 admin 响应设置 no-store、nosniff、no-referrer 和 `default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'` 的 CSP，不使用内联脚本。令牌明文只在签发响应返回一次；管理页可录入数据库连接串（DSN），服务端立即加密写入凭证库并只保存内部引用，页面不回显 DSN。
 - 首版正式发布范围只覆盖 PostgreSQL 普通能力；SQLite 是 T-11 的首个增量驱动，已实现并完成本地真实文件边界验证，尚未随首版发布。MySQL/MariaDB、SQL Server 按后续阶段扩展。未支持的驱动必须明确拒绝，不能退回通用 SQL。生产 source 的普通 SQL 只读。
 - source 代表一个具体数据库，并配置一组连接 profiles。profiles 数量不固定为两个，可有多个最小权限连接；tool 通过服务端映射选取适用 profile，agent 不得指定 DSN 或切换执行身份。
@@ -59,7 +59,7 @@ mcp-db 是一个多 SQL 数据源的 HTTP MCP 服务，可在任何能够访问�
 - source、profile 元数据、token/grants、审计、审批状态和建库预留须持久化；数据库连接池与 MCP 会话是进程内状态。
 - 启用加密凭证库时，服务启动打开已有凭证库；文件不存在则创建空库，使全新部署可直接在管理面录入第一条连接串。主密钥文件必须预先存在且格式合法，缺失或非法时启动失败，不得降级为无凭证模式。
 - 停机/重启不能自动执行旧批准或盲目重放写入。尚未执行的待批/已批请求终止，客户端需重新发起并重新审批；已经发出的写入若结果未知，保留未知状态并人工核对，不标记为未执行或重试。
-- 首版管理面仅本机：MCP 与管理监听分离，管理端口只发布到宿主回环地址，登录使用 CLI 生成的登录凭证（一次性令牌或永久管理员密钥）；admin 会话须有 HttpOnly、SameSite 和 CSRF 防护。跨主机接入属于后续阶段，启用前必须明确公开访问地址、受信代理及 Origin 校验配置，并在 HTTPS 下使用 Secure cookie。
+- 管理面访问边界：MCP 与管理监听分离，管理端口默认只发布到宿主回环地址，登录使用 CLI 生成的登录凭证（一次性令牌或永久管理员密钥）；admin 会话须有 HttpOnly、SameSite 和 CSRF 防护。可选公网 HTTPS 入口属于显式启用的部署形态：受信代理终止 TLS 并转发到仅回环发布的管理端口，代理必须传递原始 scheme/host（如 `X-Forwarded-Proto`、`X-Forwarded-Host`），应用据此校验 Origin 并发放 Secure cookie；未配置代理时保持回环限制。
 
 ## 3. 授权、连接与审批
 
@@ -182,7 +182,7 @@ SQLite 使用独立方言解析，不接受 PostgreSQL 解析结果。下列语�
 | `AC2-07` | 结果限制 | 超过 source 行数上限显式截断；不把结果截断等同于限制数据库扫描成本 |
 | `AC2-08` | 资源限制 | 每 profile 连接上限、语句超时、token 请求速率按配置执行；未支持的硬限制明确拒绝配置，不假装生效 |
 | `AC2-09` | 审计 | 记录 token/agent、source、tool、profile 标识、决定、渠道、原因与适用耗时/行数，绝不记录凭证 |
-| `AC2-10` | 部署与管理隔离 | 首版以 Docker 服务在非数据库主机按需启动；管理页仅通过宿主回环端口和一次性登录令牌/永久管理员密钥访问；agent 不能操作 admin API；跨主机接入在后续阶段具备 TLS/认证/网络控制后才可启用 |
+| `AC2-10` | 部署与管理隔离 | 以 Docker 服务在非数据库主机按需启动；管理页默认仅通过宿主回环端口和一次性登录令牌/永久管理员密钥访问，可选启用受信 TLS 反向代理后的公网入口（代理传递真实 scheme/host，应用校验 Origin 并发放 Secure cookie）；agent 不能操作 admin API |
 | `AC2-11` | 配置校验 | 未知 tool/profile、错误用途映射、生产写 grant、非法凭证引用或限制保存失败；连接数不固定为两个，query 实际只读性有验证依据 |
 | `AC2-12` | 工具发现 | 展示 token 在有效 source 上 grants 的 tool 并集，加基础 `list_sources`；不可见不替代调用鉴权 |
 | `AC2-13` | 精确 grant | A 库获某 tool 不允许对 B 库调用该 tool；直接构造参数也拒绝；source/profile/环境限制始终生效 |

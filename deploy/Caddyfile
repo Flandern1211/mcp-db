@@ -1,0 +1,41 @@
+# TLS entry point for mcp-db, synced from the repository by the cd pipeline.
+#
+# The host is addressed by IP (no domain), so Caddy issues an internal
+# self-signed certificate; browsers show a one-time trust warning. mcp-db
+# itself stays loopback-only: everything public terminates here on 443.
+#
+# Forwarded headers are mandatory for the admin UI: the app validates
+# X-Forwarded-Proto + X-Forwarded-Host against Origin and issues Secure
+# cookies only when they are present and consistent.
+#
+# Caddy connects to the app over the compose-internal network, so no admin
+# or MCP port is ever published beyond the host loopback.
+
+{
+	admin off
+}
+
+https://:443 {
+	# MCP endpoint (Streamable HTTP, Bearer auth at the app layer).
+	handle /mcp* {
+		reverse_proxy mcp-db:8787 {
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	# Admin UI and its JSON API (session cookie + CSRF at the app layer).
+	handle /admin* {
+		reverse_proxy mcp-db:8788 {
+			header_up X-Forwarded-Proto https
+			header_up X-Forwarded-Host {host}
+		}
+	}
+
+	# Everything else: nothing to see, close the door politely.
+	handle {
+		respond 404
+	}
+
+	tls internal
+}

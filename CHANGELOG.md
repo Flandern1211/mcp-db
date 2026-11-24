@@ -1,5 +1,10 @@
 # 变更记录
 
+## 2026-11-24
+
+- 管理面新增可选公网 HTTPS 入口（AC2-10 基线修订）：受信反向代理终止 TLS 后转发到仅回环发布的管理端口，应用按 `X-Forwarded-Proto`/`X-Forwarded-Host` 校验 Host 与 Origin，HTTPS 下 `mcpdb_admin` cookie 附加 Secure；未配置代理头时保持回环限制，直接访问非回环 Host 仍被拒绝。部署单元新增 Caddy 服务（443 → /admin、/mcp），主机无域名时使用内部自签证书。
+
+
 ## 2026-11-23
 
 - 新增 GitHub Actions 交付流水线：PR 与推送执行脚本回归、fmt、clippy、locked 测试、镜像构建和容器冒烟；`main` 推送把冒烟通过的镜像以不可变摘要发布到 GHCR，每次部署从该提交同步 `deploy/` 到目标主机再按摘要滚动。部署单元只把 MCP 与管理端口发布到宿主回环地址，运维手册见 [docs/deploy.md](docs/deploy.md)。
