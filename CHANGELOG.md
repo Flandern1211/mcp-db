@@ -1,5 +1,9 @@
 # 变更记录
 
+## 2026-11-25
+
+- 数据源新增「删除」（AC2-21 基线修订）：在归档之外提供物理删除控制面记录，可随时对活动或已归档 source 执行且不可撤销。同一事务内删除 source 及其 profiles、routes、grants 和已结算建库预留，并清理服务端托管的加密凭证；`audit_events` 与审批历史保留，物理数据库永不删除，ID 删除后可复用。存在待批/已批准审批、子 source 或未结算建库预留时拒绝删除并提示先处理，不做强制级联。管理页列表与详情页提供删除入口（须输入数据源 ID 确认），CLI 新增 `mcp-db sources delete <id>`。
+
 ## 2026-11-24
 
 - 管理面新增可选公网 HTTPS 入口（AC2-10 基线修订）：受信反向代理终止 TLS 后转发到仅回环发布的管理端口，应用按 `X-Forwarded-Proto`/`X-Forwarded-Host` 校验 Host 与 Origin，HTTPS 下 `mcpdb_admin` cookie 附加 Secure；未配置代理头时保持回环限制，直接访问非回环 Host 仍被拒绝。部署单元新增 Caddy 服务（443 → /admin、/mcp），主机无域名时使用内部自签证书。

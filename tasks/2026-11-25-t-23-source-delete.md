@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 | --- | --- |
 | 档位 | 完整（用户可见行为、数据模型与 AC2-21 基线变更、跨模块：store/admin/CLI/前端） |
-| 状态 | 进行中 |
+| 状态 | 🟡 待验收 |
 | 依赖 | T-08（source 生命周期）、T-09/T-13（管理面） |
 | AC | AC2-21（修订：归档之外新增物理删除） |
 | 任务分支 | `feat/zcode/t-23-source-delete` |
@@ -65,8 +65,28 @@
 
 ## 4. 测试与证据
 
-（实现完成后回填）
+| 层级 | AC | 命令或步骤 | 环境 | 结果 |
+| --- | --- | --- | --- | --- |
+| 模块集成（store） | 2、3、4、5 | `bash scripts/verify.sh fast`（内含 `cargo test --locked`） | 本地 Docker（rust:1.89-slim-bookworm） | `tests/source_delete.rs` 10 例全过：级联与 ID 复用、SOURCE_DELETED 审计（decision=allowed）、三种拒绝条件且记录不变、已结算预留随删、quarantined 双列拒绝、归档可删、NotFound、token 身份不受影响 |
+| HTTP 集成 | 2、4 | 同上 `cargo test --locked` | 同上 | `tests/admin_http.rs` 新增 2 例：401/403 守卫矩阵；pending 审批 409（中文原因）→ deny 后 200，详情 404、列表空、overview total=0 |
+| 凭证库 | 3 | 同上 `cargo test --locked` | 同上 | `tests/credentials.rs` 新增 2 例：remove 后其余引用可解析且重启持久；未知引用幂等 Ok |
+| 前端（Node Mock） | 1、2 | `node --test tests/admin_source_delete.test.cjs tests/admin_grants_picker.test.cjs tests/admin_token_copy.test.cjs` | 本机 Node v24 | 20/20 通过：active 有归档+删除、archived 有恢复+删除；弹窗 ID 门禁（错 ID disabled、正确 ID enabled、trim）；成功路径恰好一次 DELETE + 列表重载 + 弹窗关闭；失败路径弹窗保持并显示服务端中文原因 |
+| 静态检查 | — | `node --check src/transport/admin_assets/app.js`、`git diff --check` | 本机 | 均通过 |
+| 推送门禁 | — | `bash scripts/preflight.sh` | 本机 Docker | OK（0 warning）；随后提交 `9804455` |
+
+提交：`9804455`（feat/zcode/t-23-source-delete，未推送）。
+
+审查修正（主会话复核实现席 diff 后）：
+
+1. `restore` handler 响应体被误改为裸对象，已恢复 `{"source": …}` 原契约。
+2. `delete_source` handler 解构与 JSON 重组改为具名变量，行为不变。
+3. CLI 凭证库打不开时不再以 `?` 传播错误中断命令（删除已提交），降级为 stderr warning。
 
 ## 5. 缺口表
 
-（交付时回填）
+| 类型 | 项目 | 原因 | 影响 | 开发可以做什么 | 阻塞后续 |
+| --- | --- | --- | --- | --- | --- |
+| 🔴 未验收 | 删除入口的人工验收（浏览器真实点击删除弹窗；CLI `sources delete` 真实执行一次） | 自动化覆盖 store/HTTP/前端函数级行为，入口路径未由第二方在真实界面复现 | 影响 AC2-21 删除部分的人工签字；不影响合并与后续任务 | 用户或独立会话：起服务（或用现有部署），归档态与活动态各删一个测试数据源，核对列表/概览/审计；CLI 用临时 `MCPDB_STATE_PATH` 跑 `sources delete` | 否 |
+| 🔴 未测试 | 凭证清理失败 → 200 + warnings 的端到端路径 | fixture 固定传 `None` sink，需要新的失败注入点才能自动化 | 仅影响该 warning 分支的自动化证据；逻辑已审查且代码路径简单 | 后续给 AdminState 加可注入失败 sink 的测试构造再补一例；或人工在测试环境制造凭证库只读 | 否 |
+
+无阻塞后续的缺口。

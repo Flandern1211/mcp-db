@@ -151,7 +151,7 @@ mcp-db                        # 启动 MCP 服务与管理面
 mcp-db --healthcheck          # 健康检查
 mcp-db admin-login-token      # 一次性登录令牌
 mcp-db admin-key create <label>
-mcp-db sources | sources add <id> <production|nonproduction> [postgres|sqlite]
+mcp-db sources | sources add <id> <production|nonproduction> [postgres|sqlite] | sources delete <id>
 mcp-db profiles <source> | profiles add <source> <name> <query|mutate|schema|provision> <credential_ref>
 mcp-db routes add <source> <tool> <profile_id> [direct|approval]
 mcp-db tokens issue <agent> | tokens revoke <token_id>
@@ -169,7 +169,7 @@ mcp-db archive-source <id> | restore-source <id>
 - 每个工具走固定连接配置，找不到可用映射就拒绝，不会自动升级身份。
 - 生产数据源禁止授予 `mutate_sql` 和 `execute_ddl`。
 - 应用层 SQL 分类不是最终边界：数据库原生最小权限、只读账号和只读会话才是兜底。
-- 归档只阻止访问并保留记录，不删除物理数据库。
+- 归档只阻止访问并保留记录，不删除物理数据库；管理台的删除只清控制面记录和托管凭证，物理数据库仍由人经数据库运维流程删除。
 
 ## 已知限制
 
