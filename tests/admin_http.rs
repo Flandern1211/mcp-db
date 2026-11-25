@@ -1892,3 +1892,167 @@ async fn profiles_and_routes_support_update_delete_and_versioning() {
     .await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn source_delete_requires_session_and_removes_the_source_from_every_view() {
+    let fixture = setup();
+
+    // No session cookie at all.
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::DELETE,
+            "/admin/api/sources/a",
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Session cookie without the CSRF header.
+    let (cookie, _) = login(&fixture).await;
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::DELETE,
+            "/admin/api/sources/a",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Deleting a missing source with a wrong CSRF token is still a 403.
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        write_request(
+            Method::DELETE,
+            "/admin/api/sources/a",
+            None,
+            &cookie,
+            "wrong",
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn delete_source_removes_the_source_and_conflict_guards_keep_it() {
+    let fixture = setup();
+    let (cookie, csrf) = login(&fixture).await;
+
+    // create_pending_approval itself registers source "a" with a mutate route,
+    // so no separate create call is needed here.
+    let approval_id = create_pending_approval(&fixture);
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(Method::DELETE, "/admin/api/sources/a", None, &cookie, &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("待批或已批准请求"),
+        "the conflict message must name the pending approval: {body}"
+    );
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/sources/a",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "source must survive a rejected delete"
+    );
+
+    // Resolve the pending approval by denying it, then delete.
+    {
+        let store = fixture.store.lock().expect("store lock");
+        store
+            .decide_approval(
+                approval_id,
+                false,
+                "admin-web",
+                now_ms(),
+                fixture.state.approval_execution_ttl_ms,
+            )
+            .expect("deny approval");
+    }
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        write_request(Method::DELETE, "/admin/api/sources/a", None, &cookie, &csrf),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["deleted"], true);
+    assert_eq!(body["source"]["id"], "a");
+    assert_eq!(body["source"]["driver"], "postgres");
+    assert_eq!(body["source"]["environment"], "nonproduction");
+    assert_eq!(
+        body["warnings"].as_array().expect("warnings").len(),
+        0,
+        "no credential sink is configured, so there are no warnings"
+    );
+
+    let (status, _, _) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/sources/a",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/sources",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sources"].as_array().expect("sources").len(), 0);
+
+    let (status, _, body) = send_json(
+        fixture.admin.clone(),
+        admin_request(
+            Method::GET,
+            "/admin/api/overview",
+            None,
+            Some(&cookie),
+            Some(ORIGIN),
+            None,
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["sources"]["total"], 0);
+}

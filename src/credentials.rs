@@ -21,10 +21,12 @@ pub trait CredentialResolver: Send + Sync {
     fn resolve(&self, reference: &str) -> Result<String>;
 }
 
-/// Writes a credential reference. Provisioning is the only first-version writer:
-/// the service owns the file as a single writer and rewrites it atomically.
+/// Writes and removes credential references. Provisioning is the only
+/// first-version writer: the service owns the file as a single writer and
+/// rewrites it atomically.
 pub trait CredentialSink: Send + Sync {
     fn store(&self, reference: &str, dsn: &str) -> Result<()>;
+    fn remove(&self, reference: &str) -> Result<()>;
 }
 
 /// Encrypted JSON map of `credential_ref -> DSN`, keyed by an externally supplied master key.
@@ -101,6 +103,22 @@ impl CredentialSink for EncryptedFileResolver {
         let mut next = entries.clone();
         next.insert(reference.to_string(), dsn.to_string());
         // Persist before exposing the new value to concurrent readers.
+        write_encrypted(&self.store_path, &self.key, &next)?;
+        *entries = next;
+        Ok(())
+    }
+
+    fn remove(&self, reference: &str) -> Result<()> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| Error::InvalidInput("credential store is unavailable".to_string()))?;
+        let mut next = entries.clone();
+        if next.remove(reference).is_none() {
+            // Deleting an already-deleted reference is a no-op, not a failure.
+            return Ok(());
+        }
+        // Persist before exposing the new map to concurrent readers.
         write_encrypted(&self.store_path, &self.key, &next)?;
         *entries = next;
         Ok(())

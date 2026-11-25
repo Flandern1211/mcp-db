@@ -130,7 +130,10 @@ pub fn admin_app(state: AdminState) -> Router {
         .route("/admin/api/session", get(session_info))
         .route("/admin/api/overview", get(overview))
         .route("/admin/api/sources", get(list_sources).post(create_source))
-        .route("/admin/api/sources/{id}", get(source_detail))
+        .route(
+            "/admin/api/sources/{id}",
+            get(source_detail).delete(delete_source),
+        )
         .route("/admin/api/sources/{id}/environment", post(set_environment))
         .route("/admin/api/sources/{id}/archive", post(archive))
         .route("/admin/api/sources/{id}/restore", post(restore))
@@ -627,6 +630,75 @@ async fn restore(
         Ok(value) => json_response(StatusCode::OK, json!({ "source": value })),
         Err(response) => *response,
     }
+}
+
+async fn delete_source(
+    State(state): State<AdminState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = write_guard(&state, &headers) {
+        return *response;
+    }
+    let (source, references) = match store_call(&state, |store| {
+        // Snapshot before the rows are gone; the response is rebuilt from it.
+        let references = store
+            .list_profiles(&id)?
+            .into_iter()
+            .map(|profile| profile.credential_ref)
+            .collect::<Vec<_>>();
+        let source = store.delete_source(&id, ADMIN_ACTOR, now_ms())?;
+        record_admin_event(
+            store,
+            "admin_source_deleted",
+            "source",
+            Some(&id),
+            None,
+            "deleted source control-plane records",
+        )?;
+        Ok((source, references))
+    }) {
+        Ok(result) => result,
+        Err(response) => return *response,
+    };
+    // Credential cleanup runs after the store commit: a failed cleanup must not
+    // roll back or fail the already-completed delete, so it degrades to warnings.
+    let mut warnings = Vec::new();
+    if let Some(sink) = state.credentials.as_ref() {
+        for reference in &references {
+            let in_use = match store_call(&state, |store| {
+                store.count_profiles_with_credential(reference)
+            }) {
+                Ok(count) => count,
+                Err(_) => {
+                    warnings.push(format!(
+                        "凭证引用 {reference} 的引用检查失败，请手动确认是否可以删除。"
+                    ));
+                    continue;
+                }
+            };
+            if in_use > 0 {
+                continue;
+            }
+            if let Err(error) = sink.remove(reference) {
+                warnings.push(format!(
+                    "托管凭证 {reference} 未能从凭证库删除：{error}；请检查凭证库后手动清理。"
+                ));
+            }
+        }
+    }
+    json_response(
+        StatusCode::OK,
+        json!({
+            "deleted": true,
+            "source": {
+                "id": source.id,
+                "driver": source.driver.as_str(),
+                "environment": source.environment.as_str(),
+            },
+            "warnings": warnings,
+        }),
+    )
 }
 
 #[derive(Deserialize)]

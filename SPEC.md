@@ -163,7 +163,11 @@ SQLite 使用独立方言解析，不接受 PostgreSQL 解析结果。下列语�
 
 ### 3.6 Source 生命周期
 
-归档和恢复仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。首版本机管理面通过 CLI 与 Web 管理页提供审批、source 创建/归档/恢复、profile/route、token/grant、审计查询和隔离预留结算；Web 管理页在 source 详情展示 profiles 与 routes，profile 只填写 credential_ref，不编辑或回显 DSN。待批请求必须展示完整 SQL（建库请求展示服务端生成的建库规格）、参数、profile/route 标识与版本后才能决定，不允许盲批。环境分类变更仅对已归档 source 开放，标记生产前须先撤销写 grants。
+归档、恢复和删除仅限 admin，不是 MCP agent tools。归档阻止新请求、使待批请求失效、关闭连接池并从 agent 列表移除，但保留配置、grants 和审计，不删除物理数据库。已发出的请求不承诺可撤回，结果未知时按未知状态处理。恢复须复核环境、profiles、grants 和活动配额。
+
+删除是物理删除控制面记录，与归档独立，可随时对活动或已归档 source 执行，且不可撤销：同一事务内删除 source 及其 profiles、routes、grants 和已结算建库预留；`audit_events` 与审批历史保留，物理数据库永不删除，ID 删除后可复用。存在 `pending`/`approved` 审批、子 source 或 `reserved`/`quarantined` 预留时拒绝删除并提示先处理，不做强制级联。经 Web 管理面删除时同时清理无其他 profile 引用的服务端托管加密凭证；CLI 删除只清控制面记录并逐条提示保留的凭证引用，因为运行中的服务是凭证库的唯一写者，第二个写者会被其内存副本覆盖。
+
+首版本机管理面通过 CLI 与 Web 管理页提供审批、source 创建/归档/恢复/删除、profile/route、token/grant、审计查询和隔离预留结算；Web 管理页在 source 详情展示 profiles 与 routes，profile 只填写 credential_ref，不编辑或回显 DSN。待批请求必须展示完整 SQL（建库请求展示服务端生成的建库规格）、参数、profile/route 标识与版本后才能决定，不允许盲批。环境分类变更仅对已归档 source 开放，标记生产前须先撤销写 grants。
 
 ## 4. 需求与验收
 
@@ -193,7 +197,7 @@ SQLite 使用独立方言解析，不接受 PostgreSQL 解析结果。下列语�
 | `AC2-18` | 建库审批 | 每次建库由 admin 批准并绑定创建目标、profile 版本和结果 grants；一次性消费，执行前复核；provision 凭证不能进入通用 SQL |
 | `AC2-19` | 并发配额 | 默认每 token × 父 source 5 个活动库、60 秒成功 1 个；执行前原子预留，恢复受限；未知结果保留隔离预留待核对 |
 | `AC2-20` | 新库登记 | 就绪后才暴露新 source 与结果 grants；prod 仅查询，非 prod 按审批模板；不继承建库能力；现有会话可重新发现新 source |
-| `AC2-21` | 归档恢复 | 仅 admin 操作，阻止新请求、使待批失效、保留记录且不删物理库；恢复复核 profiles、grants 和配额 |
+| `AC2-21` | 归档恢复与删除 | 归档恢复仅 admin 操作，阻止新请求、使待批失效、保留记录且不删物理库；恢复复核 profiles、grants 和配额；删除仅 admin，物理删除 source 及 profiles/routes/grants/已结算预留、保留审计、不删物理库，Web 删除同时清理无其他引用的托管凭证，存在待批/已批准请求、子 source 或未结算预留时拒绝 |
 | `AC2-22` | 按需停启 | 重启保留配置/grants/审计/预留；不重放旧批准或外部写；未发出请求终止，已发出未知请求保留待核对状态 |
 | `AC2-23` | 旧模型迁移 | 停服后按固定矩阵导入 TOML 与状态库，用 journal 完成可恢复 cutover，不生成建库能力；未分类 source 禁用。提交后活动 TOML 不含旧凭证/权限，旧 binary 用活动配置无法获得 source；新服务只启用分类 tools 并拒绝旧 `execute_sql`，失败/崩溃只能回滚提交点前状态或进入 recovery |
 

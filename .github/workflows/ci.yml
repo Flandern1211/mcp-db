@@ -1,12 +1,15 @@
 name: ci
 
-# CI：构建并验证。每次 PR、push 和手动触发都运行；
-# 发布与部署在 cd.yml，只有 main 推送才继续。
+# CI：构建并验证。只在发布分支 main 上运行：
+#   - PR 目标为 main（合并前的门禁）
+#   - 推送到 main（合并后，喂给 cd）
+# develop 及其他分支不触发（2026-11-24 用户决定：CI/CD 是发布关卡，
+# 不是提交关卡；推送前的本地门禁见 scripts/preflight.sh）。
 on:
   pull_request:
-    branches: [develop, main]
+    branches: [main]
   push:
-    branches: [develop, main]
+    branches: [main]
   workflow_dispatch:
 
 permissions:

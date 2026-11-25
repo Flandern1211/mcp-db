@@ -37,7 +37,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 
 | 角色 | 职责 |
 | --- | --- |
-| 管理员 | 配置 source/profile、签发 token、设置 grants 与审批策略、处理审批、查看审计、归档/恢复 source |
+| 管理员 | 配置 source/profile、签发 token、设置 grants 与审批策略、处理审批、查看审计、归档/恢复/删除 source |
 | MCP agent/client | 使用 Bearer token 发现并调用获授权的数据库 tools |
 | 数据库管理员/运维 | 在产品外提供数据库原生最小权限、备份恢复和物理删库 |
 
@@ -85,7 +85,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 2. 管理页提供概览、访问令牌、待批请求、审计日志、数据源五个入口；可签发/撤销令牌、增删精确 source×tool grants、创建/修改/删除 profiles 与 routes、测试连接、归档/恢复 source，并核对隔离预留。
 3. 待批请求先展示完整 SQL 或建库规格、绑定参数、profile/route 版本，再允许批准或拒绝；审批不能盲批。修改 profile/route 会递增版本并使旧审批在执行前被拒绝。
 4. 管理页只通过发布到宿主回环地址的独立端口访问，并要求 CLI 生成的一次性登录令牌或永久管理员密钥。
-5. 管理员可以归档 source；归档阻止新请求、使待批失效并关闭连接，但不删除物理数据库。
+5. 管理员可以归档 source；归档阻止新请求、使待批失效并关闭连接，但不删除物理数据库。管理员也可以删除 source：只删除控制面记录（source、profiles、routes、grants、已结算预留），保留审计，物理数据库仍由运维删除；经管理页删除时同时清理无其他引用的托管凭证。
 6. 管理员重启服务后，配置、grants、审计、配额和隔离预留仍然存在；旧批准和外部写不重放。
 
 ### 3.6 从 v1 迁移
@@ -105,7 +105,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 - Rust 单进程 HTTP MCP 服务，提供 OCI 容器镜像。
 - Docker 部署；MCP 端口默认只发布到宿主回环地址或受控网络。
 - PostgreSQL source 的只读查询、受控写入和库内 DDL。
-- PostgreSQL 受控建库、配额、新 source 登记与归档/恢复。
+- PostgreSQL 受控建库、配额、新 source 登记与归档/恢复/删除。
 - 精确 `(token, source, tool)` grants。
 - 任意数量的命名 connection profiles，按 query/mutate/schema/provision 用途路由。
 - `list_sources`、`list_tables`、`describe_table`、`explain_query`、`query_sql`、`mutate_sql`、`execute_ddl`、`create_database`。
@@ -146,7 +146,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 7. **未知结果不重试**：外部执行结果未知时保留状态并等待人工核对。
 8. **迁移不混合授权**：任一时刻只允许一个授权事实源。
 9. **管理面不对 agent 开放**：agent token 不能访问管理 API 或管理页。
-10. **归档不等于删除**：归档只阻止访问并保留记录，不承诺释放物理存储。
+10. **归档不等于删除**：归档只阻止访问并保留记录，不承诺释放物理存储；管理台的删除也只清控制面记录和托管凭证，物理数据库仍由人经数据库运维流程删除。
 
 ## 6. 成功指标
 
@@ -172,7 +172,7 @@ mcp-db 为 AI agent 提供一个统一、可审计、可精确授权的多 SQL �
 4. 只读 token 能完成发现和查询；直接构造未授权 source/tool 调用被拒绝。
 5. PostgreSQL query profile 绕过 MCP 分类直连的 INSERT/UPDATE/DELETE 和 schema DDL 均被拒绝，夹具不变。
 6. 普通写入的 direct/elicitation/admin 队列行为符合策略；高危操作强制管理员审批。
-7. 建库申请在缺 grant 或 provision 映射时审批前拒绝；批准、配额、登记、可见性和归档恢复符合定义。
+7. 建库申请在缺 grant 或 provision 映射时审批前拒绝；批准、配额、登记、可见性、归档恢复与删除符合定义。
 8. 服务重启后 grants、审计和预留保留，旧批准和外部写不重放。
 9. 从 Bun/TypeScript v1 完成一次可恢复迁移；活动配置无旧凭证/权限，旧 binary 无法获得 source。
 10. 审计可查到首版所有关键操作的记录，且不包含凭证。

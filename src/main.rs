@@ -213,7 +213,7 @@ fn open_credential_resolver(
 
 fn print_help() {
     println!(
-"mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db admin-key create <label> Create a permanent admin key (shown once, revocable)\n  mcp-db admin-key list           List admin keys (never shows the secret)\n  mcp-db admin-key revoke <id>    Revoke an admin key immediately\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
+"mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db admin-key create <label> Create a permanent admin key (shown once, revocable)\n  mcp-db admin-key list           List admin keys (never shows the secret)\n  mcp-db admin-key revoke <id>    Revoke an admin key immediately\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db sources delete <id>          Delete a source's control-plane records (physical database untouched)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
         env!("CARGO_PKG_VERSION"),
         mcp_db::ADMIN_ADDR
     );
@@ -389,6 +389,30 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                     Some(source.id.as_str()),
                     None,
                 )?;
+                Ok(())
+            }
+            Some("delete") => {
+                let id = args.next().ok_or("sources delete requires a source id")?;
+                // Snapshot the credential references before the profiles are gone.
+                let references = store
+                    .list_profiles(&id)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(|profile| profile.credential_ref)
+                    .collect::<Vec<_>>();
+                let source = store
+                    .delete_source(&id, "admin-cli", now)
+                    .map_err(|error| error.to_string())?;
+                // The running service owns the credential store as its single writer and
+                // rewrites the whole file from memory, so a CLI rewrite would be clobbered
+                // (or clobber a credential the service just wrote). Deleting through the
+                // admin page cleans them up instead.
+                for reference in &references {
+                    eprintln!(
+                        "notice: managed credential {reference} stays in the credential store; delete the source from the admin page to remove it"
+                    );
+                }
+                println!("deleted {} (physical database untouched)", source.id);
                 Ok(())
             }
             Some(other) => Err(format!("unknown sources subcommand: {other}")),
