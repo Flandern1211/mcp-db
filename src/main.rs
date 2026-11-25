@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use mcp_db::{
-    check_health, ApprovalPolicy, AuditEvent, Config, CredentialSink, Driver, DriverExecutors,
+    check_health, ApprovalPolicy, AuditEvent, Config, Driver, DriverExecutors,
     EncryptedFileResolver, Environment, MetadataProvider, NewGrant, NewProfile, NewRoute,
     NewSource, PostgresExecutor, PostgresMetadata, ProfilePurpose, SqlExecutor, SqliteExecutor,
     SqliteMetadata, Store, Tool, UnavailableExecutor, UnavailableMetadata, ADMIN_LOGIN_TTL_MS,
@@ -403,44 +403,14 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                 let source = store
                     .delete_source(&id, "admin-cli", now)
                     .map_err(|error| error.to_string())?;
-                let mut failures = Vec::new();
-                match (&config.credential_store, &config.master_key_file) {
-                    // The delete is already committed, so a credential-store failure
-                    // must not turn the command into an error.
-                    (Some(store_path), Some(key_path)) => {
-                        match open_credential_resolver(store_path, key_path) {
-                            Ok(resolver) => {
-                                for reference in &references {
-                                    // The store rows are gone, so any remaining profile pointing
-                                    // at this reference belongs to another source; keep it.
-                                    match store.count_profiles_with_credential(reference) {
-                                        Ok(0) => {
-                                            if let Err(error) = resolver.remove(reference) {
-                                                failures.push(format!(
-                                                    "managed credential {reference} could not be removed: {error}"
-                                                ));
-                                            }
-                                        }
-                                        Ok(_) => {}
-                                        Err(error) => failures.push(format!(
-                                            "could not check references for {reference}: {error}"
-                                        )),
-                                    }
-                                }
-                            }
-                            Err(error) => failures.push(format!(
-                                "credential store could not be opened, managed credentials stay in place: {error}"
-                            )),
-                        }
-                    }
-                    _ => {
-                        eprintln!(
-                            "notice: credential store is not configured; managed credentials stay in the credential store"
-                        );
-                    }
-                }
-                for failure in &failures {
-                    eprintln!("warning: {failure}");
+                // The running service owns the credential store as its single writer and
+                // rewrites the whole file from memory, so a CLI rewrite would be clobbered
+                // (or clobber a credential the service just wrote). Deleting through the
+                // admin page cleans them up instead.
+                for reference in &references {
+                    eprintln!(
+                        "notice: managed credential {reference} stays in the credential store; delete the source from the admin page to remove it"
+                    );
                 }
                 println!("deleted {} (physical database untouched)", source.id);
                 Ok(())
