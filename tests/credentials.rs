@@ -212,6 +212,56 @@ fn upsert_rejects_invalid_references_and_multiline_values() {
 }
 
 #[test]
+fn remove_deletes_one_reference_and_keeps_the_rest() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+    let key = [7_u8; 32];
+    fs::write(&key_file, key_hex(&key)).expect("write key");
+    EncryptedFileResolver::seal(&store, &key, &entries()).expect("seal");
+    let resolver = EncryptedFileResolver::open(&store, &key_file).expect("open");
+
+    let extra = "keyring:provision/mcpdb_np_test/query";
+    let dsn = "postgres://mcpdb_np_test_ro:s3cret-pw@db.example:5432/mcpdb_np_test";
+    resolver.store(extra, dsn).expect("store credential");
+    resolver
+        .remove("keyring:mcp-db/test/query")
+        .expect("remove");
+    assert!(matches!(
+        resolver.resolve("keyring:mcp-db/test/query"),
+        Err(Error::CredentialUnavailable)
+    ));
+    assert_eq!(resolver.resolve(extra).expect("resolve"), dsn);
+
+    // The removal survives a reopen: it is persisted, not just dropped in memory.
+    let reopened = EncryptedFileResolver::open(&store, &key_file).expect("reopen");
+    assert!(matches!(
+        reopened.resolve("keyring:mcp-db/test/query"),
+        Err(Error::CredentialUnavailable)
+    ));
+    assert_eq!(reopened.resolve(extra).expect("resolve"), dsn);
+}
+
+#[test]
+fn removing_an_unknown_reference_is_idempotent() {
+    let dir = TempDir::new().expect("temp dir");
+    let store = dir.path().join("credentials.enc");
+    let key_file = dir.path().join("master.key");
+    let key = [7_u8; 32];
+    fs::write(&key_file, key_hex(&key)).expect("write key");
+    EncryptedFileResolver::seal(&store, &key, &entries()).expect("seal");
+    let resolver = EncryptedFileResolver::open(&store, &key_file).expect("open");
+
+    resolver
+        .remove("keyring:mcp-db/never-existed")
+        .expect("missing reference removal is a no-op");
+    assert!(
+        resolver.resolve("keyring:mcp-db/test/query").is_ok(),
+        "removing an unknown reference must not touch other entries"
+    );
+}
+
+#[test]
 fn concurrent_reads_see_either_the_old_or_new_store() {
     use std::sync::Arc;
 

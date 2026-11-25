@@ -2159,7 +2159,7 @@ function renderSources(root) {
       h(
         "p",
         { class: "page-desc" },
-        "数据源代表一个 PostgreSQL 数据库。连接配置直接填写数据库连接串，服务端加密保存，页面不回显。归档不会删除物理数据库。",
+        "数据源代表一个 PostgreSQL 数据库。连接配置直接填写数据库连接串，服务端加密保存，页面不回显。归档与删除都不会删除物理数据库；删除会清除控制面记录且不可撤销。",
       ),
       h(
         "div",
@@ -2277,6 +2277,15 @@ function sourcesTable(rows) {
                         },
                         "恢复",
                       ),
+                  h(
+                    "button",
+                    {
+                      class: "btn btn-ghost btn-error btn-sm",
+                      type: "button",
+                      onClick: () => openDeleteSourceModal(source),
+                    },
+                    "删除",
+                  ),
                 ),
               ),
             ),
@@ -2705,6 +2714,15 @@ function sourceDetailModal(data) {
             },
             "恢复",
           ),
+      h(
+        "button",
+        {
+          class: "btn btn-ghost btn-error",
+          type: "button",
+          onClick: () => openDeleteSourceModal(source),
+        },
+        "删除",
+      ),
       h("button", { class: "btn", type: "button", onClick: closeModal }, "关闭"),
     ),
   );
@@ -3346,6 +3364,90 @@ function openRestoreModal(source) {
       ),
     ),
   );
+}
+
+function openDeleteSourceModal(source) {
+  const errorEl = h("p", { class: "form-error hidden" });
+  const confirmInput = h("input", {
+    class: "input",
+    id: "delete-source-confirm",
+    placeholder: "输入数据源 ID 以确认",
+    autocomplete: "off",
+  });
+  const submit = h(
+    "button",
+    {
+      class: "btn btn-ghost btn-error",
+      type: "button",
+      disabled: true,
+      onClick: async () => {
+        submit.disabled = true;
+        submit.textContent = "删除中…";
+        try {
+          const data = await api(`/admin/api/sources/${encodeURIComponent(source.id)}`, {
+            method: "DELETE",
+          });
+          closeModal();
+          showToast("数据源已删除");
+          if (data.warnings?.length) {
+            showToast(data.warnings.join("；"), "error");
+          }
+          await reloadSourcesPage();
+        } catch (error) {
+          submit.disabled = false;
+          submit.textContent = "删除数据源";
+          errorEl.textContent = errorMessage(error);
+          errorEl.classList.remove("hidden");
+        }
+      },
+    },
+    "删除数据源",
+  );
+  confirmInput.addEventListener("input", () => {
+    submit.disabled = confirmInput.value.trim() !== source.id;
+  });
+
+  openModal(
+    h(
+      "div",
+      { class: "dialog" },
+      h(
+        "div",
+        { class: "modal-head" },
+        h("h2", { class: "modal-title" }, "删除数据源"),
+        h("p", { class: "modal-subtitle" }, source.id),
+      ),
+      h(
+        "div",
+        { class: "modal-body" },
+        h(
+          "div",
+          { class: "alert alert-error" },
+          "删除只清除控制面记录：数据源、连接配置、工具路由、授权、已结算的建库预留和托管凭证。审计与审批历史保留，物理数据库不会被删除。此操作不可撤销。",
+        ),
+        h(
+          "div",
+          { class: "field" },
+          h(
+            "label",
+            { class: "field-label", for: "delete-source-confirm" },
+            "请输入数据源 ID ",
+            h("code", { class: "key" }, source.id),
+            " 以确认删除",
+          ),
+          confirmInput,
+        ),
+        errorEl,
+      ),
+      h(
+        "div",
+        { class: "modal-foot" },
+        h("button", { class: "btn", type: "button", onClick: closeModal }, "取消"),
+        submit,
+      ),
+    ),
+  );
+  confirmInput.focus();
 }
 
 function openSettleModal(reservation, target) {

@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use mcp_db::{
-    check_health, ApprovalPolicy, AuditEvent, Config, Driver, DriverExecutors,
+    check_health, ApprovalPolicy, AuditEvent, Config, CredentialSink, Driver, DriverExecutors,
     EncryptedFileResolver, Environment, MetadataProvider, NewGrant, NewProfile, NewRoute,
     NewSource, PostgresExecutor, PostgresMetadata, ProfilePurpose, SqlExecutor, SqliteExecutor,
     SqliteMetadata, Store, Tool, UnavailableExecutor, UnavailableMetadata, ADMIN_LOGIN_TTL_MS,
@@ -213,7 +213,7 @@ fn open_credential_resolver(
 
 fn print_help() {
     println!(
-"mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db admin-key create <label> Create a permanent admin key (shown once, revocable)\n  mcp-db admin-key list           List admin keys (never shows the secret)\n  mcp-db admin-key revoke <id>    Revoke an admin key immediately\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
+"mcp-db {}\n\nUsage:\n  mcp-db                 Start the MCP service (MCPDB_ADDR, default {DEFAULT_ADDR})\n                         and the local admin UI (MCPDB_ADMIN_ADDR, default {})\n  mcp-db --healthcheck   Check a running service (MCPDB_HEALTHCHECK_ADDR)\n  mcp-db --version\n  mcp-db --help\n\nLegacy v1 migration (stop the old service first):\n  mcp-db migrate-legacy --config <legacy.toml> [--environment production|nonproduction]\n  mcp-db recover-legacy-migration\n\nLocal admin commands (use the same MCPDB_STATE_PATH as the service):\n  mcp-db admin-login-token        Print a one-time web login token (valid 5 minutes)\n  mcp-db admin-key create <label> Create a permanent admin key (shown once, revocable)\n  mcp-db admin-key list           List admin keys (never shows the secret)\n  mcp-db admin-key revoke <id>    Revoke an admin key immediately\n  mcp-db sources                  List all sources\n  mcp-db sources add <id> <production|nonproduction> [postgres|sqlite]\n  mcp-db sources set-environment <id> <production|nonproduction>  (archived only)\n  mcp-db sources delete <id>          Delete a source's control-plane records (physical database untouched)\n  mcp-db profiles <source>        List profiles of one source\n  mcp-db profiles add <source> <name> <query|mutate|schema|provision> <credential_ref> [max_connections] [statement_timeout_ms]\n  mcp-db routes add <source> <tool> <profile_id> [direct|approval]\n  mcp-db tokens issue <agent>     Issue an agent token (plaintext shown once)\n  mcp-db tokens revoke <token_id>\n  mcp-db grants <token_id>        List grants of one token\n  mcp-db grants add <token_id> <source> <tool> [direct|approval]\n  mcp-db grants revoke <token_id> <source> <tool>\n  mcp-db audit [limit]            List recent audit events (default 50)\n  mcp-db approvals [limit]        List pending approvals\n  mcp-db approve <id>             Approve one pending request\n  mcp-db deny <id>                Deny one pending request\n  mcp-db archive-source <id>      Archive a source without dropping the database\n  mcp-db restore-source <id>      Restore an archived source after quota checks\n  mcp-db reservations             List recent provisioning reservations\n  mcp-db settle-reservation <id> release|commit",
         env!("CARGO_PKG_VERSION"),
         mcp_db::ADMIN_ADDR
     );
@@ -389,6 +389,60 @@ fn run_admin(command: &str, mut args: impl Iterator<Item = String>) -> Result<()
                     Some(source.id.as_str()),
                     None,
                 )?;
+                Ok(())
+            }
+            Some("delete") => {
+                let id = args.next().ok_or("sources delete requires a source id")?;
+                // Snapshot the credential references before the profiles are gone.
+                let references = store
+                    .list_profiles(&id)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(|profile| profile.credential_ref)
+                    .collect::<Vec<_>>();
+                let source = store
+                    .delete_source(&id, "admin-cli", now)
+                    .map_err(|error| error.to_string())?;
+                let mut failures = Vec::new();
+                match (&config.credential_store, &config.master_key_file) {
+                    // The delete is already committed, so a credential-store failure
+                    // must not turn the command into an error.
+                    (Some(store_path), Some(key_path)) => {
+                        match open_credential_resolver(store_path, key_path) {
+                            Ok(resolver) => {
+                                for reference in &references {
+                                    // The store rows are gone, so any remaining profile pointing
+                                    // at this reference belongs to another source; keep it.
+                                    match store.count_profiles_with_credential(reference) {
+                                        Ok(0) => {
+                                            if let Err(error) = resolver.remove(reference) {
+                                                failures.push(format!(
+                                                    "managed credential {reference} could not be removed: {error}"
+                                                ));
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => failures.push(format!(
+                                            "could not check references for {reference}: {error}"
+                                        )),
+                                    }
+                                }
+                            }
+                            Err(error) => failures.push(format!(
+                                "credential store could not be opened, managed credentials stay in place: {error}"
+                            )),
+                        }
+                    }
+                    _ => {
+                        eprintln!(
+                            "notice: credential store is not configured; managed credentials stay in the credential store"
+                        );
+                    }
+                }
+                for failure in &failures {
+                    eprintln!("warning: {failure}");
+                }
+                println!("deleted {} (physical database untouched)", source.id);
                 Ok(())
             }
             Some(other) => Err(format!("unknown sources subcommand: {other}")),

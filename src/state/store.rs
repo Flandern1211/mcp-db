@@ -871,6 +871,65 @@ impl Store {
         Ok(restored)
     }
 
+    /// Physically removes a source's control-plane records. The physical database
+    /// itself is never touched; audit and approval history have no foreign keys
+    /// to the source and are kept on purpose.
+    pub fn delete_source(&self, id: &str, actor: &str, now: i64) -> Result<Source> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let source = self.get_source(id)?;
+        let pending_approvals: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM approval_requests
+              WHERE source_id = ? AND status IN ('pending', 'approved')",
+            [id],
+            |row| row.get(0),
+        )?;
+        if pending_approvals > 0 {
+            return Err(Error::Conflict(format!(
+                "这个数据源还有 {pending_approvals} 个待批或已批准请求，请先批准、拒绝或等待超时后再删除。"
+            )));
+        }
+        let children: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM sources WHERE parent_source_id = ?",
+            [id],
+            |row| row.get(0),
+        )?;
+        if children > 0 {
+            return Err(Error::Conflict(format!(
+                "这个数据源还有 {children} 个子数据源，请先删除子数据源。"
+            )));
+        }
+        // A source's own id is also the database name of the child it provisioned,
+        // so settled reservations can reference the deleted parent from both columns.
+        let unsettled: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM quota_reservations
+              WHERE status IN ('reserved', 'quarantined')
+                AND (parent_source_id = ? OR database_name = ?)",
+            params![id, id],
+            |row| row.get(0),
+        )?;
+        if unsettled > 0 {
+            return Err(Error::Conflict(format!(
+                "这个数据源还有 {unsettled} 条未结算的建库预留，请先在隔离预留里结算后再删除。"
+            )));
+        }
+        transaction.execute("DELETE FROM source_tool_routes WHERE source_id = ?", [id])?;
+        transaction.execute("DELETE FROM connection_profiles WHERE source_id = ?", [id])?;
+        transaction.execute("DELETE FROM tool_grants WHERE source_id = ?", [id])?;
+        // Settled reservations are removed too so provision_usage stops counting
+        // the deleted source as an active database.
+        transaction.execute(
+            "DELETE FROM quota_reservations WHERE parent_source_id = ? OR database_name = ?",
+            params![id, id],
+        )?;
+        transaction.execute("DELETE FROM sources WHERE id = ?", [id])?;
+        insert_audit(
+            &transaction,
+            &source_event(id, "deleted", actor, "SOURCE_DELETED", now),
+        )?;
+        transaction.commit()?;
+        Ok(source)
+    }
+
     pub fn create_profile(&self, profile: &NewProfile) -> Result<Profile> {
         let source = self.get_source(&profile.source_id)?;
         if source.status != SourceStatus::Active {
@@ -1076,6 +1135,17 @@ impl Store {
             .query_map([source_id], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         ids.into_iter().map(|id| self.get_profile(id)).collect()
+    }
+
+    /// Number of profiles anywhere that still point at a credential reference.
+    /// Used before removing a managed credential so references shared with other
+    /// sources are never deleted.
+    pub fn count_profiles_with_credential(&self, credential_ref: &str) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM connection_profiles WHERE credential_ref = ?",
+            [credential_ref],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn create_route(&self, route: &NewRoute) -> Result<Route> {
@@ -2923,7 +2993,7 @@ fn source_event(
         route_version: None,
         request_digest: None,
         channel: None,
-        decision: if event == "restored" {
+        decision: if matches!(event, "restored" | "deleted") {
             "allowed"
         } else {
             "rejected"
