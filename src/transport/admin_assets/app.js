@@ -2260,13 +2260,11 @@ function sourcesTable(rows) {
                     ? h(
                         "button",
                         {
-                          class: "btn btn-circle btn-ghost btn-sm btn-error",
+                          class: "btn btn-sm",
                           type: "button",
-                          title: "归档",
-                          "aria-label": `归档 ${source.id}`,
                           onClick: () => openArchiveModal(source),
                         },
-                        icon("trash", 16),
+                        "归档",
                       )
                     : h(
                         "button",
